@@ -1,0 +1,22 @@
+{
+  "local": {
+    "data_root": "<LOCAL_DATA_ROOT>",
+    "run_root": "<LOCAL_RUN_ROOT>",
+    "hf_home": "<LOCAL_HF_CACHE>",
+    "venv": ".venv312",
+    "fineweb_edu_1b": "<LOCAL_DATA_ROOT>/datasets/fineweb_edu_1b_ctx1024",
+    "fineweb_edu_50m": "<LOCAL_DATA_ROOT>/datasets/fineweb_edu_50m"
+  },
+  "remote": {
+    "user": "<REMOTE_USER>",
+    "host": "<REMOTE_HOST>",
+    "ssh": "<REMOTE_USER>@<REMOTE_HOST>",
+    "root": "<REMOTE_ROOT>",
+    "repo": "<REMOTE_ROOT>/naime-hybrid-moe",
+    "runs": "<REMOTE_ROOT>/runs",
+    "datasets": "<REMOTE_ROOT>/datasets",
+    "venv": "<REMOTE_ROOT>/envs/.venv312",
+    "python": "<REMOTE_ROOT>/envs/.venv312/Scripts/python.exe",
+    "python_home": "<REMOTE_PYTHON_HOME>"
+  }
+}

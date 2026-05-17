@@ -1,0 +1,15 @@
+NAIME Hybrid MoE
+
+Copyright (c) 2026 daoquynhthu.
+
+This project is licensed under the GNU Affero General Public License version 3
+as published by the Free Software Foundation. See LICENSE.
+
+Third-party dependencies, datasets, model weights, tokenizer files, and other
+external materials are governed by their own licenses. Inclusion of integration
+code or configuration in this repository does not relicense those third-party
+materials.
+
+Unless explicitly stated otherwise, generated model checkpoints, training
+outputs, private datasets, local workspace configuration, credentials, and
+machine-specific operation notes are not part of the source-code release.

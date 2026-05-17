@@ -1,0 +1,39 @@
+[project]
+name = "naime-hybrid-moe"
+version = "0.1.0"
+description = "NAIME-State MoE research prototype"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+exclude = [
+    ".venv*",
+    "data",
+    "experiments",
+    "references",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = [
+    "E501",  # Long tensor/logging lines are allowed when wrapping would obscure metric groups.
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
