@@ -107,28 +107,61 @@ class WorldStateSlots(nn.Module):
         )
         state_trace: list[torch.Tensor] = []
         metric_values: dict[str, list[torch.Tensor]] = {}
-        history_entropies: list[torch.Tensor] = []
-        history_focuses: list[torch.Tensor] = []
         previous_delta = hidden_states.new_tensor(0.0)
         velocities: list[torch.Tensor] = []
         accelerations: list[torch.Tensor] = []
+
+        # Precompute query norm, bank reshape, and key slot norm once outside the sequential loop.
+        full_query = self.query_norm(hidden_states)
+        precomputed_history_context = None
+        history_read_entropy = hidden_states.new_tensor(0.0)
+        history_read_max = hidden_states.new_tensor(0.0)
+
+        if incoming_trace is not None:
+            incoming_bank = incoming_trace.reshape(batch, -1, dim)
+            full_key = self.slot_norm(incoming_bank)
+            total_slots = incoming_bank.size(1)
+
+            # Compute parallel scores: shape is (batch, seq_len, total_slots)
+            scores = torch.matmul(full_query, full_key.transpose(1, 2)) / (dim**0.5)
+
+            # Construct causal block-level mask: shape is (seq_len, total_slots)
+            t_indices = torch.arange(seq_len, device=hidden_states.device)
+            block_indices = t_indices // stride
+            limits = block_indices * self.slots
+            s_indices = torch.arange(total_slots, device=hidden_states.device)
+            mask = s_indices.unsqueeze(0) >= limits.unsqueeze(1)  # True for future slots
+
+            # Apply mask and compute weights
+            scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
+            weights_history = torch.softmax(scores.float(), dim=-1).type_as(full_query)
+
+            # Compute history context: shape is (batch, seq_len, dim)
+            precomputed_history_context = torch.matmul(weights_history, incoming_bank)
+
+            # Compute history telemetry in parallel outside the loop
+            probs = weights_history.float().clamp_min(1e-6)
+            entropy = -(probs * probs.log()).sum(dim=-1)  # (batch, seq_len)
+            focus = weights_history.max(dim=-1).values  # (batch, seq_len)
+
+            # Calculate average telemetry for valid tokens (limits > 0)
+            valid_mask = limits > 0
+            if valid_mask.any():
+                history_read_entropy = entropy[:, valid_mask].mean().type_as(hidden_states)
+                history_read_max = focus[:, valid_mask].mean().type_as(hidden_states)
 
         for block_idx in range(block_count):
             start = block_idx * stride
             end = min(seq_len, start + stride)
             block_context, block_weights, block_confidence = self.read(hidden_states[:, start:end, :], current)
-            history_slots = incoming_trace[:, :block_idx, :, :] if incoming_trace is not None else None
-            history_context, history_entropy, history_focus = self._read_history(
-                hidden_states[:, start:end, :],
-                history_slots,
-            )
-            if history_slots is not None and history_slots.size(1) > 0:
+
+            if incoming_trace is not None and block_idx > 0:
+                history_context = precomputed_history_context[:, start:end, :]
                 block_context = 0.5 * (block_context + history_context)
+
             context[:, start:end, :] = block_context
             weights[:, start:end, :] = block_weights
             confidence[:, start:end, :] = block_confidence
-            history_entropies.append(history_entropy)
-            history_focuses.append(history_focus)
 
             summary = token_semantic[:, start:end, :].mean(dim=1)
             next_state, metrics = self.update_slots(current, summary)
@@ -143,15 +176,13 @@ class WorldStateSlots(nn.Module):
                 metric_values.setdefault(key, []).append(value)
 
         averaged = {
-            key: torch.stack(values).mean().type_as(hidden_states)
-            for key, values in metric_values.items()
-            if values
+            key: torch.stack(values).mean().type_as(hidden_states) for key, values in metric_values.items() if values
         }
         if velocities:
             averaged["state_velocity"] = torch.stack(velocities).mean().type_as(hidden_states)
             averaged["state_acceleration"] = torch.stack(accelerations).mean().type_as(hidden_states)
-            averaged["history_read_entropy"] = torch.stack(history_entropies).mean().type_as(hidden_states)
-            averaged["history_read_max"] = torch.stack(history_focuses).mean().type_as(hidden_states)
+            averaged["history_read_entropy"] = history_read_entropy
+            averaged["history_read_max"] = history_read_max
         else:
             zero = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
             averaged["state_velocity"] = zero

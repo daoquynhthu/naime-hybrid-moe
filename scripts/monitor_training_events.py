@@ -13,13 +13,13 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def run_text(command: list[str], timeout: int = 20) -> tuple[int, str]:
@@ -142,7 +142,7 @@ def file_snapshot(run_dir: Path) -> list[dict[str, Any]]:
                 "name": path.name,
                 "is_dir": path.is_dir(),
                 "size": stat.st_size,
-                "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+                "mtime": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(timespec="seconds"),
             }
         )
     model_dir = run_dir / "models"
@@ -157,7 +157,7 @@ def file_snapshot(run_dir: Path) -> list[dict[str, Any]]:
                     "name": f"models/{path.name}",
                     "is_dir": path.is_dir(),
                     "size": stat.st_size,
-                    "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+                    "mtime": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(timespec="seconds"),
                 }
             )
     return rows

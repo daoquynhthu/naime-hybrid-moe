@@ -104,6 +104,7 @@ param(
     [switch]$StructuralStop,
     [switch]$PrintArgs,
     [switch]$ResearchUnsafe,
+    [int]$MaxSteps = -1,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ExtraArgs
 )
@@ -252,6 +253,10 @@ if ($LrCycleLength -gt 0) {
 
 if ($effectiveTargetTokens -gt 0) {
     $common += @("--target-tokens", "$effectiveTargetTokens")
+}
+
+if ($MaxSteps -gt 0) {
+    $common += @("--max-steps", "$MaxSteps")
 }
 
 if ($AsyncLatest) {

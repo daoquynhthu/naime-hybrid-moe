@@ -43,8 +43,7 @@ def normalize_state_dict_for_model(
     source_nested = any(f".{COMPILED_PREFIX}" in key for key in source_keys)
     if target_nested and not source_nested:
         target_by_native = {
-            key.removeprefix(COMPILED_PREFIX).replace(f".{COMPILED_PREFIX}", "."): key
-            for key in target_keys
+            key.removeprefix(COMPILED_PREFIX).replace(f".{COMPILED_PREFIX}", "."): key for key in target_keys
         }
         return {target_by_native.get(key, key): value for key, value in state_dict.items()}
     if source_nested and not target_nested:

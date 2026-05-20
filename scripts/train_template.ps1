@@ -35,6 +35,7 @@ param(
     [double]$SelfStateWorldGateMin = -1.0,
     [double]$SelfStateWorldGateScale = -1.0,
     [string]$Device = "",
+    [int]$MaxSteps = -1,
     [switch]$NoAutoBatch,
     [switch]$UseVoice,
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -165,6 +166,7 @@ Add-Override $params "SemanticGateMixerMaxStateWeight" $SemanticGateMixerMaxStat
 Add-Override $params "SelfStateWorldGateMin" $SelfStateWorldGateMin { $SelfStateWorldGateMin -ge 0.0 }
 Add-Override $params "SelfStateWorldGateScale" $SelfStateWorldGateScale { $SelfStateWorldGateScale -gt 0.0 }
 Add-Override $params "Device" $Device { -not [string]::IsNullOrWhiteSpace($Device) }
+Add-Override $params "MaxSteps" $MaxSteps { $MaxSteps -gt 0 }
 
 if ($NoAutoBatch) {
     $params["NoAutoBatch"] = $true

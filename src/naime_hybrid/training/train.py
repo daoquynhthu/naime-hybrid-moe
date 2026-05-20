@@ -405,7 +405,9 @@ def main() -> None:
             False,
         )
     data_iter = _cycle_loader(loader, pre_cuda_iterator)
-    logger.info("dataset_size=%s initial_batch_size=%s seq_len=%s", len(dataset), config.batch_size, config.model.max_seq_len)
+    logger.info(
+        "dataset_size=%s initial_batch_size=%s seq_len=%s", len(dataset), config.batch_size, config.model.max_seq_len
+    )
 
     device = resolve_device(config.device)
     if device.type == "cuda":
@@ -435,7 +437,10 @@ def main() -> None:
         if os.name == "nt" and config.num_workers > 0:
             _shutdown_loader_iterator(pre_cuda_iterator, logger)
             pre_cuda_iterator = None
-            logger.info("auto-batch selected batch=%d; disabling data workers on Windows to avoid CUDA-spawn conflict", config.batch_size)
+            logger.info(
+                "auto-batch selected batch=%d; disabling data workers on Windows to avoid CUDA-spawn conflict",
+                config.batch_size,
+            )
             loader = _build_loader(
                 dataset,
                 batch_size=config.batch_size,
@@ -687,7 +692,7 @@ def main() -> None:
     grad_explosion_streak = 0
     bad_grad_window: deque[int] = deque()
     lr_safety_factor = 1.0
-    last_lr_backoff_step = -10**9
+    last_lr_backoff_step = -(10**9)
     bad_grad_window_steps = 500
     bad_grad_window_threshold = 15
     bad_grad_backoff_cooldown = 500
@@ -731,7 +736,9 @@ def main() -> None:
         for step in range(start_step + 1, config.max_steps + 1):
             if stop_signals.requested:
                 save_step = max(start_step, step - 1)
-                logger.warning("stop signal requested before next step (%s); saving at step=%d", stop_signals.reason, save_step)
+                logger.warning(
+                    "stop signal requested before next step (%s); saving at step=%d", stop_signals.reason, save_step
+                )
                 _save_shutdown_checkpoint(
                     reason_name="interrupted",
                     checkpoint_writer=checkpoint_writer,
@@ -749,9 +756,9 @@ def main() -> None:
                 )
                 logger.info("signal checkpoint saved by subprocess; exiting cleanly")
                 break
-            batch_loss = 0.0
-            batch_lm_loss = 0.0
-            metrics: dict[str, float] = {}
+            batch_loss_gpu = torch.tensor(0.0, device=device)
+            batch_lm_loss_gpu = torch.tensor(0.0, device=device)
+            gpu_metrics_accum = {}
             for _micro_step in range(config.grad_accum_steps):
                 batch = next(data_iter)
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -803,112 +810,85 @@ def main() -> None:
                     )
                     total_loss = total_loss / config.grad_accum_steps
 
-                if not torch.isfinite(total_loss.detach()):
-                    raise FloatingPointError(f"non-finite loss at step {step}: {float(total_loss.detach())}")
-
                 scaler.scale(total_loss).backward()
-                batch_loss += float(total_loss.detach()) * config.grad_accum_steps
-                batch_lm_loss += float(main_loss.detach())
-                metrics = {
-                    "loss_total": float(total_loss.detach()) * config.grad_accum_steps,
-                    "loss_lm": float(main_loss.detach()),
-                    "loss_load": float(aux["load"].detach()),
-                    "loss_sparse": float(aux["sparse"].detach()),
-                    "loss_kl": float(aux["kl"].detach()),
-                    "loss_semantic_pred": float(aux["semantic_pred"].detach()),
-                    "loss_v5_state_pred": float(aux["v5_state_pred"].detach()),
-                    "loss_v5_slot_diversity": float(aux["v5_slot_diversity"].detach()),
-                    "loss_v5_slot_stability": float(aux["v5_slot_stability"].detach()),
-                    "loss_v6_self_pred": float(aux["v6_self_pred"].detach()),
-                    "loss_v6_slot_diversity": float(aux["v6_slot_diversity"].detach()),
-                    "loss_load_contrib": float(load_contrib.detach()),
-                    "loss_sparse_contrib": float(sparse_contrib.detach()),
-                    "loss_kl_contrib": float(kl_contrib.detach()),
-                    "loss_semantic_pred_contrib": float(semantic_pred_contrib.detach()),
-                    "loss_v5_state_pred_contrib": float(state_pred_contrib.detach()),
-                    "loss_v5_slot_diversity_contrib": float(slot_diversity_contrib.detach()),
-                    "loss_v5_slot_stability_contrib": float(slot_stability_contrib.detach()),
-                    "loss_v6_self_pred_contrib": float(self_pred_contrib.detach()),
-                    "loss_v6_slot_diversity_contrib": float(self_slot_diversity_contrib.detach()),
-                    "router_entropy": float(aux["router_entropy"].detach()),
-                    "semantic_prior_entropy": float(aux["semantic_prior_entropy"].detach()),
-                    "fusion_mid_weight": float(aux["fusion_mid_weight"].detach()),
-                    "fusion_global_weight": float(aux["fusion_global_weight"].detach()),
-                    "alpha_mean": float(aux["alpha_mean"].detach()),
-                    "alpha_raw_mean": float(aux["alpha_raw_mean"].detach()),
-                    "alpha_prob_mean": float(aux["alpha_prob_mean"].detach()),
-                    "alpha_clean_prob_mean": float(aux["alpha_clean_prob_mean"].detach()),
-                    "alpha_capped_mean": float(aux["alpha_capped_mean"].detach()),
-                    "alpha_downstream_mean": float(aux["alpha_downstream_mean"].detach()),
-                    "v4_layer_scale": float(aux["v4_layer_scale"].detach()),
-                    "v4_state_norm": float(aux["v4_state_norm"].detach()),
-                    "v4_memory_norm": float(aux["v4_memory_norm"].detach()),
-                    "v4_memory_gate": float(aux["v4_memory_gate"].detach()),
-                    "v4_memory_attention_entropy": float(aux["v4_memory_attention_entropy"].detach()),
-                    "v4_memory_read_strength": float(aux["v4_memory_read_strength"].detach()),
-                    "v4_memory_novelty": float(aux["v4_memory_novelty"].detach()),
-                    "v4_state_gate": float(aux["v4_state_gate"].detach()),
-                    "v4_state_confidence": float(aux["v4_state_confidence"].detach()),
-                    "v4_state_delta": float(aux["v4_state_delta"].detach()),
-                    "v4_state_agreement": float(aux["v4_state_agreement"].detach()),
-                    "gate_mix_alpha_weight": float(aux["gate_mix_alpha_weight"].detach()),
-                    "gate_mix_clean_weight": float(aux["gate_mix_clean_weight"].detach()),
-                    "gate_mix_state_weight": float(aux["gate_mix_state_weight"].detach()),
-                    "v5_state_pred": float(aux["v5_state_pred"].detach()),
-                    "v5_slot_diversity": float(aux["v5_slot_diversity"].detach()),
-                    "v5_slot_stability": float(aux["v5_slot_stability"].detach()),
-                    "v5_slot_update_gate": float(aux["v5_slot_update_gate"].detach()),
-                    "v5_slot_write_max": float(aux["v5_slot_write_max"].detach()),
-                    "v5_slot_write_entropy": float(aux["v5_slot_write_entropy"].detach()),
-                    "v5_slot_write_min": float(aux["v5_slot_write_min"].detach()),
-                    "v5_slot_write_active": float(aux["v5_slot_write_active"].detach()),
-                    "v5_slot_confidence": float(aux["v5_slot_confidence"].detach()),
-                    "v5_slot_confidence_std": float(aux["v5_slot_confidence_std"].detach()),
-                    "v5_slot_delta": float(aux["v5_slot_delta"].detach()),
-                    "v5_slot_cosine": float(aux["v5_slot_cosine"].detach()),
-                    "v5_slot_read_entropy": float(aux["v5_slot_read_entropy"].detach()),
-                    "v5_slot_read_max": float(aux["v5_slot_read_max"].detach()),
-                    "v5_router_semantic_norm": float(aux["v5_router_semantic_norm"].detach()),
-                    "v5_router_world_norm": float(aux["v5_router_world_norm"].detach()),
-                    "v5_router_world_ratio": float(aux["v5_router_world_ratio"].detach()),
-                    "v5_router_world_cosine": float(aux["v5_router_world_cosine"].detach()),
-                    "v5_router_world_gate": float(aux["v5_router_world_gate"].detach()),
-                    "v5_router_memory_norm": float(aux["v5_router_memory_norm"].detach()),
-                    "v5_router_memory_ratio": float(aux["v5_router_memory_ratio"].detach()),
-                    "v5_router_effective_norm": float(aux["v5_router_effective_norm"].detach()),
-                    "v5_semantic_hidden_write_norm": float(aux["v5_semantic_hidden_write_norm"].detach()),
-                    "v5_semantic_hidden_write_scale": float(aux["v5_semantic_hidden_write_scale"].detach()),
-                    "v5_memory_hidden_write_norm": float(aux["v5_memory_hidden_write_norm"].detach()),
-                    "v5_memory_hidden_write_scale": float(aux["v5_memory_hidden_write_scale"].detach()),
-                    "v6_self_pred": float(aux["v6_self_pred"].detach()),
-                    "v6_slot_diversity": float(aux["v6_slot_diversity"].detach()),
-                    "v6_slot_cosine": float(aux["v6_slot_cosine"].detach()),
-                    "v6_slot_context_cosine": float(aux["v6_slot_context_cosine"].detach()),
-                    "v6_state_delta": float(aux["v6_state_delta"].detach()),
-                    "v6_state_norm": float(aux["v6_state_norm"].detach()),
-                    "v6_reflection_norm": float(aux["v6_reflection_norm"].detach()),
-                    "v6_world_explained_norm": float(aux["v6_world_explained_norm"].detach()),
-                    "v6_hidden_residual_norm": float(aux["v6_hidden_residual_norm"].detach()),
-                    "v6_world_residual_ratio": float(aux["v6_world_residual_ratio"].detach()),
-                    "v6_hidden_write_gate": float(aux["v6_hidden_write_gate"].detach()),
-                    "v6_hidden_write_norm": float(aux["v6_hidden_write_norm"].detach()),
-                    "v6_hidden_write_scale": float(aux["v6_hidden_write_scale"].detach()),
-                    "v6_boundary_entropy": float(aux["v6_boundary_entropy"].detach()),
-                    "v6_boundary_self": float(aux["v6_boundary_self"].detach()),
-                    "v6_boundary_world": float(aux["v6_boundary_world"].detach()),
-                    "v6_boundary_other": float(aux["v6_boundary_other"].detach()),
-                    "v6_boundary_unknown": float(aux["v6_boundary_unknown"].detach()),
-                    "dispatch_dense": float(aux["dispatch_dense"].detach()),
-                    "lambda_sparse_effective": float(w_sparse),
-                    "lambda_kl_effective": float(w_kl * kl_warmup),
-                    "lambda_state_pred_effective": float(w_state_pred),
-                    "lambda_slot_diversity_effective": float(w_slot_div),
-                    "lambda_self_pred_effective": float(w_self_pred),
-                    "lambda_self_slot_diversity_effective": float(w_self_slot_div),
+                batch_loss_gpu = batch_loss_gpu + total_loss.detach() * config.grad_accum_steps
+                batch_lm_loss_gpu = batch_lm_loss_gpu + main_loss.detach()
+
+                micro_step_gpu = {
+                    "loss_total": total_loss.detach() * config.grad_accum_steps,
+                    "loss_lm": main_loss.detach(),
+                    "loss_load": aux["load"].detach(),
+                    "loss_sparse": aux["sparse"].detach(),
+                    "loss_kl": aux["kl"].detach(),
+                    "loss_semantic_pred": aux["semantic_pred"].detach(),
+                    "loss_v5_state_pred": aux["v5_state_pred"].detach(),
+                    "loss_v5_slot_diversity": aux["v5_slot_diversity"].detach(),
+                    "loss_v5_slot_stability": aux["v5_slot_stability"].detach(),
+                    "loss_v6_self_pred": aux["v6_self_pred"].detach(),
+                    "loss_v6_slot_diversity": aux["v6_slot_diversity"].detach(),
+                    "loss_load_contrib": load_contrib.detach(),
+                    "loss_sparse_contrib": sparse_contrib.detach(),
+                    "loss_kl_contrib": kl_contrib.detach(),
+                    "loss_semantic_pred_contrib": semantic_pred_contrib.detach(),
+                    "loss_v5_state_pred_contrib": state_pred_contrib.detach(),
+                    "loss_v5_slot_diversity_contrib": slot_diversity_contrib.detach(),
+                    "loss_v5_slot_stability_contrib": slot_stability_contrib.detach(),
+                    "loss_v6_self_pred_contrib": self_pred_contrib.detach(),
+                    "loss_v6_slot_diversity_contrib": self_slot_diversity_contrib.detach(),
+                }
+                for k, v in aux.items():
+                    if isinstance(v, torch.Tensor):
+                        micro_step_gpu[k] = v.detach()
+
+                if not gpu_metrics_accum:
+                    gpu_metrics_accum = {k: v.clone() for k, v in micro_step_gpu.items()}
+                else:
+                    for k, v in micro_step_gpu.items():
+                        if k in gpu_metrics_accum:
+                            gpu_metrics_accum[k] = gpu_metrics_accum[k] + v
+                        else:
+                            gpu_metrics_accum[k] = v.clone()
+
+            # Average accumulated metrics on GPU
+            if gpu_metrics_accum:
+                for k in gpu_metrics_accum:
+                    gpu_metrics_accum[k] = gpu_metrics_accum[k] / config.grad_accum_steps
+
+            # Stack and transfer all GPU tensors to CPU in a single batch transfer
+            gpu_keys = list(gpu_metrics_accum.keys())
+            tensors_to_stack = [gpu_metrics_accum[k].float() for k in gpu_keys] + [
+                batch_loss_gpu.float(),
+                batch_lm_loss_gpu.float(),
+            ]
+            stacked_gpu = torch.stack(tensors_to_stack)
+            stacked_cpu = stacked_gpu.cpu()
+            float_vals = stacked_cpu.tolist()
+
+            # Map back to float values
+            metrics = dict(zip(gpu_keys, float_vals[: len(gpu_keys)], strict=True))
+            batch_loss = float_vals[len(gpu_keys)]
+            batch_lm_loss = float_vals[len(gpu_keys) + 1]
+
+            # Check for non-finite values on CPU
+            if not math.isfinite(batch_loss) or not math.isfinite(batch_lm_loss):
+                raise FloatingPointError(
+                    f"non-finite loss at step {step}: batch_loss={batch_loss}, batch_lm_loss={batch_lm_loss}"
+                )
+
+            # Populate effective lambdas and scheduler metrics
+            metrics.update(
+                {
+                    "lambda_sparse_effective": float(config.lambda_sparse),
+                    "lambda_kl_effective": float(config.lambda_kl * kl_warmup),
+                    "lambda_state_pred_effective": float(config.lambda_state_pred),
+                    "lambda_slot_diversity_effective": float(config.lambda_slot_diversity),
+                    "lambda_self_pred_effective": float(config.lambda_self_pred),
+                    "lambda_self_slot_diversity_effective": float(config.lambda_self_slot_diversity),
                     "lr_safety_factor": float(lr_safety_factor),
                     "bad_grad_window_count": float(len(bad_grad_window)),
                     "balancer_conf": 0.0,
                 }
+            )
 
             if config.grad_clip > 0:
                 scaler.unscale_(optimizer)

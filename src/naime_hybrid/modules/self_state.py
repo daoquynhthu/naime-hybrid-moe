@@ -238,6 +238,23 @@ class RecursiveSelfState(nn.Module):
         zero_summary = hidden_states.new_zeros(batch_size, hidden_states.size(-1))
         incoming_world_trace = world_state if world_state is not None and world_state.ndim == 4 else None
 
+        block_count = (seq_len + block_size - 1) // block_size
+
+        # Precompute static, compile-friendly history summaries outside the loop
+        precomputed_self_summaries = zero_summary.unsqueeze(1).expand(-1, block_count, -1).clone()
+        if incoming_self_trace is not None and block_count > 1:
+            self_block_summaries = self.self_norm(incoming_self_trace).mean(dim=2)
+            self_cumsum = torch.cumsum(self_block_summaries, dim=1)
+            steps = torch.arange(1, block_count, device=hidden_states.device, dtype=hidden_states.dtype).view(1, -1, 1)
+            precomputed_self_summaries[:, 1:, :] = self_cumsum[:, : block_count - 1, :] / steps
+
+        precomputed_world_summaries = zero_summary.unsqueeze(1).expand(-1, block_count, -1).clone()
+        if incoming_world_trace is not None and block_count > 1:
+            world_block_summaries = self.world_norm(incoming_world_trace).mean(dim=2)
+            world_cumsum = torch.cumsum(world_block_summaries, dim=1)
+            steps = torch.arange(1, block_count, device=hidden_states.device, dtype=hidden_states.dtype).view(1, -1, 1)
+            precomputed_world_summaries[:, 1:, :] = world_cumsum[:, : block_count - 1, :] / steps
+
         # Compute per-token norm + boundary once for the full sequence.
         normed_hidden = self.hidden_norm(hidden_states)
         boundary_logits = self.boundary(normed_hidden.float()) / self.boundary_temperature
@@ -279,16 +296,8 @@ class RecursiveSelfState(nn.Module):
             normed_block = normed_hidden[:, start:end, :]
             block_boundary = boundary_probs[:, start:end, :]
             state_before_block = current
-            if incoming_self_trace is not None and block_idx > 0:
-                past_self = incoming_self_trace[:, :block_idx, :, :].reshape(batch_size, -1, hidden_states.size(-1))
-                history_self_summary = self.self_norm(past_self).mean(dim=1)
-            else:
-                history_self_summary = zero_summary
-            if incoming_world_trace is not None and block_idx > 0:
-                past_world = incoming_world_trace[:, :block_idx, :, :].reshape(batch_size, -1, hidden_states.size(-1))
-                world_summary = self.world_norm(past_world).mean(dim=1)
-            else:
-                world_summary = zero_summary
+            history_self_summary = precomputed_self_summaries[:, block_idx, :]
+            world_summary = precomputed_world_summaries[:, block_idx, :]
             history_residual_summary = self._world_residual(history_self_summary, world_summary)
 
             pooled_self = self.self_norm(current).mean(dim=1)

@@ -37,6 +37,8 @@
     "LatestEvery": 2500,
     "EvalEvery": 2500,
     "EvalMaxBatches": 20,
-    "Resume": "none"
+    "Resume": "none",
+    "CompileModel": true,
+    "MaxSteps": 500
   }
 }

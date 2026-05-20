@@ -380,11 +380,7 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
         memory_read_strength = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
         memory_novelty = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
         memory_hidden_write = torch.zeros_like(router_semantic)
-        if (
-            self.config.semantic_causal
-            and self.world_state_slots is not None
-            and world_state is not None
-        ):
+        if self.config.semantic_causal and self.world_state_slots is not None and world_state is not None:
             state_context, state_weights, state_confidence, world_state, v5_metrics = (
                 self.world_state_slots.read_update_sequence(
                     hidden_states,
@@ -393,11 +389,15 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
                     stride=max(self.config.stride, self.config.causal_state_stride),
                 )
             )
-            effective_state_scale = state_scale * state_confidence if self.config.semantic_state_confidence_gate else state_scale
+            effective_state_scale = (
+                state_scale * state_confidence if self.config.semantic_state_confidence_gate else state_scale
+            )
             world_component = effective_state_scale * self.state_proj(state_context)
             router_semantic = router_semantic + world_component
         elif not self.config.semantic_causal:
-            effective_state_scale = state_scale * state_confidence if self.config.semantic_state_confidence_gate else state_scale
+            effective_state_scale = (
+                state_scale * state_confidence if self.config.semantic_state_confidence_gate else state_scale
+            )
             world_component = effective_state_scale * self.state_proj(state_context)
             router_semantic = router_semantic + world_component
 

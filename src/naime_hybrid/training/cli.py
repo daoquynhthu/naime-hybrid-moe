@@ -103,7 +103,9 @@ def parse_args() -> argparse.Namespace:
         choices=["random", "sequential"],
         help="random avoids repeatedly validating only the prefix of the validation split; sequential keeps legacy order.",
     )
-    parser.add_argument("--eval-seed", type=int, default=4321, help="Seed for deterministic random validation sampling.")
+    parser.add_argument(
+        "--eval-seed", type=int, default=4321, help="Seed for deterministic random validation sampling."
+    )
     parser.add_argument(
         "--early-stop-patience",
         type=int,

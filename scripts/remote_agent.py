@@ -145,7 +145,9 @@ def build_training_args(state: AgentState, payload: dict[str, Any]) -> tuple[lis
     run_dir = Path(payload.get("run_dir") or state.run_root / run_name)
     data_path = payload.get(
         "data_path",
-        _workspace_value("local", "fineweb_edu_50m", "NAIME_DEFAULT_DATASET", str(DEFAULT_ROOT / "datasets" / "fineweb_edu_50m")),
+        _workspace_value(
+            "local", "fineweb_edu_50m", "NAIME_DEFAULT_DATASET", str(DEFAULT_ROOT / "datasets" / "fineweb_edu_50m")
+        ),
     )
 
     if payload.get("template"):
@@ -257,7 +259,8 @@ def build_training_args(state: AgentState, payload: dict[str, Any]) -> tuple[lis
         str(state.python),
         "--run-dir",
         str(run_dir),
-        "--max-restarts", "0",
+        "--max-restarts",
+        "0",
         "--",
         *trainer_flags,
     ]

@@ -369,13 +369,9 @@ def collect_aux_losses(
         "v5_slot_cosine": torch.stack(v5_slot_cosines).mean() if v5_slot_cosines else zero,
         "v5_slot_read_entropy": torch.stack(v5_slot_read_entropies).mean() if v5_slot_read_entropies else zero,
         "v5_slot_read_max": torch.stack(v5_slot_read_maxes).mean() if v5_slot_read_maxes else zero,
-        "v5_history_read_entropy": torch.stack(v5_history_read_entropies).mean()
-        if v5_history_read_entropies
-        else zero,
+        "v5_history_read_entropy": torch.stack(v5_history_read_entropies).mean() if v5_history_read_entropies else zero,
         "v5_history_read_max": torch.stack(v5_history_read_maxes).mean() if v5_history_read_maxes else zero,
-        "v5_router_semantic_norm": torch.stack(v5_router_semantic_norms).mean()
-        if v5_router_semantic_norms
-        else zero,
+        "v5_router_semantic_norm": torch.stack(v5_router_semantic_norms).mean() if v5_router_semantic_norms else zero,
         "v5_router_world_norm": torch.stack(v5_router_world_norms).mean() if v5_router_world_norms else zero,
         "v5_router_world_ratio": torch.stack(v5_router_world_ratios).mean() if v5_router_world_ratios else zero,
         "v5_router_world_cosine": torch.stack(v5_router_world_cosines).mean() if v5_router_world_cosines else zero,
@@ -406,15 +402,9 @@ def collect_aux_losses(
         "v6_state_acceleration": torch.stack(v6_state_accelerations).mean() if v6_state_accelerations else zero,
         "v6_state_norm": torch.stack(v6_state_norms).mean() if v6_state_norms else zero,
         "v6_reflection_norm": torch.stack(v6_reflection_norms).mean() if v6_reflection_norms else zero,
-        "v6_world_explained_norm": torch.stack(v6_world_explained_norms).mean()
-        if v6_world_explained_norms
-        else zero,
-        "v6_hidden_residual_norm": torch.stack(v6_hidden_residual_norms).mean()
-        if v6_hidden_residual_norms
-        else zero,
-        "v6_world_residual_ratio": torch.stack(v6_world_residual_ratios).mean()
-        if v6_world_residual_ratios
-        else zero,
+        "v6_world_explained_norm": torch.stack(v6_world_explained_norms).mean() if v6_world_explained_norms else zero,
+        "v6_hidden_residual_norm": torch.stack(v6_hidden_residual_norms).mean() if v6_hidden_residual_norms else zero,
+        "v6_world_residual_ratio": torch.stack(v6_world_residual_ratios).mean() if v6_world_residual_ratios else zero,
         "v6_hidden_write_gate": torch.stack(v6_hidden_write_gates).mean() if v6_hidden_write_gates else zero,
         "v6_hidden_write_norm": torch.stack(v6_hidden_write_norms).mean() if v6_hidden_write_norms else zero,
         "v6_hidden_write_scale": torch.stack(v6_hidden_write_scales).mean() if v6_hidden_write_scales else zero,

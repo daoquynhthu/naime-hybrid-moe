@@ -227,7 +227,9 @@ class NAIMEV5WorldStateMoEDecoder(NAIMEV4StateMoEDecoder):
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
-        public_world_state = world_state[:, -1, :, :] if world_state is not None and world_state.ndim == 4 else world_state
+        public_world_state = (
+            world_state[:, -1, :, :] if world_state is not None and world_state.ndim == 4 else world_state
+        )
         output: dict[str, torch.Tensor | list[dict[str, torch.Tensor]]] = {
             "logits": logits,
             "hidden_states": hidden_states,
@@ -311,7 +313,9 @@ class NAIMEV6RecursiveSelfMoEDecoder(NAIMEV5WorldStateMoEDecoder):
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
-        public_world_state = world_state[:, -1, :, :] if world_state is not None and world_state.ndim == 4 else world_state
+        public_world_state = (
+            world_state[:, -1, :, :] if world_state is not None and world_state.ndim == 4 else world_state
+        )
         public_self_state = self_state[:, -1, :, :] if self_state is not None and self_state.ndim == 4 else self_state
         output: dict[str, torch.Tensor | list[dict[str, torch.Tensor]]] = {
             "logits": logits,

@@ -145,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         import ctypes
+
         # Pin to P-cores only (logical 0-15) to avoid E-core scheduling
         # i7-12700KF: 8 P-cores × 2 HT + 4 E-cores = 20 logical
         mask = 0xFFFF  # bits 0-15 (first 16 logical processors)

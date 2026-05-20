@@ -2,10 +2,11 @@ import os
 import signal
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
-from typing import Any, Callable
+from typing import Any
 
 
 @dataclass
