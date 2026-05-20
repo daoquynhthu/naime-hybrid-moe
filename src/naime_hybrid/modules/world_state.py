@@ -47,6 +47,8 @@ class WorldStateSlots(nn.Module):
 
     def read(self, hidden_states: torch.Tensor, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         query = self.query_norm(hidden_states)
+        if slots.ndim == 4:
+            slots = slots[:, -1, :, :]
         key = self.slot_norm(slots)
         scores = torch.matmul(query, key.transpose(1, 2)) / (query.size(-1) ** 0.5)
         weights = torch.softmax(scores.float(), dim=-1).type_as(hidden_states)
@@ -58,12 +60,120 @@ class WorldStateSlots(nn.Module):
         confidence = (weighted_slot_quality * token_match).type_as(hidden_states)
         return context, weights, confidence
 
+    def _read_history(
+        self,
+        hidden_states: torch.Tensor,
+        history_slots: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if history_slots is None or history_slots.size(1) == 0:
+            zero = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
+            return torch.zeros_like(hidden_states), zero, zero
+
+        batch, _, dim = hidden_states.shape
+        bank = history_slots.reshape(batch, -1, dim)
+        query = self.query_norm(hidden_states)
+        key = self.slot_norm(bank)
+        scores = torch.matmul(query, key.transpose(1, 2)) / (query.size(-1) ** 0.5)
+        weights = torch.softmax(scores.float(), dim=-1).type_as(hidden_states)
+        context = torch.matmul(weights, bank)
+        probs = weights.float().clamp_min(1e-6)
+        entropy = -(probs * probs.log()).sum(dim=-1).mean().type_as(hidden_states)
+        focus = weights.max(dim=-1).values.mean().type_as(hidden_states)
+        return context, entropy, focus
+
+    def read_update_sequence(
+        self,
+        hidden_states: torch.Tensor,
+        token_semantic: torch.Tensor,
+        slots: torch.Tensor,
+        stride: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Read previous world-state per block, then write the current block.
+
+        This is the causal alternative to a full-sequence state summary:
+        tokens in block k can read only state produced by blocks < k, while
+        block k writes state for blocks > k.
+        """
+        batch, seq_len, dim = hidden_states.shape
+        block_count = (seq_len + stride - 1) // stride
+        context = torch.zeros_like(hidden_states)
+        weights = torch.zeros(batch, seq_len, self.slots, device=hidden_states.device, dtype=hidden_states.dtype)
+        confidence = torch.ones(batch, seq_len, 1, device=hidden_states.device, dtype=hidden_states.dtype)
+        incoming_trace = slots if slots.ndim == 4 else None
+        current = (
+            self.initial_state(batch, hidden_states.device, hidden_states.dtype)
+            if incoming_trace is not None
+            else slots
+        )
+        state_trace: list[torch.Tensor] = []
+        metric_values: dict[str, list[torch.Tensor]] = {}
+        history_entropies: list[torch.Tensor] = []
+        history_focuses: list[torch.Tensor] = []
+        previous_delta = hidden_states.new_tensor(0.0)
+        velocities: list[torch.Tensor] = []
+        accelerations: list[torch.Tensor] = []
+
+        for block_idx in range(block_count):
+            start = block_idx * stride
+            end = min(seq_len, start + stride)
+            block_context, block_weights, block_confidence = self.read(hidden_states[:, start:end, :], current)
+            history_slots = incoming_trace[:, :block_idx, :, :] if incoming_trace is not None else None
+            history_context, history_entropy, history_focus = self._read_history(
+                hidden_states[:, start:end, :],
+                history_slots,
+            )
+            if history_slots is not None and history_slots.size(1) > 0:
+                block_context = 0.5 * (block_context + history_context)
+            context[:, start:end, :] = block_context
+            weights[:, start:end, :] = block_weights
+            confidence[:, start:end, :] = block_confidence
+            history_entropies.append(history_entropy)
+            history_focuses.append(history_focus)
+
+            summary = token_semantic[:, start:end, :].mean(dim=1)
+            next_state, metrics = self.update_slots(current, summary)
+            state_delta = (next_state - current).float().pow(2).mean(dim=-1).sqrt().mean()
+            velocities.append(state_delta)
+            accelerations.append((state_delta - previous_delta).abs())
+            previous_delta = state_delta.detach()
+            current = next_state
+            state_trace.append(current)
+
+            for key, value in metrics.items():
+                metric_values.setdefault(key, []).append(value)
+
+        averaged = {
+            key: torch.stack(values).mean().type_as(hidden_states)
+            for key, values in metric_values.items()
+            if values
+        }
+        if velocities:
+            averaged["state_velocity"] = torch.stack(velocities).mean().type_as(hidden_states)
+            averaged["state_acceleration"] = torch.stack(accelerations).mean().type_as(hidden_states)
+            averaged["history_read_entropy"] = torch.stack(history_entropies).mean().type_as(hidden_states)
+            averaged["history_read_max"] = torch.stack(history_focuses).mean().type_as(hidden_states)
+        else:
+            zero = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
+            averaged["state_velocity"] = zero
+            averaged["state_acceleration"] = zero
+            averaged["history_read_entropy"] = zero
+            averaged["history_read_max"] = zero
+
+        if state_trace:
+            traced_state = torch.stack(state_trace, dim=1)
+        else:
+            traced_state = current.unsqueeze(1)
+
+        return context, weights, confidence, traced_state, averaged
+
     def update_slots(
         self,
         slots: torch.Tensor,
         semantic_summary: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         summary = semantic_summary.detach() if self.pred_detach_target else semantic_summary
+        if slots.ndim == 4:
+            slots = slots[:, -1, :, :]
         identity = self.slot_identity.to(device=slots.device, dtype=slots.dtype).unsqueeze(0).expand_as(slots)
         normalized_slots = self.slot_norm(slots)
         normalized_summary = self.summary_norm(summary)

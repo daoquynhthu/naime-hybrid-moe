@@ -227,10 +227,11 @@ class NAIMEV5WorldStateMoEDecoder(NAIMEV4StateMoEDecoder):
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
+        public_world_state = world_state[:, -1, :, :] if world_state is not None and world_state.ndim == 4 else world_state
         output: dict[str, torch.Tensor | list[dict[str, torch.Tensor]]] = {
             "logits": logits,
             "hidden_states": hidden_states,
-            "world_state": world_state,
+            "world_state": public_world_state,
         }
         if return_aux:
             output["aux"] = aux_by_layer
@@ -254,6 +255,9 @@ class NAIMEV6RecursiveSelfMoEDecoder(NAIMEV5WorldStateMoEDecoder):
             identity_scale=config.self_state_identity_scale,
             context_score_scale=config.self_state_context_score_scale,
             pred_detach_target=config.self_state_pred_detach_target,
+            world_gate=config.self_state_world_gate,
+            world_gate_min=config.self_state_world_gate_min,
+            world_gate_scale=config.self_state_world_gate_scale,
         )
         self.self_state_slots.apply(_init_weights)
 
@@ -296,6 +300,8 @@ class NAIMEV6RecursiveSelfMoEDecoder(NAIMEV5WorldStateMoEDecoder):
                     attention_mask=attention_mask,
                     world_state=world_state,
                     self_state=self_state,
+                    causal_safe=self.config.semantic_causal,
+                    block_size=max(self.config.stride, self.config.causal_state_stride),
                 )
                 aux["v6"] = v6_aux
             else:
@@ -305,11 +311,13 @@ class NAIMEV6RecursiveSelfMoEDecoder(NAIMEV5WorldStateMoEDecoder):
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
+        public_world_state = world_state[:, -1, :, :] if world_state is not None and world_state.ndim == 4 else world_state
+        public_self_state = self_state[:, -1, :, :] if self_state is not None and self_state.ndim == 4 else self_state
         output: dict[str, torch.Tensor | list[dict[str, torch.Tensor]]] = {
             "logits": logits,
             "hidden_states": hidden_states,
-            "world_state": world_state,
-            "self_state": self_state,
+            "world_state": public_world_state,
+            "self_state": public_self_state,
         }
         if return_aux:
             output["aux"] = aux_by_layer

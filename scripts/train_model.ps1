@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("dense", "token_moe", "naime_v1", "naime_v2", "naime_v2_hybrid", "naime_v3_safe", "naime_v3_aggressive", "naime_v3_repaired", "naime_v4_state_moe", "naime_v41_state_moe", "naime_v42_state_moe", "naime_v5_world_state_moe", "naime_v6_recursive_self_moe")]
+    [ValidateSet("dense", "token_moe", "naime_state_moe", "naime_v4_state_moe", "naime_v5_world_state_moe", "naime_v6_recursive_self_moe")]
     [string]$Model,
     [switch]$UseVoice,
     [string]$RunName = "",
@@ -9,6 +9,7 @@ param(
     [string]$DataPath = "data\naime\wikitext_processed",
     [int64]$TargetTokens = 12288000,
     [int]$SeqLen = 512,
+    [int]$BatchSize = 4,
     [int]$DModel = 384,
     [int]$Layers = 8,
     [int]$DenseLayers = 2,
@@ -22,11 +23,14 @@ param(
     [ValidateSet("auto", "dense", "sparse")]
     [string]$MoeDispatchMode = "auto",
     [int]$Stride = 16,
+    [int]$CausalStateStride = 512,
     [int]$Window = 24,
     [int]$ZDim = 96,
     [double]$LogvarClip = 10.0,
     [double]$VramFraction = 0.90,
     [int]$AutoBatchMax = 64,
+    [switch]$NoAutoBatch,
+    [switch]$NoAdaptiveDefaults,
     [int]$NumWorkers = 4,
     [int]$GradAccumSteps = 1,
     [double]$LearningRate = 0.0003,
@@ -38,6 +42,11 @@ param(
     [double]$GradClip = 1.0,
     [string]$Device = "auto",
     [switch]$CompileModel,
+    [ValidateSet("full", "dense")]
+    [string]$CompileScope = "full",
+    [ValidateSet("inductor", "eager", "aot_eager")]
+    [string]$CompileBackend = "inductor",
+    [switch]$DisableFlashSdp,
     [switch]$NoAmp,
     [int]$SaveEvery = 2000,
     [int]$LatestEvery = 1000,
@@ -47,6 +56,9 @@ param(
     [string]$BestCheckpointMode = "model",
     [int]$EvalEvery = 100,
     [int]$EvalMaxBatches = 10,
+    [ValidateSet("random", "sequential")]
+    [string]$EvalSampling = "random",
+    [int]$EvalSeed = 4321,
     [int]$EarlyStopPatience = 0,
     [int]$EarlyStopMinEvals = 0,
     [double]$EarlyStopMinDelta = 0.0,
@@ -55,6 +67,9 @@ param(
     [int]$KlWarmupSteps = 0,
     [double]$WeightDecay = 0.01,
     [int]$WorldStateSlots = 4,
+    [double]$SemanticStateWriteScale = 0.0,
+    [double]$SemanticMemoryHiddenScale = 0.0,
+    [double]$SemanticGateMixerMaxStateWeight = 0.0,
     [int]$SelfStateSlots = 4,
     [int]$SelfStateRecursionDepth = 1,
     [double]$SelfStateWriteScale = 0.03,
@@ -62,6 +77,9 @@ param(
     [double]$SelfStateBoundaryTemperature = 1.0,
     [double]$SelfStateIdentityScale = 0.02,
     [double]$SelfStateContextScoreScale = 4.0,
+    [switch]$NoSelfStateWorldGate,
+    [double]$SelfStateWorldGateMin = 0.10,
+    [double]$SelfStateWorldGateScale = 1.0,
     [double]$LambdaStatePred = 0.0,
     [double]$LambdaSlotDiversity = 0.0,
     [double]$LambdaSlotStability = 0.0,
@@ -73,17 +91,19 @@ param(
     [string]$AttentionType = "gqa",
     [int]$MlaLatentDim = 128,
     [int]$MlaRopePerHead = 32,
-    [string]$Resume = "auto",
+    [string]$Resume = "none",
     [ValidateSet("checkpoint", "absolute", "progress", "reset")]
     [string]$ResumeLrPolicy = "checkpoint",
     [switch]$ResumeAllowFailed,
+    [switch]$AllowLegacyResume,
     [string]$StopFile = "",
     [int]$StopCheckEvery = 1,
     [ValidateSet("total", "additional")]
     [string]$TargetTokensMode = "total",
-    [string]$ReferenceMetrics = "experiments\runs\naime_v3_repaired_wt103_vae_stable_v1\metrics.jsonl",
+    [string]$ReferenceMetrics = "",
     [switch]$StructuralStop,
     [switch]$PrintArgs,
+    [switch]$ResearchUnsafe,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ExtraArgs
 )
@@ -99,18 +119,13 @@ if ([string]::IsNullOrWhiteSpace($RunName)) {
 
 $StateModels = @(
     "naime_v4_state_moe",
-    "naime_v41_state_moe",
-    "naime_v42_state_moe",
     "naime_v5_world_state_moe",
     "naime_v6_recursive_self_moe"
 )
 $HybridRouterModels = @(
-    "naime_v2_hybrid",
-    "naime_v3_safe",
-    "naime_v3_aggressive",
-    "naime_v3_repaired"
+    "naime_state_moe"
 ) + $StateModels
-$StructuralStopModels = @("naime_v3_repaired") + $StateModels
+$StructuralStopModels = $StateModels
 
 $isStateModel = $Model -in $StateModels
 $isFineWebLike = $DataPath -match "(?i)fineweb|cosmopedia|slimpajama|openwebtext"
@@ -123,7 +138,7 @@ $effectiveEvalEvery = $EvalEvery
 $effectiveSaveEvery = $SaveEvery
 $effectiveBestCheckpointMode = $BestCheckpointMode
 $effectiveGradClip = $GradClip
-if ($isStateModel -and $isFineWebLike) {
+if (-not $NoAdaptiveDefaults -and $isStateModel -and $isFineWebLike) {
     if ($Dropout -eq 0.0) {
         $effectiveDropout = 0.05
     }
@@ -153,16 +168,14 @@ if ($isStateModel -and $isFineWebLike) {
 $architecture = switch ($Model) {
     "dense" { "dense" }
     "token_moe" { "token_moe" }
+    "naime_state_moe" { "naime_state_moe" }
     "naime_v4_state_moe" { "naime_v4_state_moe" }
-    "naime_v41_state_moe" { "naime_v41_state_moe" }
-    "naime_v42_state_moe" { "naime_v42_state_moe" }
     "naime_v5_world_state_moe" { "naime_v5_world_state_moe" }
     "naime_v6_recursive_self_moe" { "naime_v6_recursive_self_moe" }
     default { "naime_state_moe" }
 }
 
 $routerMode = switch ($Model) {
-    "naime_v2" { "prior" }
     { $_ -in $HybridRouterModels } { "hybrid" }
     default { "concat" }
 }
@@ -176,10 +189,7 @@ $common = @(
     "--data-split", "train",
     "--vocab-size", "50257",
     "--seq-len", "$SeqLen",
-    "--batch-size", "4",
-    "--auto-batch",
-    "--vram-fraction", "$VramFraction",
-    "--auto-batch-max", "$AutoBatchMax",
+    "--batch-size", "$BatchSize",
     "--num-workers", "$NumWorkers",
     "--grad-accum-steps", "$GradAccumSteps",
     "--learning-rate", "$LearningRate",
@@ -202,6 +212,8 @@ $common = @(
     "--eval-every", "$effectiveEvalEvery",
     "--eval-split", "validation",
     "--eval-max-batches", "$effectiveEvalMaxBatches",
+    "--eval-sampling", $EvalSampling,
+    "--eval-seed", "$EvalSeed",
     "--early-stop-patience", "$EarlyStopPatience",
     "--early-stop-min-evals", "$EarlyStopMinEvals",
     "--early-stop-min-delta", "$EarlyStopMinDelta",
@@ -211,12 +223,23 @@ $common = @(
     "--target-tokens-mode", $TargetTokensMode
 )
 
+if (-not $NoAutoBatch) {
+    $common += @(
+        "--auto-batch",
+        "--vram-fraction", "$VramFraction",
+        "--auto-batch-max", "$AutoBatchMax"
+    )
+}
+
 if (-not [string]::IsNullOrWhiteSpace($StopFile)) {
     $common += @("--stop-file", $StopFile)
 }
 
 if ($ResumeAllowFailed) {
     $common += @("--resume-allow-failed")
+}
+if ($AllowLegacyResume) {
+    $common += @("--allow-legacy-resume")
 }
 
 if ($LrCycleLength -gt 0) {
@@ -236,11 +259,19 @@ if ($AsyncLatest) {
 }
 
 if ($CompileModel) {
-    $common += @("--compile-model")
+    $common += @("--compile-model", "--compile-scope", $CompileScope, "--compile-backend", $CompileBackend)
+}
+
+if ($DisableFlashSdp) {
+    $common += @("--disable-flash-sdp")
 }
 
 if ($NoAmp) {
     $common += @("--no-amp")
+}
+
+if ($ResearchUnsafe) {
+    $common += @("--research-unsafe")
 }
 
 if ($Model -eq "dense") {
@@ -261,6 +292,7 @@ if ($Model -ne "dense") {
 if ($Model -like "naime_*") {
     $common += @(
         "--stride", "$Stride",
+        "--causal-state-stride", "$CausalStateStride",
         "--window", "$Window",
         "--z-dim", "$ZDim",
         "--semantic-router-mode", $routerMode,
@@ -269,65 +301,12 @@ if ($Model -like "naime_*") {
     )
 }
 
-if ($Model -like "naime_*" -and $Model -ne "naime_v3_repaired" -and -not $isStateModel) {
+if ($Model -eq "naime_state_moe") {
     $common += @(
         "--target-sparsity", $(if ($TargetSparsity -gt 0.0) { "$TargetSparsity" } else { "0.2" }),
         "--logvar-clip", "$LogvarClip",
         "--semantic-router-prior-scale", "$PriorScale",
         "--lambda-kl", "0.001"
-    )
-}
-
-if ($Model -eq "naime_v3_safe") {
-    $common += @(
-        "--semantic-scales", "local_mid",
-        "--mid-stride", "32",
-        "--mid-window", "64",
-        "--semantic-fusion", "gated_sum",
-        "--semantic-residual-write",
-        "--semantic-write-scale", "0.05",
-        "--semantic-pred-horizon", "1",
-        "--lambda-semantic-pred", "0.01"
-    )
-}
-
-if ($Model -eq "naime_v3_aggressive") {
-    $common += @(
-        "--semantic-scales", "local_mid_global",
-        "--mid-stride", "32",
-        "--mid-window", "64",
-        "--global-semantic",
-        "--semantic-fusion", "concat",
-        "--semantic-residual-write",
-        "--semantic-write-scale", "0.10",
-        "--semantic-pred-horizon", "1",
-        "--lambda-semantic-pred", "0.03"
-    )
-}
-
-if ($Model -eq "naime_v3_repaired") {
-    $common += @(
-        "--semantic-scales", "local_mid_global",
-        "--mid-stride", "32",
-        "--mid-window", "64",
-        "--global-semantic",
-        "--semantic-fusion", "concat",
-        "--semantic-residual-write",
-        "--semantic-write-scale", "0.05",
-        "--semantic-pred-horizon", "1",
-        "--semantic-router-prior-scale", "0.5",
-        "--semantic-router-prior-clip", "1.0",
-        "--semantic-router-detach",
-        "--semantic-gate-downstream", "clean_prob",
-        "--semantic-sparse-alpha", "downstream",
-        "--semantic-router-alpha-cap", "0.85",
-        "--semantic-alpha-cap-mode", "clamp",
-        "--semantic-downstream-deterministic",
-        "--lambda-kl", "0.005",
-        "--kl-warmup-steps", $(if ($KlWarmupSteps -gt 0) { "$KlWarmupSteps" } else { "1500" }),
-        "--logvar-clip", $(if ($LogvarClip -ne 10.0) { "$LogvarClip" } else { "2.0" }),
-        "--target-sparsity", $(if ($TargetSparsity -gt 0.0) { "$TargetSparsity" } else { "0.55" }),
-        "--lambda-semantic-pred", "0.015"
     )
 }
 
@@ -364,33 +343,24 @@ if ($isStateModel) {
             "--semantic-state-write-scale", "0.03"
         )
     }
-    if ($Model -eq "naime_v41_state_moe") {
-        $common += @(
-            "--semantic-gate-mixer-temperature", "1.35",
-            "--semantic-gate-mixer-min-weight", "0.08",
-            "--semantic-state-confidence-mode", "hybrid",
-            "--semantic-state-confidence-temperature", "3.0",
-            "--semantic-memory-write-scale", "0.025",
-            "--semantic-state-write-scale", "0.035"
-        )
-    }
-    if ($Model -in @("naime_v42_state_moe", "naime_v5_world_state_moe", "naime_v6_recursive_self_moe")) {
+    if ($Model -in @("naime_v5_world_state_moe", "naime_v6_recursive_self_moe")) {
         $common += @(
             "--semantic-gate-mixer-temperature", "2.5",
             "--semantic-gate-mixer-min-weight", "0.08",
             "--semantic-gate-mixer-max-clean-weight", "0.45",
+            "--semantic-gate-mixer-max-state-weight", $(if ($SemanticGateMixerMaxStateWeight -gt 0.0) { "$SemanticGateMixerMaxStateWeight" } else { "0.35" }),
             "--semantic-state-confidence-mode", "hybrid",
             "--semantic-state-confidence-temperature", "3.0",
             "--semantic-state-confidence-gate",
             "--semantic-memory-read-gate",
             "--semantic-memory-write-scale", "0.035",
-            "--semantic-state-write-scale", "0.045"
+            "--semantic-state-write-scale", $(if ($SemanticStateWriteScale -gt 0.0) { "$SemanticStateWriteScale" } else { "0.045" })
         )
     }
     if ($Model -in @("naime_v5_world_state_moe", "naime_v6_recursive_self_moe")) {
         $common += @(
             "--world-state-slots", "$WorldStateSlots",
-            "--semantic-memory-hidden-scale", "0.035",
+            "--semantic-memory-hidden-scale", $(if ($SemanticMemoryHiddenScale -gt 0.0) { "$SemanticMemoryHiddenScale" } else { "0.035" }),
             "--lambda-state-pred", $(if ($LambdaStatePred -gt 0.0) { "$LambdaStatePred" } else { "0.02" }),
             "--lambda-slot-diversity", $(if ($LambdaSlotDiversity -gt 0.0) { "$LambdaSlotDiversity" } else { "0.01" }),
             "--lambda-slot-stability", "$LambdaSlotStability",
@@ -412,9 +382,14 @@ if ($isStateModel) {
             "--self-state-boundary-temperature", "$SelfStateBoundaryTemperature",
             "--self-state-identity-scale", "$SelfStateIdentityScale",
             "--self-state-context-score-scale", "$SelfStateContextScoreScale",
+            "--self-state-world-gate-min", "$SelfStateWorldGateMin",
+            "--self-state-world-gate-scale", "$SelfStateWorldGateScale",
             "--lambda-self-pred", $(if ($LambdaSelfPred -gt 0.0) { "$LambdaSelfPred" } else { "0.01" }),
             "--lambda-self-slot-diversity", $(if ($LambdaSelfSlotDiversity -gt 0.0) { "$LambdaSelfSlotDiversity" } else { "0.02" })
         )
+        if ($NoSelfStateWorldGate) {
+            $common += "--no-self-state-world-gate"
+        }
     }
 }
 

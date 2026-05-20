@@ -1,127 +1,110 @@
 # NAIME V6: Recursive Self-State MoE
 
-V6 extends the V5 world-state model with a recursive self-state subsystem. The goal is not just lower language-model loss; the architecture is also meant to test whether a compact model can maintain measurable internal state boundaries while learning from large-scale text.
+Status: **active architecture family, protocol-aligned work in progress**
+
+V6 extends the V5 world-state model with recursive self-state slots. Current V6
+work is governed by `docs/architecture/STATE_PROTOCOL.md`; clean claims must use
+causal-integrity-v2 checkpoints and clean runs only.
+
+Older V6 continuation runs that reported ultra-low validation perplexity are
+legacy/contaminated evidence. They must not be cited as proof of model quality or
+architecture superiority.
 
 ## Core Mechanism
 
-- `naime_v6_recursive_self_moe` keeps V5 world-state slots and adds recursive self-state slots.
-- The self-state module predicts and updates internal state from hidden activations, previous self slots, and world context.
-- Boundary metrics split state signal into `self`, `world`, `other`, and `unknown` components.
-- V6 auxiliary objectives include self prediction and self-slot diversity.
-- Training logs expose LM metrics and structure metrics such as `v6_self_pred`, `v6_slot_cosine`, `v6_slot_context_cosine`, `v6_boundary_self`, `v6_boundary_world`, and `v6_reflection_norm`.
+- `naime_v6_recursive_self_moe` keeps V5 world-state slots and adds recursive
+  self-state slots.
+- V5 world state contributes an explicitly measured world component to the MoE
+  router bus.
+- V6 self state receives world-conditioned residual summaries. In protocol
+  terms, self state should explain what world state did not already explain,
+  rather than absorbing the full hidden stream as unconstrained self evidence.
+- Self-state hidden modulation is gated by world signal strength and logs its
+  effective gate, norm, and scale.
+- Boundary metrics split state signal into `self`, `world`, `other`, and
+  `unknown` components.
 
-## Validation Snapshot
+## Protocol-Aligned Metrics
 
-Latest completed validated remote run:
-
-```text
-naime_v6_100m_1b_conservative_logfix_add40m_20260517_1645
-```
-
-Configuration summary:
-
-```text
-architecture = naime_v6_recursive_self_moe
-dataset      = fineweb_edu_1b_ctx1024
-ctx          = 1024
-d_model      = 768
-layers       = 12
-experts      = 6
-top_k        = 2
-world slots  = 6
-self slots   = 6
-```
-
-Validation trajectory:
-
-| Step | val_lm | val_ppl | alpha | router_ent | Notes |
-|------|--------|---------|-------|------------|-------|
-| 10000 | 2.0106 | 7.47 | ~0.72 | ~0.67 | First credible V6 validation from the formal 1B run. |
-| 27500 | 0.9483 | 2.581 | 0.657 | 1.117 | Stable continuation checkpoint. |
-| 30000 | 0.8281 | 2.289 | 0.648 | 1.204 | Continued improvement without eval collapse. |
-| 32500 | 0.7183 | 2.051 | 0.644 | 1.266 | Best pre-final eval. |
-| 32958 | 0.7033 | 2.020 | 0.645 | 1.260 | Best validated checkpoint so far. |
-
-Tail-100 training metrics in the latest completed run:
+Router bus:
 
 ```text
-loss_lm mean       ~= 0.7955
-ppl mean           ~= 2.225
-grad_norm mean     ~= 3.30
-alpha mean         ~= 0.654
-router entropy     ~= 1.25
+v5_router_semantic_norm
+v5_router_world_norm
+v5_router_world_ratio
+v5_router_world_cosine
+v5_router_world_gate
+v5_router_memory_norm
+v5_router_memory_ratio
+v5_router_effective_norm
 ```
 
-## Structure Metrics
-
-The early formal run showed self-state dominance:
+Hidden writes:
 
 ```text
-v6_boundary_self  ~= 0.79
-v6_boundary_world ~= 0.06
+v5_semantic_hidden_write_norm
+v5_semantic_hidden_write_scale
+v5_memory_hidden_write_norm
+v5_memory_hidden_write_scale
+v6_hidden_write_gate
+v6_hidden_write_norm
+v6_hidden_write_scale
 ```
 
-The later continuation is healthier:
+World-residual self path:
 
 ```text
-v6_self_pred              ~= 0.0048
-v6_slot_context_cosine    ~= 0.56
-v6_boundary_self          ~= 0.71
-v6_boundary_world         ~= 0.07
-v6_boundary_other         ~= 0.12
-v6_boundary_unknown       ~= 0.10
+v6_world_explained_norm
+v6_hidden_residual_norm
+v6_world_residual_ratio
 ```
 
-Interpretation:
-
-- The recursive self-state path is active and no longer just noise.
-- Self remains the strongest boundary component, but it is less extreme than in the first V6 run.
-- World-state utilization is still weaker than desired. Future architecture work should strengthen world coupling rather than merely amplifying self-recursion.
-- Router entropy around `1.2-1.3` is currently healthier than the early collapse toward very low entropy.
-
-## Known Risks
-
-- Bad-gradient spikes remain the main reliability problem. The latest completed segment had 153 skipped bad-gradient steps, but no checkpoint reloads.
-- Long schedules can enter unstable late phases. Prefer segmented continuation with explicit LR strategy.
-- Model-only checkpoint resumes are stable for continuation, but LR and warmup must be set deliberately.
-- Checkpoint I/O can hurt throughput and, on shared/unstable Windows environments, increase native crash risk.
-- Visible remote windows or SSH-tied foreground launches can be interrupted by other desktop activity. Use hidden/background launch helpers.
-
-## Current Training Policy
-
-The project target remains feeding approximately 1B tokens. Recommended continuation policy:
+Recursive self-state:
 
 ```text
-resume          previous validated model_best.pt
-target mode     additional
-segment size    100M tokens when GPU is available
-vram fraction   0.80
-learning rate   2.5e-5
-warmup steps    500
-min lr ratio    0.03
-grad clip       0.8
-eval every      5000
-eval batches    40
-save every      10000
-latest every    5000
-best mode       model
+v6_self_pred
+v6_slot_cosine
+v6_slot_context_cosine
+v6_state_delta
+v6_state_norm
+v6_reflection_norm
+v6_boundary_self
+v6_boundary_world
+v6_boundary_other
+v6_boundary_unknown
 ```
 
-When the server is shared, first sample other GPU usage over a short window. If another training job occupies most VRAM, use conservative fixed batch and gradient accumulation. If the GPU is free, use auto-batch with predictive skip/headroom.
+## Current Interpretation
 
-Segmented continuation must preserve data-stream continuity. Confirm the sampler log:
+V6 is promising, but the current project standard is strict:
 
-```text
-train sampler resumed stream seed=1234 resume_step=<step> offset_batches=<offset>/<epoch_batches>
+- Do not resume from old checkpoints unless intentionally running a legacy
+  forensic baseline.
+- Do not use pre-protocol ultra-low perplexity runs as validation evidence.
+- Prefer training templates over manual command construction.
+- Treat LM loss, router-bus metrics, hidden-write metrics, and boundary metrics
+  as a coupled health surface.
+
+## Training Policy
+
+Use template launches:
+
+```powershell
+.\scripts\train_template.ps1 -List
+.\scripts\train_template.ps1 -Template v6_local_smoke
+.\scripts\train_template.ps1 -Template v6_local_64m_probe
 ```
 
-## Current Verdict
+Remote large segments should use the remote templates as command sources and the
+hidden/background remote workflow documented in `docs/REMOTE_4090_OPERATIONS.md`.
 
-V6 is validated as the current best architecture direction. It has surpassed the earlier V5 validation metrics on the current 1B-corpus training path, and its internal metrics show genuine structure rather than a purely decorative module.
+## Remaining Work
 
-It is not yet a finished large-scale model. The next work should focus on:
-
-- completing the 1B-token curriculum without replaying batches;
-- reducing bad-gradient frequency with adaptive LR and safer late-run scheduling;
-- strengthening world-state utilization so recursive self-state does not monopolize structure;
-- evaluating generation quality from the best completed and later continuation checkpoints.
+- Verify that world-residual self input improves boundary allocation under clean
+  causal training.
+- Promote selected warning metrics into control mechanisms only after the metric
+  behavior is stable.
+- Keep memory contribution explicit: in causal V6, memory hidden/router influence
+  is currently dormant unless the architecture is deliberately changed.
+- Continue improving generation quality evaluation; validation loss alone is not
+  sufficient evidence of model usefulness.

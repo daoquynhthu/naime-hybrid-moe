@@ -34,6 +34,8 @@ class TrainConfig:
     eval_every: int = 0
     eval_split: str = "validation"
     eval_max_batches: int = 10
+    eval_sampling: str = "random"
+    eval_seed: int = 4321
     early_stop_patience: int = 0
     early_stop_min_delta: float = 0.0
     early_stop_min_evals: int = 0
@@ -59,10 +61,15 @@ class TrainConfig:
 
     amp: bool = True
     compile_model: bool = False
+    compile_scope: str = "full"
+    compile_backend: str = "inductor"
+    disable_flash_sdp: bool = False
     device: str = "auto"
-    resume: str = "auto"
+    resume: str = "none"
     resume_lr_policy: str = "checkpoint"
     resume_allow_failed: bool = False
+    allow_legacy_resume: bool = False
+    causal_integrity_version: int = 2
     strict_resume: bool = True
     stop_file: str | None = None
     stop_check_every: int = 1

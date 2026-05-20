@@ -10,10 +10,11 @@ from functools import partial
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader, RandomSampler, Sampler
 
 from naime_hybrid.data import HFDiskCausalDataset
 from naime_hybrid.models import build_model
+from naime_hybrid.modules.blocks import DenseTransformerBlock
 
 from .checkpoint import (
     AsyncCheckpointWriter,
@@ -103,6 +104,25 @@ def _build_loader(
     return DataLoader(dataset, **loader_kwargs)
 
 
+def _cycle_loader(loader: DataLoader, first_iterator=None):
+    if first_iterator is not None:
+        yield from first_iterator
+    while True:
+        yield from loader
+
+
+def _shutdown_loader_iterator(iterator, logger: logging.Logger) -> None:
+    if iterator is None:
+        return
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if shutdown is None:
+        return
+    try:
+        shutdown()
+    except Exception:
+        logger.debug("DataLoader worker shutdown failed", exc_info=True)
+
+
 def _extract_max_steps(path: Path) -> int:
     try:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
@@ -162,6 +182,24 @@ def _set_scheduler_to_step(scheduler, step: int) -> None:
     scheduler._last_lr = [group["lr"] for group in scheduler.optimizer.param_groups]
 
 
+def _set_optimizer_base_lr(optimizer: torch.optim.Optimizer, scheduler, base_lr: float) -> None:
+    """Make a resumed run honor the current LR config instead of checkpoint LR.
+
+    Loading a full checkpoint restores optimizer param groups and LambdaLR
+    `base_lrs`. For continuation policies that intentionally define a new
+    schedule, those restored base values must be replaced before positioning
+    the scheduler.
+    """
+
+    base_lr = float(base_lr)
+    for group in optimizer.param_groups:
+        group["lr"] = base_lr
+        group["initial_lr"] = base_lr
+    if hasattr(scheduler, "base_lrs"):
+        scheduler.base_lrs = [base_lr for _ in scheduler.optimizer.param_groups]
+    scheduler._last_lr = [base_lr for _ in optimizer.param_groups]
+
+
 def _apply_lr_safety_factor(optimizer, scheduler, factor: float) -> float:
     """Apply a runtime LR backoff without changing the scheduler's shape."""
 
@@ -218,10 +256,110 @@ def _save_shutdown_checkpoint(
     )
 
 
+def _assert_torch_compile_available() -> None:
+    if not hasattr(torch, "compile"):
+        raise RuntimeError("torch.compile is unavailable in this PyTorch build.")
+    try:
+        probe = torch.compile(lambda x: x + 1, backend="eager")
+        probe(torch.ones(1))
+    except Exception as exc:
+        raise RuntimeError(
+            "torch.compile failed its availability probe. "
+            "Check that training is running inside the project venv "
+            "(.venv312 / remote .venv312) and that the installed PyTorch build supports compile."
+        ) from exc
+
+
+def _configure_cuda_attention_backends(config, logger: logging.Logger) -> None:
+    if not config.disable_flash_sdp:
+        return
+    cuda_backends = getattr(torch.backends, "cuda", None)
+    if cuda_backends is None:
+        logger.warning("disable_flash_sdp requested but torch.backends.cuda is unavailable")
+        return
+
+    toggles = [
+        ("enable_flash_sdp", False),
+        ("enable_mem_efficient_sdp", False),
+        ("enable_math_sdp", True),
+    ]
+    applied: list[str] = []
+    for name, enabled in toggles:
+        fn = getattr(cuda_backends, name, None)
+        if fn is None:
+            continue
+        fn(enabled)
+        applied.append(f"{name}={enabled}")
+    if applied:
+        logger.warning(
+            "CUDA SDPA backend override active: %s. This avoids known flash/efficient attention backward "
+            "crashes under torch.compile on some Windows CUDA stacks.",
+            " ".join(applied),
+        )
+    else:
+        logger.warning("disable_flash_sdp requested but this PyTorch build exposes no SDPA backend toggles")
+
+
+def _configure_matmul_precision(logger: logging.Logger) -> None:
+    set_precision = getattr(torch, "set_float32_matmul_precision", None)
+    if set_precision is None:
+        return
+    try:
+        set_precision("high")
+        logger.info("torch float32 matmul precision set to high")
+    except Exception:
+        logger.debug("failed to set float32 matmul precision", exc_info=True)
+
+
+def _compile_module(module: torch.nn.Module, config) -> torch.nn.Module:
+    if config.compile_backend == "inductor":
+        return torch.compile(module, mode="default")
+    return torch.compile(module, backend=config.compile_backend)
+
+
+def _compile_model(model: torch.nn.Module, config, logger: logging.Logger) -> torch.nn.Module:
+    _assert_torch_compile_available()
+    warnings.filterwarnings("ignore", message="online softmax")
+    torch._logging.set_logs(dynamo=logging.ERROR, inductor=logging.ERROR)
+
+    if config.compile_scope == "dense":
+        compiled = 0
+        for name, module in list(model.named_modules()):
+            if not isinstance(module, DenseTransformerBlock):
+                continue
+            parent_name, _, child_name = name.rpartition(".")
+            parent = model.get_submodule(parent_name) if parent_name else model
+            setattr(parent, child_name, _compile_module(module, config))
+            compiled += 1
+        if compiled == 0:
+            logger.warning("compile_scope=dense requested but no DenseTransformerBlock modules were found")
+        else:
+            logger.info(
+                "compiled %d dense Transformer blocks with torch.compile; state/MoE/self-recursion remain eager",
+                compiled,
+            )
+            logger.info("torch.compile backend=%s scope=dense", config.compile_backend)
+        return model
+
+    if config.compile_scope != "full":
+        raise ValueError("compile_scope must be full or dense")
+    if config.model.moe_dispatch_mode != "dense":
+        logger.warning(
+            "torch.compile requested with moe_dispatch_mode=%s; sparse MoE dispatch and stochastic gate "
+            "paths are explicitly kept eager to reduce graph-break and gradient-risk exposure",
+            config.model.moe_dispatch_mode,
+        )
+    logger.info(
+        "compiling full model with torch.compile backend=%s; checkpoints are saved from the unwrapped module",
+        config.compile_backend,
+    )
+    return _compile_module(model, config)
+
+
 def main() -> None:
     args = parse_args()
     config = build_train_config(args)
-    set_seed(config.seed)
+    set_seed(config.seed, seed_cuda=False)
 
     run_dir = Path(config.output_dir) / config.run_name
     model_dir = run_dir / "models"
@@ -232,11 +370,54 @@ def main() -> None:
     with (run_dir / "config.json").open("w", encoding="utf-8") as f:
         json.dump(config.to_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
 
-    device = resolve_device(config.device)
     logger.info("run_dir=%s", run_dir)
-    logger.info("device=%s cuda=%s", device, torch.cuda.is_available())
     logger.info("architecture=%s", config.architecture)
 
+    resume_probe_path = _resolve_resume_path(config.resume, run_dir, model_dir, config.resume_allow_failed)
+    resume_probe_step = _extract_step(resume_probe_path) if resume_probe_path is not None else 0
+
+    # Phase 1: CPU-only setup — build dataset and DataLoader BEFORE any CUDA
+    # forward/backward.  On Windows, PyTorch DataLoader uses spawn for worker
+    # processes; spawning workers after CUDA is initialized can silently kill
+    # the entire process group without a traceback or crash dump.
+    dataset = build_dataset(config)
+    collate_fn = None
+    if isinstance(dataset, HFDiskCausalDataset):
+        collate_fn = partial(HFDiskCausalDataset.causal_collate, seq_len=config.model.max_seq_len)
+    loader = _build_loader(
+        dataset,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        shuffle=True,
+        drop_last=True,
+        pin_memory=False,
+        collate_fn=collate_fn,
+        seed=config.seed,
+        resume_step=resume_probe_step,
+        grad_accum_steps=config.grad_accum_steps,
+    )
+    pre_cuda_iterator = None
+    if os.name == "nt" and config.num_workers > 0:
+        pre_cuda_iterator = iter(loader)
+        logger.info(
+            "primed DataLoader workers before CUDA init workers=%d pin_memory=%s",
+            config.num_workers,
+            False,
+        )
+    data_iter = _cycle_loader(loader, pre_cuda_iterator)
+    logger.info("dataset_size=%s initial_batch_size=%s seq_len=%s", len(dataset), config.batch_size, config.model.max_seq_len)
+
+    device = resolve_device(config.device)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(config.seed)
+        _configure_matmul_precision(logger)
+        _configure_cuda_attention_backends(config, logger)
+    logger.info("device=%s cuda=%s", device, device.type == "cuda")
+
+    # Phase 2: CUDA auto-batch probe (this will fail if DataLoader workers
+    # are first spawned after CUDA context initialization.  On Windows we
+    # explicitly primed the iterator above, then rebuild with workers=0 below
+    # after probing so no second spawn occurs in a CUDA-initialized process.
     if config.auto_batch:
         config.batch_size = probe_auto_batch_size(
             config.architecture,
@@ -248,11 +429,44 @@ def main() -> None:
             device,
             logger,
         )
+        # Rebuild the loader with the probed batch_size.  When the batch
+        # size grows and the initial loader was built with workers, rebuild
+        # with num_workers=0 on Windows to avoid CUDA-context spawn crashes.
+        if os.name == "nt" and config.num_workers > 0:
+            _shutdown_loader_iterator(pre_cuda_iterator, logger)
+            pre_cuda_iterator = None
+            logger.info("auto-batch selected batch=%d; disabling data workers on Windows to avoid CUDA-spawn conflict", config.batch_size)
+            loader = _build_loader(
+                dataset,
+                batch_size=config.batch_size,
+                num_workers=0,
+                shuffle=True,
+                drop_last=True,
+                pin_memory=device.type == "cuda",
+                collate_fn=collate_fn,
+                seed=config.seed,
+                resume_step=resume_probe_step,
+                grad_accum_steps=config.grad_accum_steps,
+            )
+        else:
+            loader = _build_loader(
+                dataset,
+                batch_size=config.batch_size,
+                num_workers=config.num_workers,
+                shuffle=True,
+                drop_last=True,
+                pin_memory=device.type == "cuda",
+                collate_fn=collate_fn,
+                seed=config.seed,
+                resume_step=resume_probe_step,
+                grad_accum_steps=config.grad_accum_steps,
+            )
+        data_iter = cycle_loader(loader)
         with (run_dir / "config.json").open("w", encoding="utf-8") as f:
             json.dump(config.to_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
 
-    resume_probe_path = _resolve_resume_path(config.resume, run_dir, model_dir, config.resume_allow_failed)
-    resume_probe_step = _extract_step(resume_probe_path) if resume_probe_path is not None else 0
+    if device.type == "cuda":
+        data_iter = AsyncPrefetcher(data_iter, device)
 
     if config.target_tokens is not None:
         tokens_per_step = config.batch_size * config.model.max_seq_len * config.grad_accum_steps
@@ -273,26 +487,13 @@ def main() -> None:
         with (run_dir / "config.json").open("w", encoding="utf-8") as f:
             json.dump(config.to_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
 
-    dataset = build_dataset(config)
-    collate_fn = None
-    if isinstance(dataset, HFDiskCausalDataset):
-        collate_fn = partial(HFDiskCausalDataset.causal_collate, seq_len=config.model.max_seq_len)
-    loader = _build_loader(
-        dataset,
-        batch_size=config.batch_size,
-        num_workers=config.num_workers,
-        shuffle=True,
-        drop_last=True,
-        pin_memory=device.type == "cuda",
-        collate_fn=collate_fn,
-        seed=config.seed,
-        resume_step=resume_probe_step,
-        grad_accum_steps=config.grad_accum_steps,
+    logger.info(
+        "loader config train_workers=%d persistent=%s prefetch=%s pin_memory=%s",
+        loader.num_workers if hasattr(loader, "num_workers") else config.num_workers,
+        bool(getattr(loader, "persistent_workers", False)),
+        getattr(loader, "prefetch_factor", None) or 0,
+        bool(getattr(loader, "pin_memory", False)),
     )
-    data_iter = cycle_loader(loader)
-    if device.type == "cuda":
-        data_iter = AsyncPrefetcher(data_iter, device)
-    logger.info("dataset_size=%s batch_size=%s seq_len=%s", len(dataset), config.batch_size, config.model.max_seq_len)
     if resume_probe_step > 0:
         epoch_batches = max(1, len(dataset) // config.batch_size)
         offset_batches = (resume_probe_step * config.grad_accum_steps) % epoch_batches
@@ -303,13 +504,6 @@ def main() -> None:
             offset_batches,
             epoch_batches,
         )
-    logger.info(
-        "loader config train_workers=%d persistent=%s prefetch=%s pin_memory=%s",
-        config.num_workers,
-        config.num_workers > 0,
-        4 if config.num_workers > 0 else 0,
-        device.type == "cuda",
-    )
 
     eval_loader = None
     if config.eval_every > 0 and not config.random_data and config.data_path is not None:
@@ -318,21 +512,32 @@ def main() -> None:
         if isinstance(eval_dataset, HFDiskCausalDataset):
             eval_collate_fn = partial(HFDiskCausalDataset.causal_collate, seq_len=config.model.max_seq_len)
         eval_workers = min(config.num_workers, 2)
+        eval_sampler = None
+        eval_shuffle = False
+        if config.eval_sampling == "random" and config.eval_max_batches != 0:
+            eval_generator = torch.Generator()
+            eval_generator.manual_seed(config.eval_seed)
+            eval_sampler = RandomSampler(eval_dataset, replacement=False, generator=eval_generator)
+        elif config.eval_sampling == "random":
+            logger.warning("eval_sampling=random ignored for full validation; using sequential full split")
         eval_loader = DataLoader(
             eval_dataset,
             batch_size=config.batch_size,
-            shuffle=False,
+            shuffle=eval_shuffle,
+            sampler=eval_sampler,
             num_workers=eval_workers,
             drop_last=False,
             pin_memory=device.type == "cuda",
             collate_fn=eval_collate_fn,
         )
         logger.info(
-            "eval enabled split=%s dataset_size=%s eval_every=%s max_batches=%s",
+            "eval enabled split=%s dataset_size=%s eval_every=%s max_batches=%s sampling=%s seed=%s",
             config.eval_split,
             len(eval_dataset),
             config.eval_every,
             config.eval_max_batches,
+            "random" if eval_sampler is not None else "sequential",
+            config.eval_seed if eval_sampler is not None else "n/a",
         )
     elif config.eval_every > 0:
         logger.warning("eval requested but skipped because random data or missing data path is in use")
@@ -340,10 +545,7 @@ def main() -> None:
     model = build_model(config.architecture, config.model).to(device)
     model_eval = model
     if config.compile_model:
-        warnings.filterwarnings("ignore", message="online softmax")
-        torch._logging.set_logs(dynamo=logging.ERROR, inductor=logging.ERROR)
-        logger.info("compiling model with torch.compile (first call triggers JIT; this may take 1-2 minutes)")
-        model = torch.compile(model)
+        model = _compile_model(model, config, logger)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -405,13 +607,29 @@ def main() -> None:
     resume_path = _resolve_resume_path(config.resume, run_dir, model_dir, config.resume_allow_failed)
     if resume_path is not None:
         logger.info("resuming from %s", resume_path)
-        start_step = load_checkpoint(resume_path, model, optimizer, scheduler, scaler, strict=config.strict_resume)
+        start_step = load_checkpoint(
+            resume_path,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            strict=config.strict_resume,
+            required_causal_integrity_version=config.causal_integrity_version,
+            allow_legacy_resume=config.allow_legacy_resume,
+        )
         checkpoint_max_steps = _extract_max_steps(resume_path)
     else:
         logger.info("starting from scratch")
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
+    if config.resume_lr_policy != "checkpoint" and start_step > 0:
+        _set_optimizer_base_lr(optimizer, scheduler, config.learning_rate)
+        logger.info(
+            "resume lr policy %s: overriding checkpoint base_lr with configured learning_rate=%.8g",
+            config.resume_lr_policy,
+            config.learning_rate,
+        )
     if config.resume_lr_policy == "reset" and start_step > 0:
         _set_scheduler_to_step(scheduler, 0)
         logger.info("resume lr policy reset: scheduler restarted after loading step=%d", start_step)
@@ -538,9 +756,12 @@ def main() -> None:
                 batch = next(data_iter)
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 labels = batch["labels"].to(device, non_blocking=True)
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(device, non_blocking=True)
 
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                    out = model(input_ids)
+                    out = model(input_ids, attention_mask=attention_mask)
                     main_loss = lm_loss(out["logits"], labels)
                     aux = collect_aux_losses(
                         out.get("aux", []),
@@ -647,6 +868,18 @@ def main() -> None:
                     "v5_slot_cosine": float(aux["v5_slot_cosine"].detach()),
                     "v5_slot_read_entropy": float(aux["v5_slot_read_entropy"].detach()),
                     "v5_slot_read_max": float(aux["v5_slot_read_max"].detach()),
+                    "v5_router_semantic_norm": float(aux["v5_router_semantic_norm"].detach()),
+                    "v5_router_world_norm": float(aux["v5_router_world_norm"].detach()),
+                    "v5_router_world_ratio": float(aux["v5_router_world_ratio"].detach()),
+                    "v5_router_world_cosine": float(aux["v5_router_world_cosine"].detach()),
+                    "v5_router_world_gate": float(aux["v5_router_world_gate"].detach()),
+                    "v5_router_memory_norm": float(aux["v5_router_memory_norm"].detach()),
+                    "v5_router_memory_ratio": float(aux["v5_router_memory_ratio"].detach()),
+                    "v5_router_effective_norm": float(aux["v5_router_effective_norm"].detach()),
+                    "v5_semantic_hidden_write_norm": float(aux["v5_semantic_hidden_write_norm"].detach()),
+                    "v5_semantic_hidden_write_scale": float(aux["v5_semantic_hidden_write_scale"].detach()),
+                    "v5_memory_hidden_write_norm": float(aux["v5_memory_hidden_write_norm"].detach()),
+                    "v5_memory_hidden_write_scale": float(aux["v5_memory_hidden_write_scale"].detach()),
                     "v6_self_pred": float(aux["v6_self_pred"].detach()),
                     "v6_slot_diversity": float(aux["v6_slot_diversity"].detach()),
                     "v6_slot_cosine": float(aux["v6_slot_cosine"].detach()),
@@ -654,6 +887,12 @@ def main() -> None:
                     "v6_state_delta": float(aux["v6_state_delta"].detach()),
                     "v6_state_norm": float(aux["v6_state_norm"].detach()),
                     "v6_reflection_norm": float(aux["v6_reflection_norm"].detach()),
+                    "v6_world_explained_norm": float(aux["v6_world_explained_norm"].detach()),
+                    "v6_hidden_residual_norm": float(aux["v6_hidden_residual_norm"].detach()),
+                    "v6_world_residual_ratio": float(aux["v6_world_residual_ratio"].detach()),
+                    "v6_hidden_write_gate": float(aux["v6_hidden_write_gate"].detach()),
+                    "v6_hidden_write_norm": float(aux["v6_hidden_write_norm"].detach()),
+                    "v6_hidden_write_scale": float(aux["v6_hidden_write_scale"].detach()),
                     "v6_boundary_entropy": float(aux["v6_boundary_entropy"].detach()),
                     "v6_boundary_self": float(aux["v6_boundary_self"].detach()),
                     "v6_boundary_world": float(aux["v6_boundary_world"].detach()),
@@ -732,8 +971,12 @@ def main() -> None:
                     if reload_path is not None:
                         logger.warning("bad grad streak %d >= 3; reloading from %s", total_streak, reload_path)
                         load_checkpoint(reload_path, model, optimizer, scheduler, scaler, strict=True)
+                        if config.resume_lr_policy != "checkpoint":
+                            _set_optimizer_base_lr(optimizer, scheduler, config.learning_rate)
                         if config.resume_lr_policy == "absolute":
                             _set_scheduler_to_step(scheduler, step)
+                        elif config.resume_lr_policy == "reset":
+                            _set_scheduler_to_step(scheduler, max(0, step - start_step))
                         applied_lr = _apply_lr_safety_factor(optimizer, scheduler, lr_safety_factor)
                         logger.warning(
                             "bad grad reload lr safety %.3f -> %.3f applied_lr=%.8g",
@@ -991,6 +1234,10 @@ def main() -> None:
                     "v5_slot_write_max": metrics.get("v5_slot_write_max", 0.0),
                     "v5_slot_write_min": metrics.get("v5_slot_write_min", 0.0),
                     "v5_slot_write_active": metrics.get("v5_slot_write_active", 0.0),
+                    "v5_router_world_ratio": metrics.get("v5_router_world_ratio", 0.0),
+                    "v5_router_world_cosine": metrics.get("v5_router_world_cosine", 0.0),
+                    "v5_router_world_gate": metrics.get("v5_router_world_gate", 0.0),
+                    "v5_semantic_hidden_write_norm": metrics.get("v5_semantic_hidden_write_norm", 0.0),
                     "v6_self_pred": metrics.get("v6_self_pred", 0.0),
                     "v6_slot_diversity": metrics.get("v6_slot_diversity", 0.0),
                     "v6_slot_cosine": metrics.get("v6_slot_cosine", 0.0),
@@ -998,6 +1245,9 @@ def main() -> None:
                     "v6_state_delta": metrics.get("v6_state_delta", 0.0),
                     "v6_state_norm": metrics.get("v6_state_norm", 0.0),
                     "v6_reflection_norm": metrics.get("v6_reflection_norm", 0.0),
+                    "v6_world_residual_ratio": metrics.get("v6_world_residual_ratio", 0.0),
+                    "v6_hidden_write_gate": metrics.get("v6_hidden_write_gate", 0.0),
+                    "v6_hidden_write_norm": metrics.get("v6_hidden_write_norm", 0.0),
                     "v6_boundary_entropy": metrics.get("v6_boundary_entropy", 0.0),
                     "v6_boundary_self": metrics.get("v6_boundary_self", 0.0),
                     "v6_boundary_world": metrics.get("v6_boundary_world", 0.0),

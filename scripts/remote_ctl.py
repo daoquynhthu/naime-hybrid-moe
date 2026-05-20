@@ -16,7 +16,7 @@ def workspace_value(section: str, key: str, env_name: str, fallback: str = "") -
         return os.environ[env_name]
     config_path = os.environ.get("NAIME_WORKSPACE_CONFIG", "configs/workspace.local.json")
     if os.path.exists(config_path):
-        with open(config_path, "r", encoding="utf-8") as file:
+        with open(config_path, encoding="utf-8") as file:
             config = json.load(file)
         value = config.get(section, {}).get(key)
         if value:
@@ -117,6 +117,7 @@ def main() -> None:
     parser.add_argument("--token", default=os.environ.get("NAIME_AGENT_TOKEN"))
     parser.add_argument("--interval", type=int, default=10)
     parser.add_argument("--run-name", default="")
+    parser.add_argument("--template", default="v6_remote_100m_250m_segment")
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--seq-len", type=int, default=512)
@@ -151,11 +152,12 @@ def main() -> None:
     elif args.command == "run":
         payload = {
             "run_name": args.run_name or time.strftime("naime_v6_remote_%Y%m%d_%H%M%S"),
-            "model": "naime_v6_recursive_self_moe",
-            "data_path": args.data_path,
+            "template": args.template,
             "script_args": {
                 "TargetTokens": args.max_steps * args.batch_size * args.seq_len,
+                "TargetTokensMode": "total",
                 "SeqLen": args.seq_len,
+                "BatchSize": args.batch_size,
                 "EvalEvery": 1000,
                 "EvalMaxBatches": 0,
                 "SaveEvery": 5000,

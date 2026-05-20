@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from naime_hybrid.config import NAIMEStateMoEConfig
@@ -32,6 +33,14 @@ def _build_attention(config: NAIMEStateMoEConfig):
         qk_norm=config.qk_norm,
         rope_theta=config.rope_theta,
     )
+
+
+def _mean_token_norm(values: torch.Tensor) -> torch.Tensor:
+    return values.float().norm(dim=-1).mean().type_as(values)
+
+
+def _mean_token_cosine(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    return F.cosine_similarity(left.float(), right.float(), dim=-1, eps=1e-6).mean().type_as(left)
 
 
 class DenseTransformerBlock(nn.Module):
@@ -68,6 +77,7 @@ class NAIMEStateMoEBlock(nn.Module):
             use_global_semantic=config.use_global_semantic,
             semantic_fusion=config.semantic_fusion,
             semantic_pred_horizon=config.semantic_pred_horizon,
+            causal=config.semantic_causal,
             downstream_deterministic=config.semantic_downstream_deterministic,
             downstream_detach_latent=config.semantic_router_detach,
         )
@@ -207,7 +217,7 @@ class NAIMEV4StateMoEBlock(NAIMEStateMoEBlock):
             raise ValueError("semantic_gate_downstream must be alpha, prob, clean_prob, or none")
 
         state_confidence = torch.ones(batch, 1, 1, device=hidden_states.device, dtype=hidden_states.dtype)
-        if semantic_state_confidence is not None:
+        if semantic_state_confidence is not None and not self.config.semantic_causal:
             state_confidence = semantic_state_confidence.to(device=hidden_states.device, dtype=hidden_states.dtype)
             if state_confidence.ndim == 2:
                 state_confidence = state_confidence.unsqueeze(1)
@@ -228,7 +238,7 @@ class NAIMEV4StateMoEBlock(NAIMEStateMoEBlock):
         token_semantic = semantic["token_semantic_downstream"] * token_alpha
         router_semantic = token_semantic
         state_context = torch.zeros_like(router_semantic)
-        if semantic_state is not None:
+        if semantic_state is not None and not self.config.semantic_causal:
             state_context = self.state_proj(semantic_state).unsqueeze(1).expand_as(router_semantic)
             state_scale = self.config.semantic_state_write_scale
             if self.config.semantic_state_confidence_gate:
@@ -239,7 +249,7 @@ class NAIMEV4StateMoEBlock(NAIMEStateMoEBlock):
         memory_weights = torch.zeros(batch, seq_len, 1, device=hidden_states.device, dtype=hidden_states.dtype)
         memory_read_strength = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
         memory_novelty = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
-        if self.memory is not None and memory is not None:
+        if self.memory is not None and memory is not None and not self.config.semantic_causal:
             memory_context, memory_weights = self.memory.read(hidden_states, memory)
             memory_token_strength = memory_weights.max(dim=-1).values.unsqueeze(-1)
             memory_read_strength = memory_token_strength.mean()
@@ -320,13 +330,17 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
 
         if self.world_state_slots is not None and world_state is None:
             world_state = self.world_state_slots.initial_state(batch, hidden_states.device, hidden_states.dtype)
-        if self.world_state_slots is not None and world_state is not None:
+        if self.world_state_slots is not None and world_state is not None and not self.config.semantic_causal:
             state_context, state_weights, slot_confidence = self.world_state_slots.read(hidden_states, world_state)
             read_focus = state_weights.max(dim=-1, keepdim=True).values
             state_confidence = slot_confidence * read_focus.type_as(slot_confidence)
         else:
             state_context = torch.zeros(
                 batch, seq_len, self.config.d_model, device=hidden_states.device, dtype=hidden_states.dtype
+            )
+            slot_count = self.world_state_slots.slots if self.world_state_slots is not None else 1
+            state_weights = torch.zeros(
+                batch, seq_len, slot_count, device=hidden_states.device, dtype=hidden_states.dtype
             )
             state_confidence = torch.ones(batch, seq_len, 1, device=hidden_states.device, dtype=hidden_states.dtype)
 
@@ -359,25 +373,48 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
         token_semantic = semantic["token_semantic_downstream"] * token_alpha
         router_semantic = token_semantic
         state_scale = self.config.semantic_state_write_scale
-        if self.config.semantic_state_confidence_gate:
-            state_scale = state_scale * state_confidence
-        router_semantic = router_semantic + state_scale * self.state_proj(state_context)
+        world_component = torch.zeros_like(router_semantic)
 
         memory_context = torch.zeros_like(router_semantic)
         memory_weights = torch.zeros(batch, seq_len, 1, device=hidden_states.device, dtype=hidden_states.dtype)
         memory_read_strength = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
         memory_novelty = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
-        if self.memory is not None and memory is not None:
+        memory_hidden_write = torch.zeros_like(router_semantic)
+        if (
+            self.config.semantic_causal
+            and self.world_state_slots is not None
+            and world_state is not None
+        ):
+            state_context, state_weights, state_confidence, world_state, v5_metrics = (
+                self.world_state_slots.read_update_sequence(
+                    hidden_states,
+                    token_semantic,
+                    world_state,
+                    stride=max(self.config.stride, self.config.causal_state_stride),
+                )
+            )
+            effective_state_scale = state_scale * state_confidence if self.config.semantic_state_confidence_gate else state_scale
+            world_component = effective_state_scale * self.state_proj(state_context)
+            router_semantic = router_semantic + world_component
+        elif not self.config.semantic_causal:
+            effective_state_scale = state_scale * state_confidence if self.config.semantic_state_confidence_gate else state_scale
+            world_component = effective_state_scale * self.state_proj(state_context)
+            router_semantic = router_semantic + world_component
+
+        if self.memory is not None and memory is not None and not self.config.semantic_causal:
             memory_context, memory_weights = self.memory.read(hidden_states, memory)
             memory_token_strength = memory_weights.max(dim=-1).values.unsqueeze(-1)
             memory_read_strength = memory_token_strength.mean()
             memory_scale = self.config.semantic_memory_hidden_scale
             if self.config.semantic_memory_read_gate:
                 memory_scale = memory_scale * memory_token_strength
-            hidden_states = hidden_states + memory_scale * self.memory_proj(memory_context)
+            memory_hidden_write = memory_scale * self.memory_proj(memory_context)
+            hidden_states = hidden_states + memory_hidden_write
 
+        semantic_hidden_write = torch.zeros_like(router_semantic)
         if self.config.use_semantic_residual_write:
-            hidden_states = hidden_states + self.config.semantic_write_scale * self.semantic_write(router_semantic)
+            semantic_hidden_write = self.config.semantic_write_scale * self.semantic_write(router_semantic)
+            hidden_states = hidden_states + semantic_hidden_write
 
         moe_input = self.moe_norm(hidden_states)
         moe_output, moe_aux = self.moe(moe_input, router_semantic)
@@ -386,9 +423,9 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
         mask_f = mask.unsqueeze(-1).type_as(router_semantic)
         denom = mask_f.sum(dim=1).clamp_min(1.0)
         semantic_summary = (router_semantic * mask_f).sum(dim=1) / denom
-        if self.world_state_slots is not None and world_state is not None:
+        if self.world_state_slots is not None and world_state is not None and not self.config.semantic_causal:
             world_state, v5_metrics = self.world_state_slots.update_slots(world_state, semantic_summary)
-        else:
+        elif self.world_state_slots is None or world_state is None:
             v5_metrics = {
                 "slot_update_gate": torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype),
                 "slot_write_max": torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype),
@@ -401,6 +438,8 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
                 "slot_cosine": torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype),
                 "slot_diversity": torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype),
                 "state_pred": torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype),
+                "state_velocity": torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype),
+                "state_acceleration": torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype),
             }
 
         if self.memory is not None and memory is not None:
@@ -426,6 +465,17 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
             world_state.norm(dim=-1).mean()
             if world_state is not None
             else torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
+        )
+        semantic_norm = _mean_token_norm(token_semantic)
+        world_norm = _mean_token_norm(world_component)
+        router_norm = _mean_token_norm(router_semantic)
+        memory_write_norm = _mean_token_norm(memory_hidden_write)
+        semantic_write_norm = _mean_token_norm(semantic_hidden_write)
+        contribution_denom = (semantic_norm + world_norm).clamp_min(1e-6)
+        world_gate_metric = (
+            state_confidence.float().mean().type_as(hidden_states)
+            if self.config.semantic_state_confidence_gate
+            else torch.ones((), device=hidden_states.device, dtype=hidden_states.dtype)
         )
         aux = {
             "semantic": semantic,
@@ -454,6 +504,28 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
                 "slot_read_entropy": slot_read_entropy.type_as(hidden_states),
                 "slot_read_max": slot_read_max,
                 "slot_count": torch.tensor(slot_count, device=hidden_states.device, dtype=hidden_states.dtype),
+                "router_semantic_norm": semantic_norm,
+                "router_world_norm": world_norm,
+                "router_world_ratio": world_norm / contribution_denom,
+                "router_world_cosine": _mean_token_cosine(token_semantic, world_component),
+                "router_world_gate": world_gate_metric,
+                "router_memory_norm": torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype),
+                "router_memory_ratio": torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype),
+                "router_effective_norm": router_norm,
+                "semantic_hidden_write_norm": semantic_write_norm,
+                "semantic_hidden_write_scale": torch.tensor(
+                    self.config.semantic_write_scale if self.config.use_semantic_residual_write else 0.0,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                ),
+                "memory_hidden_write_norm": memory_write_norm,
+                "memory_hidden_write_scale": torch.tensor(
+                    self.config.semantic_memory_hidden_scale
+                    if self.memory is not None and memory is not None and not self.config.semantic_causal
+                    else 0.0,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                ),
             },
         }
         return hidden_states, aux, world_state, memory

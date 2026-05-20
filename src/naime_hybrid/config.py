@@ -27,6 +27,8 @@ class NAIMEStateMoEConfig:
     use_global_semantic: bool = False
     semantic_fusion: str = "local"
     semantic_pred_horizon: int = 0
+    semantic_causal: bool = True
+    causal_state_stride: int = 512
 
     # MoE.
     n_experts: int = 4
@@ -81,6 +83,9 @@ class NAIMEStateMoEConfig:
     self_state_identity_scale: float = 0.02
     self_state_context_score_scale: float = 4.0
     self_state_pred_detach_target: bool = True
+    self_state_world_gate: bool = True
+    self_state_world_gate_min: float = 0.10
+    self_state_world_gate_scale: float = 1.0
 
     # Stability / architecture toggles.
     qk_norm: bool = True

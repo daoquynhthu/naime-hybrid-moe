@@ -39,6 +39,7 @@ class SemanticCompressor(nn.Module):
         use_global_semantic: bool = False,
         semantic_fusion: str = "local",
         semantic_pred_horizon: int = 0,
+        causal: bool = True,
         downstream_deterministic: bool = False,
         downstream_detach_latent: bool = False,
     ):
@@ -58,6 +59,7 @@ class SemanticCompressor(nn.Module):
         self.use_global_semantic = use_global_semantic
         self.semantic_fusion = semantic_fusion
         self.semantic_pred_horizon = semantic_pred_horizon
+        self.causal = causal
         self.downstream_deterministic = downstream_deterministic
         self.downstream_detach_latent = downstream_detach_latent
 
@@ -113,6 +115,50 @@ class SemanticCompressor(nn.Module):
         )
         return pooled.view(batch, block_count, dim)
 
+    def _causal_window_pool(
+        self,
+        hidden_states: torch.Tensor,
+        mask: torch.Tensor,
+        stride: int,
+        window: int,
+        pool: AttentionPool,
+    ) -> torch.Tensor:
+        batch, seq_len, dim = hidden_states.shape
+        block_count = (seq_len + stride - 1) // stride
+        # A block summary is shared by tokens in that block, so it may only
+        # depend on tokens visible to the first token of the block. Build all
+        # prefix-causal windows at once to avoid one Python loop and one small
+        # CUDA launch per block.
+        ends = (torch.arange(block_count, device=hidden_states.device) * stride + 1).clamp(max=seq_len)
+        offsets = torch.arange(window, device=hidden_states.device) - window
+        positions = ends.unsqueeze(1) + offsets.unsqueeze(0)
+        valid = (positions >= 0) & (positions < seq_len)
+        positions = positions.clamp(0, max(seq_len - 1, 0))
+
+        flat_positions = positions.reshape(1, block_count * window)
+        hidden_index = flat_positions.unsqueeze(-1).expand(batch, -1, dim)
+        mask_index = flat_positions.expand(batch, -1)
+        windows = hidden_states.gather(1, hidden_index).view(batch, block_count, window, dim)
+        window_mask = mask.gather(1, mask_index).view(batch, block_count, window)
+        window_mask = window_mask & valid.unsqueeze(0)
+        pooled = pool(
+            windows.reshape(batch * block_count, window, dim),
+            window_mask.reshape(batch * block_count, window),
+        )
+        return pooled.view(batch, block_count, dim)
+
+    def _pool_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        mask: torch.Tensor,
+        stride: int,
+        window: int,
+        pool: AttentionPool,
+    ) -> torch.Tensor:
+        if self.causal:
+            return self._causal_window_pool(hidden_states, mask, stride, window, pool)
+        return self._window_pool(hidden_states, mask, stride, window, pool)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -128,7 +174,7 @@ class SemanticCompressor(nn.Module):
         else:
             mask = attention_mask.to(torch.bool)
 
-        block_summary = self._window_pool(hidden_states, mask, self.stride, self.window, self.pool)
+        block_summary = self._pool_blocks(hidden_states, mask, self.stride, self.window, self.pool)
         block_count = block_summary.size(1)
         flat_summary = block_summary.reshape(-1, dim)
 
@@ -163,20 +209,29 @@ class SemanticCompressor(nn.Module):
             mid_stride_blocks = self.mid_stride // self.stride
             mid_window_blocks = self.mid_window // self.stride
             block_mask = torch.ones(batch, block_count, dtype=torch.bool, device=hidden_states.device)
-            mid_summary = self._window_pool(
-                block_summary, block_mask, mid_stride_blocks, mid_window_blocks, self.mid_pool
-            )
-            mid_positions = (torch.arange(block_count, device=hidden_states.device) + 0.5) / mid_stride_blocks
-            mid_idx_lo = mid_positions.floor().long().clamp(0, mid_summary.size(1) - 1)
-            mid_idx_hi = (mid_idx_lo + 1).clamp(0, mid_summary.size(1) - 1)
-            t = (mid_positions - mid_idx_lo.float()).unsqueeze(-1).clamp(0, 1)
-            mid_semantic = (1 - t) * self.mid_to_model(mid_summary[:, mid_idx_lo, :]) + t * self.mid_to_model(
-                mid_summary[:, mid_idx_hi, :]
-            )
+            if self.causal:
+                mid_summary = self._causal_window_pool(block_summary, block_mask, 1, mid_window_blocks, self.mid_pool)
+                mid_semantic = self.mid_to_model(mid_summary)
+            else:
+                mid_summary = self._window_pool(
+                    block_summary, block_mask, mid_stride_blocks, mid_window_blocks, self.mid_pool
+                )
+                mid_positions = (torch.arange(block_count, device=hidden_states.device) + 0.5) / mid_stride_blocks
+                mid_idx_lo = mid_positions.floor().long().clamp(0, mid_summary.size(1) - 1)
+                mid_idx_hi = (mid_idx_lo + 1).clamp(0, mid_summary.size(1) - 1)
+                t = (mid_positions - mid_idx_lo.float()).unsqueeze(-1).clamp(0, 1)
+                mid_semantic = (1 - t) * self.mid_to_model(mid_summary[:, mid_idx_lo, :]) + t * self.mid_to_model(
+                    mid_summary[:, mid_idx_hi, :]
+                )
 
         if self.semantic_scales == "local_mid_global" or self.use_global_semantic:
-            global_summary = self.global_pool(hidden_states, mask)
-            global_semantic = self.global_to_model(global_summary).unsqueeze(1).expand(-1, block_count, -1)
+            if self.causal:
+                counts = torch.arange(1, block_count + 1, device=hidden_states.device).view(1, -1, 1)
+                global_summary = block_summary.cumsum(dim=1) / counts.to(dtype=block_summary.dtype)
+                global_semantic = self.global_to_model(global_summary)
+            else:
+                global_summary = self.global_pool(hidden_states, mask)
+                global_semantic = self.global_to_model(global_summary).unsqueeze(1).expand(-1, block_count, -1)
 
         if self.semantic_fusion == "gated_sum" and self.semantic_scales != "local":
             fusion_input = torch.cat([local_semantic, mid_semantic, global_semantic], dim=-1)

@@ -13,11 +13,11 @@ from .config import TrainConfig
 from .losses import collect_aux_losses, lm_loss
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, *, seed_cuda: bool = True) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    if seed_cuda and torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 

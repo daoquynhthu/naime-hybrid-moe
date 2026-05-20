@@ -27,6 +27,7 @@
 #include <string.h>
 #include <process.h>
 #include <tlhelp32.h>
+#include <stdarg.h>
 
 /* ---- configuration ---- */
 typedef struct {
@@ -52,6 +53,43 @@ typedef struct {
 static State g_state = {0};
 
 /* ---- helpers ---- */
+static void wcscat_safe(wchar_t *dst, size_t dst_size, const wchar_t *src);
+
+static void guardian_log(const wchar_t *fmt, ...) {
+    if (g_state.config.run_dir[0] == 0) {
+        return;
+    }
+    wchar_t log_path[MAX_PATH];
+    wcscpy_s(log_path, MAX_PATH, g_state.config.run_dir);
+    wcscat_safe(log_path, MAX_PATH, L"\\guardian.log");
+
+    FILE *f = _wfopen(log_path, L"a, ccs=UTF-8");
+    if (!f) {
+        return;
+    }
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fwprintf(
+        f,
+        L"%04u-%02u-%02u %02u:%02u:%02u.%03u | ",
+        st.wYear,
+        st.wMonth,
+        st.wDay,
+        st.wHour,
+        st.wMinute,
+        st.wSecond,
+        st.wMilliseconds
+    );
+
+    va_list args;
+    va_start(args, fmt);
+    vfwprintf(f, fmt, args);
+    va_end(args);
+    fwprintf(f, L"\n");
+    fclose(f);
+}
+
 static void wcscat_safe(wchar_t *dst, size_t dst_size, const wchar_t *src) {
     size_t len = wcslen(dst);
     size_t src_len = wcslen(src);
@@ -103,6 +141,7 @@ static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
 static int start_trainer(Config *cfg) {
     if (cfg->trainer_args[0] == 0) {
         fwprintf(stderr, L"guardian: no trainer arguments\n");
+        guardian_log(L"start_trainer failed: no trainer arguments");
         return -1;
     }
 
@@ -111,6 +150,7 @@ static int start_trainer(Config *cfg) {
     wcscat_safe(cmdline, 8192, cfg->trainer_python);
     wcscat_safe(cmdline, 8192, L"\" -m naime_hybrid.training.train ");
     wcscat_safe(cmdline, 8192, cfg->trainer_args);
+    guardian_log(L"start_trainer cmdline=%ls", cmdline);
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     STARTUPINFOW si = { sizeof(si) };
@@ -126,6 +166,12 @@ static int start_trainer(Config *cfg) {
                                &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     HANDLE h_err = CreateFileW(trainer_err_path, GENERIC_WRITE, FILE_SHARE_READ,
                                &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h_out == INVALID_HANDLE_VALUE) {
+        guardian_log(L"failed to open trainer stdout path=%ls error=%lu", trainer_out_path, GetLastError());
+    }
+    if (h_err == INVALID_HANDLE_VALUE) {
+        guardian_log(L"failed to open trainer stderr path=%ls error=%lu", trainer_err_path, GetLastError());
+    }
     if (h_out != INVALID_HANDLE_VALUE) SetFilePointer(h_out, 0, NULL, FILE_END);
     if (h_err != INVALID_HANDLE_VALUE) SetFilePointer(h_err, 0, NULL, FILE_END);
 
@@ -134,7 +180,7 @@ static int start_trainer(Config *cfg) {
     si.hStdOutput = h_out != INVALID_HANDLE_VALUE ? h_out : INVALID_HANDLE_VALUE;
     si.hStdError  = h_err != INVALID_HANDLE_VALUE ? h_err : INVALID_HANDLE_VALUE;
 
-    DWORD flags = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    DWORD flags = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
 
     BOOL ok = CreateProcessW(
         cfg->trainer_python, cmdline, NULL, NULL, TRUE,
@@ -142,6 +188,7 @@ static int start_trainer(Config *cfg) {
     );
     if (!ok) {
         fwprintf(stderr, L"guardian: CreateProcess failed (error %lu)\n", GetLastError());
+        guardian_log(L"CreateProcess failed error=%lu", GetLastError());
         return -1;
     }
     CloseHandle(pi.hThread);
@@ -158,6 +205,7 @@ static int start_trainer(Config *cfg) {
     write_pid_file(trainer_pid_path, pi.dwProcessId);
 
     fwprintf(stdout, L"guardian: trainer started pid=%lu\n", pi.dwProcessId);
+    guardian_log(L"trainer started pid=%lu", pi.dwProcessId);
     return 0;
 }
 
@@ -246,6 +294,16 @@ int wmain(int argc, wchar_t *argv[]) {
 
     fwprintf(stdout, L"guardian: started pid=%lu run_dir=%ls\n",
              GetCurrentProcessId(), cfg.run_dir);
+    guardian_log(
+        L"started pid=%lu repo=%ls trainer_python=%ls run_dir=%ls max_restarts=%d restart_delay=%d trainer_args=%ls",
+        GetCurrentProcessId(),
+        cfg.repo,
+        cfg.trainer_python,
+        cfg.run_dir,
+        cfg.max_restarts,
+        cfg.restart_delay,
+        cfg.trainer_args
+    );
 
     /* main loop: start and monitor trainer */
     int exit_code = 0;
@@ -267,6 +325,7 @@ int wmain(int argc, wchar_t *argv[]) {
                             g_state.trainer_process = h;
                             g_state.trainer_pid = existing_pid;
                             fwprintf(stdout, L"guardian: adopted existing trainer pid=%lu\n", existing_pid);
+                            guardian_log(L"adopted existing trainer pid=%lu", existing_pid);
                         } else {
                             CloseHandle(h);
                         }
@@ -306,14 +365,17 @@ int wmain(int argc, wchar_t *argv[]) {
             if (g_state.stop_requested) {
                 fwprintf(stdout, L"guardian: trainer stopped as requested (code=%lu reason=%s)\n",
                          code, g_state.stop_reason);
+                guardian_log(L"trainer stopped as requested code=%lu reason=%ls", code, g_state.stop_reason);
                 break;
             }
             if (code == 0) {
                 fwprintf(stdout, L"guardian: trainer exited cleanly\n");
+                guardian_log(L"trainer exited cleanly code=0");
                 break;
             }
             if (cfg.max_restarts >= 0 && g_state.restart_count >= cfg.max_restarts) {
                 fwprintf(stdout, L"guardian: max restarts (%d) reached\n", cfg.max_restarts);
+                guardian_log(L"max restarts reached code=%lu restart_count=%d max_restarts=%d", code, g_state.restart_count, cfg.max_restarts);
                 exit_code = (int)code;
                 break;
             }
@@ -321,9 +383,17 @@ int wmain(int argc, wchar_t *argv[]) {
                 g_state.restart_count++;
                 fwprintf(stdout, L"guardian: trainer crashed (code=%lu) restarting in %ds (%d/%d)\n",
                          code, cfg.restart_delay, g_state.restart_count, cfg.max_restarts);
+                guardian_log(
+                    L"trainer crashed code=%lu restarting delay=%d restart_count=%d max_restarts=%d",
+                    code,
+                    cfg.restart_delay,
+                    g_state.restart_count,
+                    cfg.max_restarts
+                );
                 Sleep(cfg.restart_delay * 1000);
             } else {
                 fwprintf(stdout, L"guardian: trainer exited with code=%lu; no restart configured\n", code);
+                guardian_log(L"trainer exited with code=%lu; no restart configured", code);
                 exit_code = (int)code;
                 break;
             }
@@ -340,6 +410,7 @@ int wmain(int argc, wchar_t *argv[]) {
             DWORD wait = WaitForSingleObject(g_state.trainer_process, 300000);
             if (wait == WAIT_TIMEOUT) {
                 fwprintf(stderr, L"guardian: trainer still alive after graceful-stop wait; leaving it to finish checkpointing\n");
+                guardian_log(L"trainer still alive after graceful-stop wait; leaving it to finish checkpointing");
             }
         }
         CloseHandle(g_state.trainer_process);
@@ -357,5 +428,6 @@ int wmain(int argc, wchar_t *argv[]) {
 
     DeleteCriticalSection(&g_state.cs);
     fwprintf(stdout, L"guardian: exited\n");
+    guardian_log(L"exited code=%d", exit_code);
     return exit_code;
 }

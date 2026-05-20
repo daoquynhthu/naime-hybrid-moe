@@ -235,12 +235,14 @@ class TrainingProgress:
                 f"[{step / max(1, self.total_steps) * 100:3.0f}% {step}/{self.total_steps} "
                 f"ETA {_dur(eta)}]  "
                 f"lm {p.get('lm', 0):.4f}  ppl {min(9999, p.get('ppl', 0)):.1f}  "
-                f"alpha {p.get('alpha_downstream_mean', 0):.3f}  ent {p.get('router_entropy', 0):.3f}"
+                f"alpha {p.get('alpha_downstream_mean', 0):.3f}  ent {p.get('router_entropy', 0):.3f}  "
+                f"tok {int(tok)}/s"
             )
             if "v6" in self.architecture:
                 line += (
                     f"  v6_cos {p.get('v6_slot_cosine', 0):.3f}"
                     f"  v6_ctx {p.get('v6_slot_context_cosine', 0):.3f}"
+                    f"  wg {p.get('v6_hidden_write_gate', 0):.2f}"
                     f"  self {p.get('v6_boundary_self', 0):.2f}"
                     f"  world {p.get('v6_boundary_world', 0):.2f}"
                 )
@@ -304,7 +306,9 @@ class TrainingProgress:
             f"conf {_conf(p.get('v5_slot_confidence', 0))}  "
             f"cos {_cos(p.get('v5_slot_cosine', 0))}  "
             f"pred {_pred(p.get('v5_state_pred', 0))}  "
-            f"w_ent {_went(p.get('v5_slot_write_entropy', 0))}"
+            f"w_ent {_went(p.get('v5_slot_write_entropy', 0))}  "
+            f"r_w {_mix_s(p.get('v5_router_world_ratio', 0))}  "
+            f"w_gate {_gate(p.get('v5_router_world_gate', 0))}"
         )
         self._put(
             f"{C}v6 self {R} \u2502 "
@@ -312,7 +316,10 @@ class TrainingProgress:
             f"cos {_cos(p.get('v6_slot_cosine', 0))}  "
             f"ctx {_cos(p.get('v6_slot_context_cosine', 0))}  "
             f"dlt {_dlt(p.get('v6_state_delta', 0))}  "
-            f"refl {_mem(p.get('v6_reflection_norm', 0))}"
+            f"refl {_mem(p.get('v6_reflection_norm', 0))}  "
+            f"res {_mix_s(p.get('v6_world_residual_ratio', 0))}  "
+            f"wg {_gate(p.get('v6_hidden_write_gate', 0))}  "
+            f"w_norm {_mem(p.get('v6_hidden_write_norm', 0))}"
         )
         self._put(
             f"{C}v6 bnd  {R} \u2502 "

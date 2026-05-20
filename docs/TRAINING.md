@@ -4,24 +4,35 @@ Date: 2026-05-17
 
 ## Entry Point
 
-Use `scripts/train_model.ps1` for normal experiments:
+Use `scripts/train_template.ps1` for normal experiments. It expands a named JSON
+template into the full training command and keeps the long argument surface out
+of day-to-day work:
 
 ```powershell
-.\scripts\train_model.ps1 -Model <name> -RunName <name> -DataPath <path> [args]
+.\scripts\train_template.ps1 -List
+.\scripts\train_template.ps1 -Template v6_local_smoke
+.\scripts\train_template.ps1 -Template v6_local_smoke -PrintArgs
 ```
 
-Available architecture IDs:
+See `docs/TRAINING_TEMPLATES.md` for template rules and safe overrides.
+
+`scripts/train_model.ps1` and `python -m naime_hybrid.training.train` remain
+expert-level interfaces for debugging and one-off research runs.
+
+Supported daily architecture IDs:
 
 ```text
 dense
 token_moe
 naime_state_moe
 naime_v4_state_moe
-naime_v41_state_moe
-naime_v42_state_moe
 naime_v5_world_state_moe
 naime_v6_recursive_self_moe
 ```
+
+Older V1/V2/V3 and V4.1/V4.2 aliases are legacy/forensic only. Do not launch
+them through `scripts/train_model.ps1`; use raw Python only if deliberately
+reproducing an old run.
 
 All model and training parameters should pass through CLI/config. Avoid hard-coding experiment-specific values in Python.
 
@@ -32,7 +43,7 @@ V6 is the active path. The current large-run policy is segmented continuation on
 Local quick probe:
 
 ```powershell
-.\scripts\train_model.ps1 -Model naime_v6_recursive_self_moe -RunName v6_local_probe -DataPath <LOCAL_FINEWEB_50M> -TargetTokens 3000000 -EvalEvery 500 -SaveEvery 5000 -LatestEvery 2500
+.\scripts\train_template.ps1 -Template v6_local_smoke -RunName v6_local_probe
 ```
 
 Remote 4090 runs should be launched through the hidden/background remote workflow documented in `docs/REMOTE_4090_OPERATIONS.md`, not from a visible foreground PowerShell window.
@@ -44,20 +55,25 @@ model              naime_v6_recursive_self_moe
 dataset            <REMOTE_DATASETS>\fineweb_edu_1b_ctx1024
 resume checkpoint  previous validated models\model_best.pt
 target mode        additional
-segment size       100M tokens when the GPU is available
-vram fraction      0.80
-learning rate      2.5e-5
-warmup steps       500
-min lr ratio       0.03
-grad clip          0.8
+segment size       500M tokens when the GPU is free
+vram fraction      0.90-0.95 when dedicated, 0.70-0.80 when shared
+learning rate      4e-6 for conservative continuation
+warmup steps       2000
+min lr ratio       0.08
+grad clip          0.5
 eval every         5000
 eval batches       40
+eval sampling      random
 save every         10000
 latest every       5000
 best mode          model
 ```
 
-Use smaller fixed batches only when another GPU job is active. When the GPU is free, prefer auto-batch with conservative prediction/headroom.
+Use smaller fixed batches only when another GPU job is active. When the GPU is
+free, prefer auto-batch with conservative prediction/headroom. Serious remote
+runs should first print the resolved template arguments, then launch through
+`scripts/launch_train_detached.py` so the process survives SSH disconnects and
+does not create a visible remote window.
 
 ## LR Schedule
 
@@ -94,17 +110,27 @@ Files:
 - `interrupted.pt` / `model_interrupted.pt`: saved on Ctrl+C or STOP.
 - `failed.pt` / `model_failed.pt`: saved on exception.
 
-Legacy checkpoints are still loadable, but new runs should keep model-only weights in `models\` and full checkpoints at the run root.
+New runs should keep model-only weights in `models\` and full checkpoints at the run root.
 
 ## Resume And Stop
 
 Default resume mode:
 
 ```text
---resume auto
+--resume none
 ```
 
-Stable auto-resume priority:
+Resume is intentionally opt-in. A clean checkpoint must carry
+`causal_integrity_version >= 2`, which marks it as produced after the current
+causal semantic/state path fixes. Checkpoints without this marker are refused by
+default because older runs may include non-causal leakage or other contaminated
+training paths.
+
+Use `--allow-legacy-resume` only for forensic analysis or deliberately
+contaminated baselines. Do not use it for clean architecture validation or
+future foundation runs.
+
+If `--resume auto` is explicitly requested, stable auto-resume priority is:
 
 ```text
 latest.pt -> interrupted.pt -> best.pt -> model_latest.pt -> model_interrupted.pt -> model_best.pt
@@ -155,6 +181,20 @@ V6 recursive self-state:
 - `v6_boundary_self`, `v6_boundary_world`, `v6_boundary_other`, `v6_boundary_unknown`
 - `v6_reflection_norm`
 
+## Validation Sampling
+
+By default validation now uses a deterministic random window when
+`--eval-max-batches > 0`:
+
+```powershell
+--eval-sampling random --eval-seed 4321
+```
+
+This avoids repeatedly measuring only the prefix of the validation split. Use
+`--eval-sampling sequential` only when comparing against older runs that used
+legacy prefix validation. Use `--eval-max-batches 0` for full sequential
+validation.
+
 ## Robustness Features
 
 - full checkpoints include model, optimizer, scheduler, AMP scaler, config, metrics, and RNG state;
@@ -167,7 +207,31 @@ V6 recursive self-state:
 - Ctrl+C and STOP request graceful checkpoint saving;
 - console output is compact, while full logs remain persisted.
 
+## `torch.compile` Safety
+
+`-CompileModel` is a throughput optimization, not part of the architecture
+definition. Treat it as experimental for V6 runs:
+
+- checkpoints are saved from the unwrapped eager module so state dict keys do not
+  acquire the `_orig_mod.` prefix;
+- compiled and eager checkpoints can be loaded across each other;
+- stochastic semantic gates are kept outside Dynamo;
+- sparse MoE dispatch is kept eager because it contains dynamic expert grouping
+  and tensor-to-Python control flow;
+- if `-CompileModel` is used with `-MoeDispatchMode auto` or `sparse`, expect a
+  partial compile rather than full graph compilation.
+
+Do not enable compile for a serious run until a short smoke run confirms finite
+loss, normal `grad_norm`, and matching validation behavior against an eager
+baseline.
+
 ## Data Preparation
+
+For large raw corpora, especially 300GB+ multi-source builds, follow the full
+data engineering requirements in [DATA_PIPELINE_SPEC.md](DATA_PIPELINE_SPEC.md).
+The commands below are convenience wrappers for already-defined corpus builds;
+they are not a substitute for source manifests, deduplication, data cards, and
+pre-training quality gates.
 
 ```powershell
 # 1B-token FineWeb-Edu corpus (ctx1024, GPT-2 tokenized, HF disk format)

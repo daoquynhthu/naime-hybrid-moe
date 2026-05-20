@@ -1,12 +1,14 @@
 import torch
 import torch.nn.functional as F
 
+IGNORE_INDEX = -100
+
 
 def lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(
         logits.reshape(-1, logits.size(-1)).float(),
         labels.reshape(-1),
-        ignore_index=0,
+        ignore_index=IGNORE_INDEX,
     )
 
 
@@ -78,21 +80,47 @@ def collect_aux_losses(
     v5_slot_confidences = []
     v5_slot_confidence_stds = []
     v5_slot_deltas = []
+    v5_state_velocities = []
+    v5_state_accelerations = []
     v5_slot_cosines = []
     v5_slot_read_entropies = []
     v5_slot_read_maxes = []
+    v5_history_read_entropies = []
+    v5_history_read_maxes = []
+    v5_router_semantic_norms = []
+    v5_router_world_norms = []
+    v5_router_world_ratios = []
+    v5_router_world_cosines = []
+    v5_router_world_gates = []
+    v5_router_memory_norms = []
+    v5_router_memory_ratios = []
+    v5_router_effective_norms = []
+    v5_semantic_hidden_write_norms = []
+    v5_semantic_hidden_write_scales = []
+    v5_memory_hidden_write_norms = []
+    v5_memory_hidden_write_scales = []
     v6_self_preds = []
     v6_slot_diversities = []
     v6_slot_cosines = []
     v6_slot_context_cosines = []
     v6_state_deltas = []
+    v6_state_velocities = []
+    v6_state_accelerations = []
     v6_state_norms = []
     v6_reflection_norms = []
+    v6_world_explained_norms = []
+    v6_hidden_residual_norms = []
+    v6_world_residual_ratios = []
+    v6_hidden_write_gates = []
+    v6_hidden_write_norms = []
+    v6_hidden_write_scales = []
     v6_boundary_entropies = []
     v6_boundary_selfs = []
     v6_boundary_worlds = []
     v6_boundary_others = []
     v6_boundary_unknowns = []
+    v6_history_self_norms = []
+    v6_history_world_norms = []
     dispatch_denses = []
 
     for layer_aux in aux_by_layer:
@@ -198,12 +226,44 @@ def collect_aux_losses(
                 v5_slot_confidence_stds.append(v5["slot_confidence_std"].float())
             if "slot_delta" in v5:
                 v5_slot_deltas.append(v5["slot_delta"].float())
+            if "state_velocity" in v5:
+                v5_state_velocities.append(v5["state_velocity"].float())
+            if "state_acceleration" in v5:
+                v5_state_accelerations.append(v5["state_acceleration"].float())
             if "slot_cosine" in v5:
                 v5_slot_cosines.append(v5["slot_cosine"].float())
             if "slot_read_entropy" in v5:
                 v5_slot_read_entropies.append(v5["slot_read_entropy"].float())
             if "slot_read_max" in v5:
                 v5_slot_read_maxes.append(v5["slot_read_max"].float())
+            if "history_read_entropy" in v5:
+                v5_history_read_entropies.append(v5["history_read_entropy"].float())
+            if "history_read_max" in v5:
+                v5_history_read_maxes.append(v5["history_read_max"].float())
+            if "router_semantic_norm" in v5:
+                v5_router_semantic_norms.append(v5["router_semantic_norm"].float())
+            if "router_world_norm" in v5:
+                v5_router_world_norms.append(v5["router_world_norm"].float())
+            if "router_world_ratio" in v5:
+                v5_router_world_ratios.append(v5["router_world_ratio"].float())
+            if "router_world_cosine" in v5:
+                v5_router_world_cosines.append(v5["router_world_cosine"].float())
+            if "router_world_gate" in v5:
+                v5_router_world_gates.append(v5["router_world_gate"].float())
+            if "router_memory_norm" in v5:
+                v5_router_memory_norms.append(v5["router_memory_norm"].float())
+            if "router_memory_ratio" in v5:
+                v5_router_memory_ratios.append(v5["router_memory_ratio"].float())
+            if "router_effective_norm" in v5:
+                v5_router_effective_norms.append(v5["router_effective_norm"].float())
+            if "semantic_hidden_write_norm" in v5:
+                v5_semantic_hidden_write_norms.append(v5["semantic_hidden_write_norm"].float())
+            if "semantic_hidden_write_scale" in v5:
+                v5_semantic_hidden_write_scales.append(v5["semantic_hidden_write_scale"].float())
+            if "memory_hidden_write_norm" in v5:
+                v5_memory_hidden_write_norms.append(v5["memory_hidden_write_norm"].float())
+            if "memory_hidden_write_scale" in v5:
+                v5_memory_hidden_write_scales.append(v5["memory_hidden_write_scale"].float())
             for value in v5.values():
                 if torch.is_tensor(value):
                     device = value.device
@@ -221,10 +281,26 @@ def collect_aux_losses(
                 v6_slot_context_cosines.append(v6["slot_context_cosine"].float())
             if "state_delta" in v6:
                 v6_state_deltas.append(v6["state_delta"].float())
+            if "state_velocity" in v6:
+                v6_state_velocities.append(v6["state_velocity"].float())
+            if "state_acceleration" in v6:
+                v6_state_accelerations.append(v6["state_acceleration"].float())
             if "state_norm" in v6:
                 v6_state_norms.append(v6["state_norm"].float())
             if "reflection_norm" in v6:
                 v6_reflection_norms.append(v6["reflection_norm"].float())
+            if "world_explained_norm" in v6:
+                v6_world_explained_norms.append(v6["world_explained_norm"].float())
+            if "hidden_residual_norm" in v6:
+                v6_hidden_residual_norms.append(v6["hidden_residual_norm"].float())
+            if "world_residual_ratio" in v6:
+                v6_world_residual_ratios.append(v6["world_residual_ratio"].float())
+            if "hidden_write_gate" in v6:
+                v6_hidden_write_gates.append(v6["hidden_write_gate"].float())
+            if "hidden_write_norm" in v6:
+                v6_hidden_write_norms.append(v6["hidden_write_norm"].float())
+            if "hidden_write_scale" in v6:
+                v6_hidden_write_scales.append(v6["hidden_write_scale"].float())
             if "boundary_entropy" in v6:
                 v6_boundary_entropies.append(v6["boundary_entropy"].float())
             if "boundary_self" in v6:
@@ -235,6 +311,10 @@ def collect_aux_losses(
                 v6_boundary_others.append(v6["boundary_other"].float())
             if "boundary_unknown" in v6:
                 v6_boundary_unknowns.append(v6["boundary_unknown"].float())
+            if "history_self_norm" in v6:
+                v6_history_self_norms.append(v6["history_self_norm"].float())
+            if "history_world_norm" in v6:
+                v6_history_world_norms.append(v6["history_world_norm"].float())
             for value in v6.values():
                 if torch.is_tensor(value):
                     device = value.device
@@ -284,20 +364,66 @@ def collect_aux_losses(
         "v5_slot_confidence": torch.stack(v5_slot_confidences).mean() if v5_slot_confidences else zero,
         "v5_slot_confidence_std": torch.stack(v5_slot_confidence_stds).mean() if v5_slot_confidence_stds else zero,
         "v5_slot_delta": torch.stack(v5_slot_deltas).mean() if v5_slot_deltas else zero,
+        "v5_state_velocity": torch.stack(v5_state_velocities).mean() if v5_state_velocities else zero,
+        "v5_state_acceleration": torch.stack(v5_state_accelerations).mean() if v5_state_accelerations else zero,
         "v5_slot_cosine": torch.stack(v5_slot_cosines).mean() if v5_slot_cosines else zero,
         "v5_slot_read_entropy": torch.stack(v5_slot_read_entropies).mean() if v5_slot_read_entropies else zero,
         "v5_slot_read_max": torch.stack(v5_slot_read_maxes).mean() if v5_slot_read_maxes else zero,
+        "v5_history_read_entropy": torch.stack(v5_history_read_entropies).mean()
+        if v5_history_read_entropies
+        else zero,
+        "v5_history_read_max": torch.stack(v5_history_read_maxes).mean() if v5_history_read_maxes else zero,
+        "v5_router_semantic_norm": torch.stack(v5_router_semantic_norms).mean()
+        if v5_router_semantic_norms
+        else zero,
+        "v5_router_world_norm": torch.stack(v5_router_world_norms).mean() if v5_router_world_norms else zero,
+        "v5_router_world_ratio": torch.stack(v5_router_world_ratios).mean() if v5_router_world_ratios else zero,
+        "v5_router_world_cosine": torch.stack(v5_router_world_cosines).mean() if v5_router_world_cosines else zero,
+        "v5_router_world_gate": torch.stack(v5_router_world_gates).mean() if v5_router_world_gates else zero,
+        "v5_router_memory_norm": torch.stack(v5_router_memory_norms).mean() if v5_router_memory_norms else zero,
+        "v5_router_memory_ratio": torch.stack(v5_router_memory_ratios).mean() if v5_router_memory_ratios else zero,
+        "v5_router_effective_norm": torch.stack(v5_router_effective_norms).mean()
+        if v5_router_effective_norms
+        else zero,
+        "v5_semantic_hidden_write_norm": torch.stack(v5_semantic_hidden_write_norms).mean()
+        if v5_semantic_hidden_write_norms
+        else zero,
+        "v5_semantic_hidden_write_scale": torch.stack(v5_semantic_hidden_write_scales).mean()
+        if v5_semantic_hidden_write_scales
+        else zero,
+        "v5_memory_hidden_write_norm": torch.stack(v5_memory_hidden_write_norms).mean()
+        if v5_memory_hidden_write_norms
+        else zero,
+        "v5_memory_hidden_write_scale": torch.stack(v5_memory_hidden_write_scales).mean()
+        if v5_memory_hidden_write_scales
+        else zero,
         "v6_self_pred": torch.stack(v6_self_preds).mean() if v6_self_preds else zero,
         "v6_slot_diversity": torch.stack(v6_slot_diversities).mean() if v6_slot_diversities else zero,
         "v6_slot_cosine": torch.stack(v6_slot_cosines).mean() if v6_slot_cosines else zero,
         "v6_slot_context_cosine": torch.stack(v6_slot_context_cosines).mean() if v6_slot_context_cosines else zero,
         "v6_state_delta": torch.stack(v6_state_deltas).mean() if v6_state_deltas else zero,
+        "v6_state_velocity": torch.stack(v6_state_velocities).mean() if v6_state_velocities else zero,
+        "v6_state_acceleration": torch.stack(v6_state_accelerations).mean() if v6_state_accelerations else zero,
         "v6_state_norm": torch.stack(v6_state_norms).mean() if v6_state_norms else zero,
         "v6_reflection_norm": torch.stack(v6_reflection_norms).mean() if v6_reflection_norms else zero,
+        "v6_world_explained_norm": torch.stack(v6_world_explained_norms).mean()
+        if v6_world_explained_norms
+        else zero,
+        "v6_hidden_residual_norm": torch.stack(v6_hidden_residual_norms).mean()
+        if v6_hidden_residual_norms
+        else zero,
+        "v6_world_residual_ratio": torch.stack(v6_world_residual_ratios).mean()
+        if v6_world_residual_ratios
+        else zero,
+        "v6_hidden_write_gate": torch.stack(v6_hidden_write_gates).mean() if v6_hidden_write_gates else zero,
+        "v6_hidden_write_norm": torch.stack(v6_hidden_write_norms).mean() if v6_hidden_write_norms else zero,
+        "v6_hidden_write_scale": torch.stack(v6_hidden_write_scales).mean() if v6_hidden_write_scales else zero,
         "v6_boundary_entropy": torch.stack(v6_boundary_entropies).mean() if v6_boundary_entropies else zero,
         "v6_boundary_self": torch.stack(v6_boundary_selfs).mean() if v6_boundary_selfs else zero,
         "v6_boundary_world": torch.stack(v6_boundary_worlds).mean() if v6_boundary_worlds else zero,
         "v6_boundary_other": torch.stack(v6_boundary_others).mean() if v6_boundary_others else zero,
         "v6_boundary_unknown": torch.stack(v6_boundary_unknowns).mean() if v6_boundary_unknowns else zero,
+        "v6_history_self_norm": torch.stack(v6_history_self_norms).mean() if v6_history_self_norms else zero,
+        "v6_history_world_norm": torch.stack(v6_history_world_norms).mean() if v6_history_world_norms else zero,
         "dispatch_dense": torch.stack(dispatch_denses).mean() if dispatch_denses else zero,
     }

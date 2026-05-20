@@ -27,6 +27,8 @@ scripts/*.exe
 monitor_test_output.txt
 
 data/
+!src/naime_hybrid/data/
+!src/naime_hybrid/data/*.py
 cache/
 wandb/
 

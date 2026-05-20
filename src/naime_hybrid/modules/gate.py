@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 
+@torch.compiler.disable(recursive=False)
 class GumbelBlockGate(nn.Module):
     """Straight-through Gumbel-Sigmoid block gate."""
 

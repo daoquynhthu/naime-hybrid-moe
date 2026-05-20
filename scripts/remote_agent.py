@@ -148,6 +148,38 @@ def build_training_args(state: AgentState, payload: dict[str, Any]) -> tuple[lis
         _workspace_value("local", "fineweb_edu_50m", "NAIME_DEFAULT_DATASET", str(DEFAULT_ROOT / "datasets" / "fineweb_edu_50m")),
     )
 
+    if payload.get("template"):
+        wrapper_args = [
+            "-Template",
+            str(payload["template"]),
+            "-RunName",
+            run_name,
+        ]
+        if payload.get("output_dir"):
+            wrapper_args.extend(["-OutputDir", str(payload["output_dir"])])
+        if payload.get("data_path"):
+            wrapper_args.extend(["-DataPath", str(data_path)])
+        for key, value in payload.get("script_args", {}).items():
+            param = "-" + key
+            if isinstance(value, bool):
+                if value:
+                    wrapper_args.append(param)
+            elif value is not None:
+                wrapper_args.extend([param, str(value)])
+        args = [
+            str(state.python),
+            str(state.repo / "scripts" / "launch_train_detached.py"),
+            "--repo",
+            str(state.repo),
+            "--python",
+            str(state.python),
+            "--run-dir",
+            str(run_dir),
+            "--",
+            *wrapper_args,
+        ]
+        return args, run_dir
+
     if payload.get("model"):
         wrapper_args = [
             "-Model",
@@ -353,6 +385,7 @@ class RemoteAgentHandler(BaseHTTPRequestHandler):
                         subprocess.CREATE_NEW_PROCESS_GROUP
                         | subprocess.DETACHED_PROCESS
                         | subprocess.CREATE_NO_WINDOW
+                        | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
                     )
                 proc = subprocess.Popen(
                     args,

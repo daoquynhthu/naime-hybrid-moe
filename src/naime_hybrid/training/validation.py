@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 
 from naime_hybrid.config import NAIMEStateMoEConfig
 
-from .losses import collect_aux_losses, lm_loss
+from .losses import IGNORE_INDEX, collect_aux_losses, lm_loss
 
 
 def evaluate_model(
@@ -73,6 +73,18 @@ def evaluate_model(
             "v5_slot_cosine",
             "v5_slot_read_entropy",
             "v5_slot_read_max",
+            "v5_router_semantic_norm",
+            "v5_router_world_norm",
+            "v5_router_world_ratio",
+            "v5_router_world_cosine",
+            "v5_router_world_gate",
+            "v5_router_memory_norm",
+            "v5_router_memory_ratio",
+            "v5_router_effective_norm",
+            "v5_semantic_hidden_write_norm",
+            "v5_semantic_hidden_write_scale",
+            "v5_memory_hidden_write_norm",
+            "v5_memory_hidden_write_scale",
             "v6_self_pred",
             "v6_slot_diversity",
             "v6_slot_cosine",
@@ -80,6 +92,12 @@ def evaluate_model(
             "v6_state_delta",
             "v6_state_norm",
             "v6_reflection_norm",
+            "v6_world_explained_norm",
+            "v6_hidden_residual_norm",
+            "v6_world_residual_ratio",
+            "v6_hidden_write_gate",
+            "v6_hidden_write_norm",
+            "v6_hidden_write_scale",
             "v6_boundary_entropy",
             "v6_boundary_self",
             "v6_boundary_world",
@@ -95,8 +113,11 @@ def evaluate_model(
                 break
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                out = model(input_ids)
+                out = model(input_ids, attention_mask=attention_mask)
                 loss = lm_loss(out["logits"], labels)
                 aux = collect_aux_losses(
                     out.get("aux", []),
@@ -147,6 +168,18 @@ def evaluate_model(
             totals["v5_slot_cosine"] += float(aux["v5_slot_cosine"].detach().cpu())
             totals["v5_slot_read_entropy"] += float(aux["v5_slot_read_entropy"].detach().cpu())
             totals["v5_slot_read_max"] += float(aux["v5_slot_read_max"].detach().cpu())
+            totals["v5_router_semantic_norm"] += float(aux["v5_router_semantic_norm"].detach().cpu())
+            totals["v5_router_world_norm"] += float(aux["v5_router_world_norm"].detach().cpu())
+            totals["v5_router_world_ratio"] += float(aux["v5_router_world_ratio"].detach().cpu())
+            totals["v5_router_world_cosine"] += float(aux["v5_router_world_cosine"].detach().cpu())
+            totals["v5_router_world_gate"] += float(aux["v5_router_world_gate"].detach().cpu())
+            totals["v5_router_memory_norm"] += float(aux["v5_router_memory_norm"].detach().cpu())
+            totals["v5_router_memory_ratio"] += float(aux["v5_router_memory_ratio"].detach().cpu())
+            totals["v5_router_effective_norm"] += float(aux["v5_router_effective_norm"].detach().cpu())
+            totals["v5_semantic_hidden_write_norm"] += float(aux["v5_semantic_hidden_write_norm"].detach().cpu())
+            totals["v5_semantic_hidden_write_scale"] += float(aux["v5_semantic_hidden_write_scale"].detach().cpu())
+            totals["v5_memory_hidden_write_norm"] += float(aux["v5_memory_hidden_write_norm"].detach().cpu())
+            totals["v5_memory_hidden_write_scale"] += float(aux["v5_memory_hidden_write_scale"].detach().cpu())
             totals["v6_self_pred"] += float(aux["v6_self_pred"].detach().cpu())
             totals["v6_slot_diversity"] += float(aux["v6_slot_diversity"].detach().cpu())
             totals["v6_slot_cosine"] += float(aux["v6_slot_cosine"].detach().cpu())
@@ -154,12 +187,18 @@ def evaluate_model(
             totals["v6_state_delta"] += float(aux["v6_state_delta"].detach().cpu())
             totals["v6_state_norm"] += float(aux["v6_state_norm"].detach().cpu())
             totals["v6_reflection_norm"] += float(aux["v6_reflection_norm"].detach().cpu())
+            totals["v6_world_explained_norm"] += float(aux["v6_world_explained_norm"].detach().cpu())
+            totals["v6_hidden_residual_norm"] += float(aux["v6_hidden_residual_norm"].detach().cpu())
+            totals["v6_world_residual_ratio"] += float(aux["v6_world_residual_ratio"].detach().cpu())
+            totals["v6_hidden_write_gate"] += float(aux["v6_hidden_write_gate"].detach().cpu())
+            totals["v6_hidden_write_norm"] += float(aux["v6_hidden_write_norm"].detach().cpu())
+            totals["v6_hidden_write_scale"] += float(aux["v6_hidden_write_scale"].detach().cpu())
             totals["v6_boundary_entropy"] += float(aux["v6_boundary_entropy"].detach().cpu())
             totals["v6_boundary_self"] += float(aux["v6_boundary_self"].detach().cpu())
             totals["v6_boundary_world"] += float(aux["v6_boundary_world"].detach().cpu())
             totals["v6_boundary_other"] += float(aux["v6_boundary_other"].detach().cpu())
             totals["v6_boundary_unknown"] += float(aux["v6_boundary_unknown"].detach().cpu())
-            tokens += int(input_ids.numel())
+            tokens += int(labels.ne(IGNORE_INDEX).sum().item())
             batches += 1
 
     if was_training:
@@ -257,11 +296,29 @@ def evaluate_model(
         "val_v5_slot_cosine": totals["v5_slot_cosine"] / batches,
         "val_v5_slot_read_entropy": totals["v5_slot_read_entropy"] / batches,
         "val_v5_slot_read_max": totals["v5_slot_read_max"] / batches,
+        "val_v5_router_semantic_norm": totals["v5_router_semantic_norm"] / batches,
+        "val_v5_router_world_norm": totals["v5_router_world_norm"] / batches,
+        "val_v5_router_world_ratio": totals["v5_router_world_ratio"] / batches,
+        "val_v5_router_world_cosine": totals["v5_router_world_cosine"] / batches,
+        "val_v5_router_world_gate": totals["v5_router_world_gate"] / batches,
+        "val_v5_router_memory_norm": totals["v5_router_memory_norm"] / batches,
+        "val_v5_router_memory_ratio": totals["v5_router_memory_ratio"] / batches,
+        "val_v5_router_effective_norm": totals["v5_router_effective_norm"] / batches,
+        "val_v5_semantic_hidden_write_norm": totals["v5_semantic_hidden_write_norm"] / batches,
+        "val_v5_semantic_hidden_write_scale": totals["v5_semantic_hidden_write_scale"] / batches,
+        "val_v5_memory_hidden_write_norm": totals["v5_memory_hidden_write_norm"] / batches,
+        "val_v5_memory_hidden_write_scale": totals["v5_memory_hidden_write_scale"] / batches,
         "val_v6_slot_cosine": totals["v6_slot_cosine"] / batches,
         "val_v6_slot_context_cosine": totals["v6_slot_context_cosine"] / batches,
         "val_v6_state_delta": totals["v6_state_delta"] / batches,
         "val_v6_state_norm": totals["v6_state_norm"] / batches,
         "val_v6_reflection_norm": totals["v6_reflection_norm"] / batches,
+        "val_v6_world_explained_norm": totals["v6_world_explained_norm"] / batches,
+        "val_v6_hidden_residual_norm": totals["v6_hidden_residual_norm"] / batches,
+        "val_v6_world_residual_ratio": totals["v6_world_residual_ratio"] / batches,
+        "val_v6_hidden_write_gate": totals["v6_hidden_write_gate"] / batches,
+        "val_v6_hidden_write_norm": totals["v6_hidden_write_norm"] / batches,
+        "val_v6_hidden_write_scale": totals["v6_hidden_write_scale"] / batches,
         "val_v6_boundary_entropy": totals["v6_boundary_entropy"] / batches,
         "val_v6_boundary_self": totals["v6_boundary_self"] / batches,
         "val_v6_boundary_world": totals["v6_boundary_world"] / batches,

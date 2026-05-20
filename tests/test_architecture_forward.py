@@ -1,3 +1,6 @@
+import warnings
+
+import pytest
 import torch
 
 from naime_hybrid import (
@@ -8,10 +11,36 @@ from naime_hybrid import (
     NAIMEV6RecursiveSelfMoEDecoder,
     build_model,
 )
+from naime_hybrid.data import HFDiskCausalDataset
 from naime_hybrid.modules.gate import GumbelBlockGate
 from naime_hybrid.modules.moe import TopKMoE
+from naime_hybrid.modules.world_state import WorldStateSlots
+from naime_hybrid.training.checkpoint import (
+    build_model_payload,
+    normalize_state_dict_for_model,
+    save_payloads_in_subprocess,
+)
+from naime_hybrid.training.cli import build_train_config, parse_args
 from naime_hybrid.training.control import reference_value_at_step, update_sparse_lambda
-from naime_hybrid.training.checkpoint import save_payloads_in_subprocess
+from naime_hybrid.training.losses import lm_loss
+
+
+class _FakeCompiledWrapper(torch.nn.Module):
+    """Small stand-in for the torch.compile wrapper shape used in checkpoints."""
+
+    def __init__(self, module: torch.nn.Module):
+        super().__init__()
+        self._orig_mod = module
+
+
+def _require_torch_compile_support():
+    if not hasattr(torch, "compile"):
+        pytest.skip("torch.compile is unavailable in this PyTorch build")
+    try:
+        probe = torch.compile(lambda x: x + 1, backend="eager")
+        probe(torch.ones(1))
+    except Exception as exc:
+        pytest.skip(f"torch.compile unavailable in this environment: {exc}")
 
 
 def test_checkpoint_subprocess_saves_payload(tmp_path):
@@ -23,6 +52,76 @@ def test_checkpoint_subprocess_saves_payload(tmp_path):
     restored = torch.load(path, map_location="cpu", weights_only=False)
     assert restored["step"] == 7
     assert torch.equal(restored["model"]["w"], torch.arange(4))
+
+
+def test_checkpoint_normalizes_compiled_prefix():
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        d_model=16,
+        n_layers=1,
+        n_heads=2,
+        n_kv_heads=1,
+        d_ff=32,
+    )
+    model = build_model("dense", config)
+    eager_state = model.state_dict()
+    compiled_like_state = {f"_orig_mod.{key}": value.clone() for key, value in eager_state.items()}
+
+    normalized = normalize_state_dict_for_model(model, compiled_like_state)
+
+    assert set(normalized) == set(eager_state)
+
+
+def test_model_payload_unwraps_compiled_prefix():
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        d_model=16,
+        n_layers=1,
+        n_heads=2,
+        n_kv_heads=1,
+        d_ff=32,
+    )
+    model = build_model("dense", config)
+    compiled = _FakeCompiledWrapper(model)
+
+    payload = build_model_payload(compiled, step=1, config={}, metrics={})
+
+    assert payload["model"]
+    assert all(not key.startswith("_orig_mod.") for key in payload["model"])
+
+
+def test_eval_sampling_cli_defaults_to_random(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["train", "--architecture", "dense", "--eval-every", "10", "--eval-max-batches", "4"],
+    )
+
+    config = build_train_config(parse_args())
+
+    assert config.eval_sampling == "random"
+    assert config.eval_seed == 4321
+    assert config.model.semantic_causal is True
+    assert config.model.causal_state_stride == 512
+
+
+def test_lm_loss_trains_token_zero_and_ignores_only_negative_sentinel():
+    logits = torch.tensor([[[8.0, -8.0], [-8.0, 8.0]]])
+    labels = torch.tensor([[0, -100]])
+
+    loss = lm_loss(logits, labels)
+
+    assert loss < 1e-4
+
+
+def test_hf_collate_keeps_token_zero_visible():
+    batch = [{"input_ids": torch.tensor([0, 5, 6, 7, 8])}, {"input_ids": torch.tensor([9, 0, 10, 11, 12])}]
+
+    collated = HFDiskCausalDataset.causal_collate(batch, seq_len=4)
+
+    assert collated["input_ids"][0, 0].item() == 0
+    assert collated["input_ids"][1, 1].item() == 0
+    assert collated["attention_mask"].all()
+    assert (collated["labels"] == -100).sum().item() == 0
 
 
 def test_tiny_decoder_forward_and_backward():
@@ -57,6 +156,166 @@ def test_tiny_decoder_forward_and_backward():
 
     loss = out["logits"].float().mean() + moe_aux["load_balance"] + semantic_aux["kl"].mean() * 0.0
     loss.backward()
+
+
+def test_v6_semantic_path_is_causal_by_default():
+    torch.manual_seed(1234)
+    config = NAIMEStateMoEConfig(
+        vocab_size=96,
+        max_seq_len=64,
+        d_model=32,
+        n_layers=3,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=3,
+        top_k=2,
+        expert_hidden_dim=48,
+        semantic_router_mode="hybrid",
+        semantic_scales="local_mid_global",
+        mid_stride=8,
+        mid_window=16,
+        use_global_semantic=True,
+        semantic_fusion="concat",
+        use_semantic_residual_write=True,
+        semantic_write_scale=0.03,
+        semantic_gate_downstream="clean_prob",
+        semantic_sparse_alpha="downstream",
+        semantic_memory_slots=2,
+        semantic_gate_mixer=True,
+        world_state_slots=4,
+        self_state_slots=3,
+        self_state_recursion_depth=2,
+    )
+    model = build_model("naime_v6_recursive_self_moe", config).eval()
+    input_ids = torch.randint(1, config.vocab_size, (2, 31))
+    changed = input_ids.clone()
+    cutoff = 12
+    changed[:, cutoff:] = torch.randint(1, config.vocab_size, changed[:, cutoff:].shape)
+
+    with torch.no_grad():
+        original_logits = model(input_ids)["logits"]
+        changed_logits = model(changed)["logits"]
+
+    assert torch.allclose(original_logits[:, :cutoff, :], changed_logits[:, :cutoff, :], atol=1e-5, rtol=1e-5)
+
+
+def test_v6_does_not_leak_within_state_blocks():
+    torch.manual_seed(2026)
+    config = NAIMEStateMoEConfig(
+        vocab_size=96,
+        max_seq_len=64,
+        d_model=32,
+        n_layers=3,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=3,
+        top_k=2,
+        expert_hidden_dim=48,
+        semantic_router_mode="hybrid",
+        semantic_scales="local_mid_global",
+        mid_stride=8,
+        mid_window=16,
+        use_global_semantic=True,
+        semantic_fusion="concat",
+        semantic_gate_downstream="clean_prob",
+        semantic_sparse_alpha="downstream",
+        semantic_memory_slots=2,
+        semantic_gate_mixer=True,
+        world_state_slots=4,
+        self_state_slots=3,
+        self_state_recursion_depth=2,
+    )
+    model = build_model("naime_v6_recursive_self_moe", config).eval()
+    input_ids = torch.randint(1, config.vocab_size, (2, 31))
+    changed = input_ids.clone()
+    cutoff = 1
+    changed[:, cutoff:] = torch.randint(1, config.vocab_size, changed[:, cutoff:].shape)
+
+    with torch.no_grad():
+        original_logits = model(input_ids)["logits"]
+        changed_logits = model(changed)["logits"]
+
+    assert torch.allclose(original_logits[:, :cutoff, :], changed_logits[:, :cutoff, :], atol=1e-5, rtol=1e-5)
+
+
+def test_world_state_history_reads_only_past_blocks():
+    torch.manual_seed(2027)
+    slots = WorldStateSlots(d_model=16, slots=3)
+    hidden = torch.randn(2, 12, 16)
+    semantic = torch.randn(2, 12, 16)
+    trace = torch.randn(2, 3, 3, 16)
+    changed_future_trace = trace.clone()
+    changed_future_trace[:, 2, :, :] = torch.randn_like(changed_future_trace[:, 2, :, :])
+
+    context, _, _, _, _ = slots.read_update_sequence(hidden, semantic, trace, stride=4)
+    changed_context, _, _, _, _ = slots.read_update_sequence(hidden, semantic, changed_future_trace, stride=4)
+
+    assert torch.allclose(context[:, :8, :], changed_context[:, :8, :], atol=1e-5, rtol=1e-5)
+
+
+def test_multiscale_semantic_architectures_do_not_leak_future_tokens():
+    torch.manual_seed(4321)
+    base_config = NAIMEStateMoEConfig(
+        vocab_size=96,
+        max_seq_len=64,
+        d_model=32,
+        n_layers=3,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=3,
+        top_k=2,
+        expert_hidden_dim=48,
+        semantic_router_mode="hybrid",
+        semantic_scales="local_mid_global",
+        mid_stride=8,
+        mid_window=16,
+        use_global_semantic=True,
+        semantic_fusion="concat",
+        use_semantic_residual_write=True,
+        semantic_write_scale=0.03,
+        semantic_gate_downstream="clean_prob",
+        semantic_sparse_alpha="downstream",
+        semantic_memory_slots=2,
+        semantic_gate_mixer=True,
+        world_state_slots=4,
+        self_state_slots=3,
+    )
+    input_ids = torch.randint(1, base_config.vocab_size, (2, 31))
+    changed = input_ids.clone()
+    cutoff = 12
+    changed[:, cutoff:] = torch.randint(1, base_config.vocab_size, changed[:, cutoff:].shape)
+
+    for architecture in [
+        "naime_state_moe",
+        "naime_v4_state_moe",
+        "naime_v5_world_state_moe",
+        "naime_v6_recursive_self_moe",
+    ]:
+        model = build_model(architecture, base_config).eval()
+        with torch.no_grad():
+            original_logits = model(input_ids)["logits"]
+            changed_logits = model(changed)["logits"]
+        assert torch.allclose(
+            original_logits[:, :cutoff, :],
+            changed_logits[:, :cutoff, :],
+            atol=1e-5,
+            rtol=1e-5,
+        ), architecture
 
 
 def test_baseline_factory_forward():
@@ -613,3 +872,108 @@ def test_reference_value_uses_latest_available_step():
     assert reference_value_at_step(curve, 200) == (500, 5.0)
     assert reference_value_at_step(curve, 1200) == (1000, 4.5)
     assert reference_value_at_step(curve, 2000) == (1500, 4.0)
+
+
+def _compile_v6_config():
+    return NAIMEStateMoEConfig(
+        vocab_size=96,
+        max_seq_len=64,
+        d_model=32,
+        n_layers=3,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=3,
+        top_k=2,
+        expert_hidden_dim=48,
+        semantic_router_mode="hybrid",
+        semantic_scales="local_mid_global",
+        mid_stride=8,
+        mid_window=16,
+        use_global_semantic=True,
+        semantic_fusion="concat",
+        use_semantic_residual_write=True,
+        semantic_write_scale=0.03,
+        semantic_gate_downstream="clean_prob",
+        semantic_sparse_alpha="downstream",
+        semantic_memory_slots=2,
+        semantic_gate_mixer=True,
+        world_state_slots=4,
+        self_state_slots=3,
+        self_state_recursion_depth=2,
+    )
+
+
+def test_compile_v6_forward_no_crash():
+    _require_torch_compile_support()
+    warnings.filterwarnings("ignore")
+    torch._logging.set_logs(dynamo=40, inductor=40)
+
+    torch.manual_seed(1)
+    config = _compile_v6_config()
+    model = build_model("naime_v6_recursive_self_moe", config)
+    input_ids = torch.randint(1, config.vocab_size, (2, 31))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    backend = "inductor" if device.type == "cuda" else "eager"
+    model = model.to(device)
+    input_ids = input_ids.to(device)
+
+    compiled = torch.compile(model, mode="reduce-overhead", backend=backend)
+    out = compiled(input_ids)
+    assert out["logits"].shape == (2, 31, config.vocab_size)
+
+
+def test_compile_v6_backward_no_crash():
+    _require_torch_compile_support()
+    warnings.filterwarnings("ignore")
+    torch._logging.set_logs(dynamo=40, inductor=40)
+
+    torch.manual_seed(2)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    backend = "inductor" if device.type == "cuda" else "eager"
+    config = _compile_v6_config()
+    model = build_model("naime_v6_recursive_self_moe", config).to(device)
+    input_ids = torch.randint(1, config.vocab_size, (2, 31), device=device)
+
+    compiled = torch.compile(model, mode="reduce-overhead", backend=backend)
+    out = compiled(input_ids)
+    loss = out["logits"].float().mean()
+    loss.backward()
+    grads = []
+    for name, p in compiled.named_parameters():
+        if p.grad is not None:
+            grads.append((name, p.grad))
+    assert len(grads) > 0, "no parameters received gradients"
+
+
+def test_compile_v6_preserves_causality():
+    _require_torch_compile_support()
+    warnings.filterwarnings("ignore")
+    torch._logging.set_logs(dynamo=40, inductor=40)
+
+    torch.manual_seed(4)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    backend = "inductor" if device.type == "cuda" else "eager"
+    config = _compile_v6_config()
+    model = build_model("naime_v6_recursive_self_moe", config).eval().to(device)
+    input_ids = torch.randint(1, config.vocab_size, (2, 31), device=device)
+    changed = input_ids.clone()
+    cutoff = 12
+    changed[:, cutoff:] = torch.randint(1, config.vocab_size, changed[:, cutoff:].shape, device=device)
+
+    compiled = torch.compile(model, mode="reduce-overhead", backend=backend)
+    with torch.no_grad():
+        original_logits = compiled(input_ids)["logits"]
+        changed_logits = compiled(changed)["logits"]
+
+    assert torch.allclose(
+        original_logits[:, :cutoff, :],
+        changed_logits[:, :cutoff, :],
+        atol=1e-5,
+        rtol=1e-5,
+    )

@@ -6,7 +6,10 @@ from .config import TrainConfig
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train NAIME Hybrid architectures.")
+    parser = argparse.ArgumentParser(
+        description="Train NAIME Hybrid architectures.",
+        fromfile_prefix_chars="@",
+    )
     parser.add_argument(
         "--architecture",
         default="naime_state_moe",
@@ -95,6 +98,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-split", default="validation")
     parser.add_argument("--eval-max-batches", type=int, default=10, help="0 means full eval split.")
     parser.add_argument(
+        "--eval-sampling",
+        default="random",
+        choices=["random", "sequential"],
+        help="random avoids repeatedly validating only the prefix of the validation split; sequential keeps legacy order.",
+    )
+    parser.add_argument("--eval-seed", type=int, default=4321, help="Seed for deterministic random validation sampling.")
+    parser.add_argument(
         "--early-stop-patience",
         type=int,
         default=0,
@@ -139,7 +149,11 @@ def parse_args() -> argparse.Namespace:
         "--structural-stop-warmup-steps", type=int, default=1000, help="Ignore structural stop before this step."
     )
     parser.add_argument("--keep-last-n", type=int, default=2)
-    parser.add_argument("--resume", default="auto")
+    parser.add_argument(
+        "--resume",
+        default="none",
+        help="Checkpoint to resume from. Defaults to none; pass auto or an explicit path only for clean checkpoints.",
+    )
     parser.add_argument(
         "--resume-lr-policy",
         default="checkpoint",
@@ -155,6 +169,14 @@ def parse_args() -> argparse.Namespace:
         help="Allow --resume auto and bad-gradient recovery to use failed.pt. Disabled by default.",
     )
     parser.add_argument(
+        "--allow-legacy-resume",
+        action="store_true",
+        help=(
+            "Allow checkpoints without the current causal-integrity marker. "
+            "Use only for forensic inspection or intentionally contaminated baselines, never for clean training."
+        ),
+    )
+    parser.add_argument(
         "--stop-file",
         default=None,
         help="Gracefully stop after a step when this file exists. Defaults to STOP in the run directory.",
@@ -167,6 +189,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--compile-model", action="store_true")
+    parser.add_argument(
+        "--compile-scope",
+        default="full",
+        choices=["full", "dense"],
+        help=(
+            "torch.compile scope. full compiles the whole decoder; dense only compiles ordinary dense "
+            "Transformer blocks and leaves state/MoE/self-recursion eager."
+        ),
+    )
+    parser.add_argument(
+        "--compile-backend",
+        default="inductor",
+        choices=["inductor", "eager", "aot_eager"],
+        help="torch.compile backend. Use eager only for plumbing diagnostics; inductor is the performance path.",
+    )
+    parser.add_argument(
+        "--disable-flash-sdp",
+        action="store_true",
+        help=(
+            "Disable CUDA flash and memory-efficient SDPA kernels. Useful when torch.compile "
+            "or driver builds crash in flash-attention backward; keeps training on the safer math backend."
+        ),
+    )
     parser.add_argument("--device", default="auto")
 
     parser.add_argument("--d-model", type=int, default=256)
@@ -208,6 +253,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--global-semantic", action="store_true")
     parser.add_argument("--semantic-fusion", default="local", choices=["local", "gated_sum", "concat"])
     parser.add_argument("--semantic-pred-horizon", type=int, default=0)
+    parser.add_argument(
+        "--semantic-noncausal",
+        action="store_true",
+        help="Allow bidirectional semantic summaries. Research-only; unsafe for autoregressive LM training.",
+    )
+    parser.add_argument(
+        "--research-unsafe",
+        action="store_true",
+        help="Permit research-only unsafe options such as --semantic-noncausal.",
+    )
+    parser.add_argument(
+        "--causal-state-stride",
+        type=int,
+        default=512,
+        help="Prefix-causal update stride for V5/V6 world/self state loops. Larger values reduce small CUDA kernels.",
+    )
     parser.add_argument("--semantic-residual-write", action="store_true")
     parser.add_argument("--semantic-write-scale", type=float, default=1.0)
     parser.add_argument("--semantic-memory-slots", type=int, default=0)
@@ -238,6 +299,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-state-diversity-margin", type=float, default=0.85)
     parser.add_argument("--self-state-identity-scale", type=float, default=0.02)
     parser.add_argument("--self-state-context-score-scale", type=float, default=4.0)
+    parser.add_argument("--no-self-state-world-gate", action="store_true")
+    parser.add_argument("--self-state-world-gate-min", type=float, default=0.10)
+    parser.add_argument("--self-state-world-gate-scale", type=float, default=1.0)
     parser.add_argument("--n-experts", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=2)
     parser.add_argument("--expert-hidden-dim", type=int, default=512)
@@ -257,6 +321,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_train_config(args: argparse.Namespace) -> TrainConfig:
+    if args.semantic_noncausal and not args.research_unsafe:
+        raise ValueError("--semantic-noncausal requires --research-unsafe because it is invalid for clean LM training")
+
     model_config = NAIMEStateMoEConfig(
         vocab_size=args.vocab_size or (50257 if args.data_format == "hf_disk" else 257),
         max_seq_len=args.seq_len,
@@ -283,6 +350,8 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         use_global_semantic=args.global_semantic,
         semantic_fusion=args.semantic_fusion,
         semantic_pred_horizon=args.semantic_pred_horizon,
+        semantic_causal=not args.semantic_noncausal,
+        causal_state_stride=args.causal_state_stride,
         semantic_router_mode=args.semantic_router_mode,
         semantic_router_prior_scale=args.semantic_router_prior_scale,
         semantic_router_prior_clip=args.semantic_router_prior_clip,
@@ -321,6 +390,9 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         self_state_diversity_margin=args.self_state_diversity_margin,
         self_state_identity_scale=args.self_state_identity_scale,
         self_state_context_score_scale=args.self_state_context_score_scale,
+        self_state_world_gate=not args.no_self_state_world_gate,
+        self_state_world_gate_min=args.self_state_world_gate_min,
+        self_state_world_gate_scale=args.self_state_world_gate_scale,
         n_experts=args.n_experts,
         top_k=args.top_k,
         expert_hidden_dim=args.expert_hidden_dim,
@@ -355,6 +427,8 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         eval_every=args.eval_every,
         eval_split=args.eval_split,
         eval_max_batches=args.eval_max_batches,
+        eval_sampling=args.eval_sampling,
+        eval_seed=args.eval_seed,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
         early_stop_min_evals=args.early_stop_min_evals,
@@ -377,10 +451,14 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         lr_restart_warmup=args.lr_restart_warmup,
         amp=not args.no_amp,
         compile_model=args.compile_model,
+        compile_scope=args.compile_scope,
+        compile_backend=args.compile_backend,
+        disable_flash_sdp=args.disable_flash_sdp,
         device=args.device,
         resume=args.resume,
         resume_lr_policy=args.resume_lr_policy,
         resume_allow_failed=args.resume_allow_failed,
+        allow_legacy_resume=args.allow_legacy_resume,
         stop_file=args.stop_file,
         stop_check_every=args.stop_check_every,
         lambda_load=args.lambda_load,

@@ -10,6 +10,63 @@ from typing import Any
 import numpy as np
 import torch
 
+COMPILED_PREFIX = "_orig_mod."
+
+
+def unwrap_compiled_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the original module behind torch.compile wrappers.
+
+    Saving compiled wrapper state directly prefixes every key with
+    `_orig_mod.`. That makes checkpoints harder to resume without compile and
+    has already made debugging noisier. Keep persisted checkpoints architecture
+    native; compile is an execution detail, not checkpoint identity.
+    """
+    return getattr(model, "_orig_mod", model)
+
+
+def normalize_state_dict_for_model(
+    model: torch.nn.Module,
+    state_dict: dict[str, Any],
+) -> dict[str, Any]:
+    """Adapt compiled/eager key prefixes before loading a checkpoint."""
+    target_keys = list(model.state_dict().keys())
+    source_keys = list(state_dict.keys())
+    target_compiled = bool(target_keys) and all(key.startswith(COMPILED_PREFIX) for key in target_keys)
+    source_compiled = bool(source_keys) and all(key.startswith(COMPILED_PREFIX) for key in source_keys)
+
+    if source_compiled and not target_compiled:
+        return {key.removeprefix(COMPILED_PREFIX): value for key, value in state_dict.items()}
+    if target_compiled and not source_compiled:
+        return {f"{COMPILED_PREFIX}{key}": value for key, value in state_dict.items()}
+
+    target_nested = any(f".{COMPILED_PREFIX}" in key for key in target_keys)
+    source_nested = any(f".{COMPILED_PREFIX}" in key for key in source_keys)
+    if target_nested and not source_nested:
+        target_by_native = {
+            key.removeprefix(COMPILED_PREFIX).replace(f".{COMPILED_PREFIX}", "."): key
+            for key in target_keys
+        }
+        return {target_by_native.get(key, key): value for key, value in state_dict.items()}
+    if source_nested and not target_nested:
+        return _normalize_nested_compiled_prefixes(state_dict)
+    return state_dict
+
+
+def _normalize_nested_compiled_prefixes(state_dict: dict[str, Any]) -> dict[str, Any]:
+    """Strip torch.compile prefixes from nested compiled submodules.
+
+    Full-model compilation prefixes every key with `_orig_mod.` and is handled
+    above.  Partial compilation, such as compiling only dense blocks, produces
+    keys like `blocks.0._orig_mod.attn...`.  Checkpoints should remain native
+    regardless of execution mode, so normalize those nested prefixes too.
+    """
+
+    normalized: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        clean_key = key.removeprefix(COMPILED_PREFIX).replace(f".{COMPILED_PREFIX}", ".")
+        normalized[clean_key] = value
+    return normalized
+
 
 def rng_state() -> dict[str, Any]:
     state: dict[str, Any] = {
@@ -106,9 +163,12 @@ def build_checkpoint_payload(
     config: dict,
     metrics: dict,
 ) -> dict[str, Any]:
+    config = dict(config)
+    config.setdefault("causal_integrity_version", 2)
+    model = unwrap_compiled_model(model)
     return {
         "step": step,
-        "model": _snapshot_value(model.state_dict()),
+        "model": _snapshot_value(_normalize_nested_compiled_prefixes(model.state_dict())),
         "optimizer": _snapshot_value(optimizer.state_dict()),
         "scheduler": _snapshot_value(scheduler.state_dict() if scheduler is not None else None),
         "scaler": _snapshot_value(scaler.state_dict() if scaler is not None else None),
@@ -124,9 +184,12 @@ def build_model_payload(
     config: dict,
     metrics: dict,
 ) -> dict[str, Any]:
+    config = dict(config)
+    config.setdefault("causal_integrity_version", 2)
+    model = unwrap_compiled_model(model)
     return {
         "step": step,
-        "model": _snapshot_value(model.state_dict()),
+        "model": _snapshot_value(_normalize_nested_compiled_prefixes(model.state_dict())),
         "config": config,
         "metrics": metrics,
     }
@@ -224,9 +287,21 @@ def load_checkpoint(
     scheduler: Any | None = None,
     scaler: Any | None = None,
     strict: bool = True,
+    required_causal_integrity_version: int = 2,
+    allow_legacy_resume: bool = False,
 ) -> int:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(checkpoint["model"], strict=strict)
+    config = checkpoint.get("config", {})
+    integrity_version = int(config.get("causal_integrity_version", 0) or 0)
+    if not allow_legacy_resume and integrity_version < required_causal_integrity_version:
+        raise RuntimeError(
+            "refusing to resume checkpoint without current causal-integrity marker: "
+            f"path={path} checkpoint_version={integrity_version} "
+            f"required={required_causal_integrity_version}. "
+            "Use --allow-legacy-resume only for forensic/contaminated baselines."
+        )
+    model_state = normalize_state_dict_for_model(model, checkpoint["model"])
+    model.load_state_dict(model_state, strict=strict)
     step = int(checkpoint.get("step", 0))
     if optimizer is not None and checkpoint.get("optimizer") is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])

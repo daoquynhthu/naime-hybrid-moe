@@ -92,24 +92,23 @@ print()
 print(f"Archive complete: {dst} ({dst.stat().st_size / (1024 ** 2):.1f} MiB)")
 '@ | & $python -
 
-$prepareRemote = @"
-`$ErrorActionPreference = 'Stop'
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent '$RemoteProjectRoot') | Out-Null
-"@
-$prepareEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($prepareRemote))
-ssh -o BatchMode=yes "$RemoteUser@$RemoteHost" "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $prepareEncoded"
-
 Write-Host "Uploading code archive with scp progress..."
 scp -o BatchMode=yes $ArchivePath "${RemoteUser}@${RemoteHost}:$remoteArchiveScp"
+
+$syncId = Get-Random -Maximum 999999
+$remoteManifestPath = "$RemoteProjectRoot-code-manifest-$syncId.txt"
 
 $remotePs = @"
 `$ErrorActionPreference = 'Stop'
 `$ProgressPreference = 'SilentlyContinue'
 `$archive = '$remoteArchive'
 `$project = '$RemoteProjectRoot'
+`$manifestRemote = '$remoteManifestPath'
+
 if (-not (Test-Path -LiteralPath `$archive)) {
     throw "Remote archive not found: `$archive"
 }
+
 if (Test-Path -LiteralPath `$project) {
     Remove-Item -LiteralPath `$project\src -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath `$project\scripts -Recurse -Force -ErrorAction SilentlyContinue
@@ -119,17 +118,67 @@ if (Test-Path -LiteralPath `$project) {
 } else {
     New-Item -ItemType Directory -Force -Path `$project | Out-Null
 }
-Expand-Archive -LiteralPath `$archive -DestinationPath `$project -Force
-Get-ChildItem -LiteralPath `$project -File | Select-Object Name,Length | ConvertTo-Json
+
+# Extract zip and capture any errors
+`$errors = @()
+try {
+    Expand-Archive -LiteralPath `$archive -DestinationPath `$project -Force
+} catch {
+    `$errors += "Expand-Archive failed: $_"
+    
+    # Fallback: use .NET directly if Expand-Archive fails
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        `$zip = [System.IO.Compression.ZipFile]::OpenRead(`$archive)
+        foreach (`$entry in `$zip.Entries) {
+            `$dest = Join-Path `$project `$entry.FullName
+            `$dir = Split-Path -Parent `$dest
+            if (-not (Test-Path -LiteralPath `$dir)) { New-Item -ItemType Directory -Force -Path `$dir | Out-Null }
+            try { [System.IO.Compression.ZipFileExtensions]::ExtractToFile(`$entry, `$dest, `$true) } catch { `$errors += "extract `$(`$entry.FullName): $_" }
+        }
+        `$zip.Dispose()
+    } catch {
+        `$errors += "Fallback extraction also failed: $_"
+    }
+}
+
+# Compute SHA256 manifest of extracted files
+`$localManifest = @()
+Get-ChildItem -LiteralPath `$project -Recurse -File | ForEach-Object {
+    `$rel = `$_.FullName.Substring(`$project.Length + 1) -replace '\\', '/'
+    `$hash = (Get-FileHash -LiteralPath `$_.FullName -Algorithm SHA256).Hash
+    `$localManifest += "`$hash  `$rel"
+}
+`$localManifest | Sort-Object | Out-File -LiteralPath `$manifestRemote -Encoding ASCII
+
+# Count extracted files and report
+`$fileCount = `$localManifest.Count
+`$errorCount = `$errors.Count
+Write-Output "SYNC_RESULT: files=`$fileCount errors=`$errorCount"
+if (`$errorCount -gt 0) { Write-Output ("SYNC_ERRORS: " + (`$errors -join '|')) }
 "@
 $remoteEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($remotePs))
-ssh -o BatchMode=yes "$RemoteUser@$RemoteHost" "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $remoteEncoded"
+$result = ssh -o BatchMode=yes "$RemoteUser@$RemoteHost" "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $remoteEncoded"
+Write-Host "Remote extraction result:"
+Write-Host $result
+
+# Fetch and verify manifest
+$localManifestPath = Join-Path $env:TEMP "naime-sync-manifest-$syncId.txt"
+scp -o BatchMode=yes "${RemoteUser}@${RemoteHost}:$remoteManifestPath" $localManifestPath
+
+if (-not (Test-Path -LiteralPath $localManifestPath)) {
+    Write-Warning "Could not fetch remote manifest; sync may have failed"
+} else {
+    $remoteCount = (Get-Content $localManifestPath | Where-Object { $_ -match '^[A-F0-9]{64}' }).Count
+    Write-Host "Remote verification: $remoteCount files synced"
+    Remove-Item -LiteralPath $localManifestPath -Force -ErrorAction SilentlyContinue
+}
 
 if (-not $KeepArchive) {
-    $cleanupRemote = "Remove-Item -LiteralPath '$remoteArchive' -Force -ErrorAction SilentlyContinue"
+    $cleanupRemote = "Remove-Item -LiteralPath '$remoteArchive' -Force -ErrorAction SilentlyContinue; if (Test-Path '$remoteManifestPath') { Remove-Item -LiteralPath '$remoteManifestPath' -Force -ErrorAction SilentlyContinue }"
     $cleanupEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanupRemote))
     ssh -o BatchMode=yes "$RemoteUser@$RemoteHost" "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $cleanupEncoded"
     Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "Remote code synced: $RemoteProjectRoot"
+Write-Host "Remote code synced: $RemoteProjectRoot ($remoteCount files)"

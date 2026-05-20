@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -10,7 +11,7 @@ from naime_hybrid.config import NAIMEStateMoEConfig
 from naime_hybrid.data import ByteTextDataset, HFDiskCausalDataset
 from naime_hybrid.models import build_model
 
-from .losses import collect_aux_losses, lm_loss
+from .losses import IGNORE_INDEX, collect_aux_losses, lm_loss
 from .train import effective_kl_lambda, resolve_device
 
 
@@ -62,6 +63,9 @@ def main() -> None:
     model.eval()
 
     dataset = build_eval_dataset(data_path, data_format, args.data_split, model_config.max_seq_len)
+    collate_fn = None
+    if isinstance(dataset, HFDiskCausalDataset):
+        collate_fn = partial(HFDiskCausalDataset.causal_collate, seq_len=model_config.max_seq_len)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -69,6 +73,7 @@ def main() -> None:
         drop_last=False,
         num_workers=0,
         pin_memory=device.type == "cuda",
+        collate_fn=collate_fn,
     )
 
     totals = {
@@ -106,8 +111,11 @@ def main() -> None:
                 break
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                out = model(input_ids)
+                out = model(input_ids, attention_mask=attention_mask)
                 loss = lm_loss(out["logits"], labels)
                 aux = collect_aux_losses(
                     out.get("aux", []),
@@ -131,7 +139,7 @@ def main() -> None:
             totals["semantic_pred"] += float(aux["semantic_pred"].detach().cpu())
             totals["fusion_mid"] += float(aux["fusion_mid_weight"].detach().cpu())
             totals["fusion_global"] += float(aux["fusion_global_weight"].detach().cpu())
-            total_tokens += int(input_ids.numel())
+            total_tokens += int(labels.ne(IGNORE_INDEX).sum().item())
             batch_count += 1
 
     elapsed_ms = None

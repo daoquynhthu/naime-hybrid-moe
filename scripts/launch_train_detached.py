@@ -19,8 +19,9 @@ from pathlib import Path
 
 def _creationflags() -> int:
     flags = 0
-    for name in ("CREATE_NEW_PROCESS_GROUP", "DETACHED_PROCESS", "CREATE_NO_WINDOW"):
+    for name in ("CREATE_NEW_PROCESS_GROUP", "DETACHED_PROCESS", "CREATE_NO_WINDOW", "CREATE_BREAKAWAY_FROM_JOB"):
         flags |= getattr(subprocess, name, 0)
+    flags |= 0x00000080  # HIGH_PRIORITY_CLASS
     return flags
 
 
@@ -41,14 +42,21 @@ def _parse_printed_args(output: str) -> list[str]:
     return args
 
 
+def _resolve_wrapper_script(repo: Path, wrapper_args: list[str]) -> Path:
+    if "-Template" in wrapper_args or "--Template" in wrapper_args:
+        return repo / "scripts" / "train_template.ps1"
+    return repo / "scripts" / "train_model.ps1"
+
+
 def resolve_training_args(repo: Path, wrapper_args: list[str], env: dict[str, str]) -> list[str]:
+    wrapper_script = _resolve_wrapper_script(repo, wrapper_args)
     command = [
         "powershell.exe",
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        str(repo / "scripts" / "train_model.ps1"),
+        str(wrapper_script),
         *wrapper_args,
         "-PrintArgs",
     ]
@@ -63,8 +71,15 @@ def resolve_training_args(repo: Path, wrapper_args: list[str], env: dict[str, st
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if result.returncode != 0:
-        raise RuntimeError(f"train_model.ps1 -PrintArgs failed ({result.returncode}):\n{result.stdout}")
+        raise RuntimeError(f"{wrapper_script.name} -PrintArgs failed ({result.returncode}):\n{result.stdout}")
     return _parse_printed_args(result.stdout)
+
+
+def write_args_file(run_dir: Path, train_args: list[str]) -> Path:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    args_file = run_dir / "train_args.txt"
+    args_file.write_text("\n".join(train_args) + "\n", encoding="utf-8")
+    return args_file
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -88,13 +103,15 @@ def main(argv: list[str] | None = None) -> int:
     if wrapper_args and wrapper_args[0] == "--":
         wrapper_args = wrapper_args[1:]
     train_args = resolve_training_args(repo, wrapper_args, env)
+    args_file = write_args_file(run_dir, train_args)
+    args_file_ref = f"@{args_file}"
 
     train_python = args.python
     command = [
         str(train_python),
         "-m",
         "naime_hybrid.training.train",
-        *train_args,
+        args_file_ref,
     ]
     guardian_exe = repo / "scripts" / "naime_guardian.exe"
     if not args.no_guardian and os.name == "nt" and guardian_exe.exists():
@@ -109,9 +126,10 @@ def main(argv: list[str] | None = None) -> int:
             "--max-restarts",
             "0",
             "--",
-            *train_args,
+            args_file_ref,
         ]
     (run_dir / "launch_cmd.txt").write_text(" ".join(command), encoding="utf-8")
+    (run_dir / "wrapper_args.txt").write_text("\n".join(wrapper_args) + "\n", encoding="utf-8")
 
     stdout = open(run_dir / "launcher.stdout.log", "ab", buffering=0)
     stderr = open(run_dir / "launcher.stderr.log", "ab", buffering=0)
@@ -125,6 +143,17 @@ def main(argv: list[str] | None = None) -> int:
         creationflags=_creationflags(),
         close_fds=True,
     )
+    try:
+        import ctypes
+        # Pin to P-cores only (logical 0-15) to avoid E-core scheduling
+        # i7-12700KF: 8 P-cores × 2 HT + 4 E-cores = 20 logical
+        mask = 0xFFFF  # bits 0-15 (first 16 logical processors)
+        handle = ctypes.windll.kernel32.OpenProcess(0x1F0FFF, False, process.pid)
+        if handle:
+            ctypes.windll.kernel32.SetProcessAffinityMask(handle, mask)
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        pass
     (run_dir / "daemon.pid").write_text(str(process.pid), encoding="utf-8")
     print(process.pid)
     return 0

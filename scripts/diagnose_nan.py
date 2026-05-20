@@ -61,9 +61,12 @@ def main():
     import logging
     import warnings
 
-    warnings.filterwarnings("ignore", message="online softmax")
-    torch._logging.set_logs(dynamo=logging.ERROR, inductor=logging.ERROR)
-    model = torch.compile(model)
+    try:
+        warnings.filterwarnings("ignore", message="online softmax")
+        torch._logging.set_logs(dynamo=logging.ERROR, inductor=logging.ERROR)
+        model = torch.compile(model)
+    except Exception as exc:
+        print(f"torch.compile disabled: availability probe failed ({exc})")
     print("building dataset...")
     from functools import partial
 
@@ -87,9 +90,12 @@ def main():
         batch = next(data_iter)
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            out = model(input_ids)
+            out = model(input_ids, attention_mask=attention_mask)
             loss = lm_loss(out["logits"], labels)
             aux = collect_aux_losses(out.get("aux", []), 0.45, "downstream", 0.90)
             total_loss = (

@@ -169,6 +169,7 @@ class TopKMoE(nn.Module):
         selected = torch.gather(expert_outputs, dim=-2, index=gather_idx)
         return torch.sum(selected * topk_weights.unsqueeze(-1), dim=-2)
 
+    @torch.compiler.disable(recursive=False)
     def _sparse_dispatch(
         self,
         hidden_states: torch.Tensor,
