@@ -1286,7 +1286,7 @@ def test_topk_moe_auto_dispatch_matches_dense_dispatch_for_small_expert_cuda_heu
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA dispatch heuristic only applies on GPU")
-def test_topk_moe_auto_dispatch_uses_dense_for_six_experts_on_cuda():
+def test_topk_moe_auto_dispatch_uses_sparse_for_six_experts_on_cuda():
     moe = TopKMoE(
         d_model=16,
         semantic_dim=16,
@@ -1298,7 +1298,7 @@ def test_topk_moe_auto_dispatch_uses_dense_for_six_experts_on_cuda():
     ).cuda()
     x = torch.randn(2, 512, 16, device="cuda")
 
-    assert moe._resolve_dispatch_mode(x) == "dense"
+    assert moe._resolve_dispatch_mode(x) == "sparse"
 
 
 def test_full_attention_mask_is_dropped_for_causal_fast_path():

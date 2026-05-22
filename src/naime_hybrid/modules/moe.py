@@ -154,9 +154,7 @@ class TopKMoE(nn.Module):
             return "dense"
         if self.n_experts <= 4 and num_tokens >= 128:
             return "dense"
-        if hidden_states.is_cuda and self.n_experts <= 8 and num_tokens >= 256:
-            return "dense"
-        if self.n_experts <= 8 and self.top_k * 2 >= self.n_experts and num_tokens >= 512:
+        if not hidden_states.is_cuda and self.n_experts <= 8 and self.top_k * 2 >= self.n_experts and num_tokens >= 512:
             return "dense"
         return "sparse"
 
