@@ -78,15 +78,34 @@ def setup_logger(run_dir: Path) -> logging.Logger:
 
 
 class JsonlMetricLogger:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, flush_every: int = 1, fsync_every: int = 100):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.flush_every = max(1, int(flush_every))
+        self.fsync_every = max(0, int(fsync_every))
+        self._writes = 0
+        self._file = self.path.open("a", encoding="utf-8")
 
-    def write(self, payload: dict[str, Any]) -> None:
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+    def write(self, payload: dict[str, Any], *, force_sync: bool = False) -> None:
+        self._file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        self._writes += 1
+        should_flush = force_sync or self._writes % self.flush_every == 0
+        should_fsync = force_sync or (self.fsync_every > 0 and self._writes % self.fsync_every == 0)
+        if should_flush or should_fsync:
+            self._file.flush()
+        if should_fsync:
+            os.fsync(self._file.fileno())
+
+    def flush(self, *, force_sync: bool = False) -> None:
+        self._file.flush()
+        if force_sync:
+            os.fsync(self._file.fileno())
+
+    def close(self) -> None:
+        if self._file.closed:
+            return
+        self.flush(force_sync=True)
+        self._file.close()
 
 
 def metrics_jsonl_to_csv(jsonl_path: Path, csv_path: Path | None = None) -> Path | None:

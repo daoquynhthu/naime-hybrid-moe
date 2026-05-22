@@ -28,6 +28,8 @@ param(
     [int]$EvalMaxBatches = -1,
     [int]$SaveEvery = -1,
     [int]$LatestEvery = -1,
+    [int]$MetricsFlushEvery = -1,
+    [int]$MetricsFsyncEvery = -1,
     [int]$NumWorkers = -1,
     [double]$SemanticStateWriteScale = -1.0,
     [double]$SemanticMemoryHiddenScale = -1.0,
@@ -39,6 +41,7 @@ param(
     [int]$MaxSteps = -1,
     [switch]$NoAutoBatch,
     [switch]$UseVoice,
+    [switch]$SyncLatest,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ExtraArgs
 )
@@ -160,6 +163,8 @@ Add-Override $params "EvalEvery" $EvalEvery { $EvalEvery -ge 0 }
 Add-Override $params "EvalMaxBatches" $EvalMaxBatches { $EvalMaxBatches -ge 0 }
 Add-Override $params "SaveEvery" $SaveEvery { $SaveEvery -ge 0 }
 Add-Override $params "LatestEvery" $LatestEvery { $LatestEvery -ge 0 }
+Add-Override $params "MetricsFlushEvery" $MetricsFlushEvery { $MetricsFlushEvery -gt 0 }
+Add-Override $params "MetricsFsyncEvery" $MetricsFsyncEvery { $MetricsFsyncEvery -ge 0 }
 Add-Override $params "NumWorkers" $NumWorkers { $NumWorkers -ge 0 }
 Add-Override $params "SemanticStateWriteScale" $SemanticStateWriteScale { $SemanticStateWriteScale -gt 0.0 }
 Add-Override $params "SemanticMemoryHiddenScale" $SemanticMemoryHiddenScale { $SemanticMemoryHiddenScale -gt 0.0 }
@@ -176,6 +181,9 @@ if ($NoAutoBatch) {
 if ($UseVoice) {
     $params["UseVoice"] = $true
 }
+if ($SyncLatest) {
+    $params["SyncLatest"] = $true
+}
 if ($PrintArgs) {
     $params["PrintArgs"] = $true
 }
@@ -189,6 +197,7 @@ $switchNames = @(
     "DisableFlashSdp",
     "NoAmp",
     "AsyncLatest",
+    "SyncLatest",
     "ResumeAllowFailed",
     "AllowLegacyResume",
     "SemanticRouterPriorGate",

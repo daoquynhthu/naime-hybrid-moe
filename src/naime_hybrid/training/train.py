@@ -366,7 +366,11 @@ def main() -> None:
     model_dir = run_dir / "models"
     run_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logger(run_dir)
-    metrics_logger = JsonlMetricLogger(run_dir / "metrics.jsonl")
+    metrics_logger = JsonlMetricLogger(
+        run_dir / "metrics.jsonl",
+        flush_every=config.metrics_flush_every,
+        fsync_every=config.metrics_fsync_every,
+    )
 
     with (run_dir / "config.json").open("w", encoding="utf-8") as f:
         json.dump(config.to_dict(), f, ensure_ascii=False, indent=2, sort_keys=True)
@@ -1185,7 +1189,7 @@ def main() -> None:
                             best_val_loss,
                             stale_eval_count,
                         )
-                    metrics_logger.write(log_payload)
+                    metrics_logger.write(log_payload, force_sync=True)
                     break
             metrics_logger.write(log_payload)
 
@@ -1306,19 +1310,24 @@ def main() -> None:
                 or step == config.max_steps
             )
             if should_save_step or should_save_latest:
+                metrics_logger.flush(force_sync=should_save_step)
                 save_metrics = {k: float(v) if isinstance(v, (int, float)) else v for k, v in log_payload.items()}
                 full_payload = build_checkpoint_payload(
                     model, optimizer, scheduler, scaler, step, config.to_dict(), save_metrics
                 )
-                model_payload = build_model_payload(model, step, config.to_dict(), save_metrics)
                 if checkpoint_writer is None:
                     save_payload(latest_path, full_payload)
-                    save_payload(model_dir / "model_latest.pt", model_payload)
                 else:
                     checkpoint_writer.submit(latest_path, full_payload)
-                    checkpoint_writer.submit(model_dir / "model_latest.pt", model_payload)
                     if config.latest_sync:
                         checkpoint_writer.wait()
+                if should_save_step:
+                    model_payload = build_model_payload(model, step, config.to_dict(), save_metrics)
+                    model_latest_path = model_dir / "model_latest.pt"
+                    if checkpoint_writer is None:
+                        save_payload(model_latest_path, model_payload)
+                    else:
+                        checkpoint_writer.submit(model_latest_path, model_payload)
                 logger.info("save ckpt | step %d | %s", step, latest_path.name)
                 progress.render_save(step)
 
@@ -1378,14 +1387,20 @@ def main() -> None:
         raise
     finally:
         stop_signals.restore()
+        active_exception = sys.exc_info()[0] is not None
         if checkpoint_writer is not None:
-            active_exception = sys.exc_info()[0] is not None
             try:
                 checkpoint_writer.close()
             except Exception:
                 logger.exception("checkpoint writer close failed")
                 if not active_exception:
                     raise
+        try:
+            metrics_logger.close()
+        except Exception:
+            logger.exception("metrics logger close failed")
+            if not active_exception:
+                raise
         csv_path = metrics_jsonl_to_csv(run_dir / "metrics.jsonl")
         if csv_path is not None:
             logger.info("metrics csv saved | %s", csv_path.name)

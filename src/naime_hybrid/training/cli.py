@@ -82,10 +82,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--async-latest",
         action="store_true",
-        help="Do not wait for latest.pt to finish writing. Faster, but a hard crash may lose the newest alias.",
+        help="Deprecated compatibility flag. latest.pt is asynchronous by default unless --sync-latest is set.",
+    )
+    parser.add_argument(
+        "--sync-latest",
+        action="store_true",
+        help="Wait for latest.pt writes to finish before continuing. Safer, but can visibly stall training.",
     )
     parser.add_argument("--no-async-checkpoint", action="store_true")
     parser.add_argument("--async-checkpoint-queue", type=int, default=2)
+    parser.add_argument(
+        "--metrics-flush-every",
+        type=int,
+        default=1,
+        help="Flush metrics.jsonl to the OS page cache every N writes.",
+    )
+    parser.add_argument(
+        "--metrics-fsync-every",
+        type=int,
+        default=100,
+        help="Force metrics.jsonl to disk every N writes. 0 disables periodic fsync; final close still fsyncs.",
+    )
     parser.add_argument(
         "--best-checkpoint-mode",
         default="model",
@@ -428,9 +445,11 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         log_every=args.log_every,
         save_every=args.save_every,
         latest_every=args.latest_every,
-        latest_sync=not args.async_latest,
+        latest_sync=bool(args.sync_latest and not args.async_latest),
         async_checkpoint=not args.no_async_checkpoint,
         async_checkpoint_queue=args.async_checkpoint_queue,
+        metrics_flush_every=args.metrics_flush_every,
+        metrics_fsync_every=args.metrics_fsync_every,
         best_checkpoint_mode=args.best_checkpoint_mode,
         eval_every=args.eval_every,
         eval_split=args.eval_split,

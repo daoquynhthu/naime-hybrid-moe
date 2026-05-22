@@ -52,6 +52,9 @@ param(
     [int]$LatestEvery = 1000,
     [int]$KeepLastN = 2,
     [switch]$AsyncLatest,
+    [switch]$SyncLatest,
+    [int]$MetricsFlushEvery = 1,
+    [int]$MetricsFsyncEvery = 100,
     [ValidateSet("full", "model")]
     [string]$BestCheckpointMode = "model",
     [int]$EvalEvery = 100,
@@ -212,6 +215,8 @@ $common = @(
     "--save-every", "$effectiveSaveEvery",
     "--latest-every", "$effectiveLatestEvery",
     "--keep-last-n", "$KeepLastN",
+    "--metrics-flush-every", "$MetricsFlushEvery",
+    "--metrics-fsync-every", "$MetricsFsyncEvery",
     "--best-checkpoint-mode", "$effectiveBestCheckpointMode",
     "--eval-every", "$effectiveEvalEvery",
     "--eval-split", "validation",
@@ -264,6 +269,10 @@ if ($MaxSteps -gt 0) {
 
 if ($AsyncLatest) {
     $common += @("--async-latest")
+}
+
+if ($SyncLatest) {
+    $common += @("--sync-latest")
 }
 
 if ($CompileModel) {
