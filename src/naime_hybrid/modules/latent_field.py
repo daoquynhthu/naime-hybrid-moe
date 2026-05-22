@@ -2,6 +2,7 @@ import torch
 from torch import nn
 
 from .norm import RMSNorm
+from .state_ops import state_softmax_matmul
 
 
 class LatentFieldCoupler(nn.Module):
@@ -125,7 +126,8 @@ class LatentFieldCoupler(nn.Module):
                 "latent_field_gate": zero,
             }
 
-        query = self.token_query(self.token_norm(hidden_states))
+        normed_tokens = self.token_norm(hidden_states)
+        query = self.token_query(normed_tokens)
         key = self.slot_key(self.slot_norm(bank))
         value = self.slot_value(bank)
         scores = torch.matmul(query, key.transpose(1, 2)) / (query.size(-1) ** 0.5)
@@ -136,19 +138,24 @@ class LatentFieldCoupler(nn.Module):
             block_size=block_size,
             treat_trace_as_past=treat_trace_as_past,
         )
+        full_mask = None
         if causal_mask is not None:
-            trace_scores = scores[:, :, :causal_trace_slots].float()
-            trace_scores = trace_scores.masked_fill(causal_mask.unsqueeze(0), torch.finfo(torch.float32).min)
-            scores = torch.cat([trace_scores, scores[:, :, causal_trace_slots:].float()], dim=-1)
+            full_mask = torch.zeros(
+                scores.shape[1:],
+                device=scores.device,
+                dtype=torch.bool,
+            )
+            full_mask[:, :causal_trace_slots] = causal_mask
 
-        weights_f = torch.softmax(scores.float(), dim=-1)
-        if causal_mask is not None and causal_trace_slots == bank.size(1):
-            valid = (~causal_mask).any(dim=-1)
-            weights_f = torch.where(valid.view(1, -1, 1), weights_f, torch.zeros_like(weights_f))
-
-        context = torch.matmul(weights_f, value.float()).type_as(hidden_states)
+        context, weights = state_softmax_matmul(
+            scores,
+            value,
+            mask=full_mask.unsqueeze(0) if full_mask is not None else None,
+            zero_invalid=full_mask is not None and causal_trace_slots == bank.size(1),
+            out_dtype=hidden_states.dtype,
+        )
         raw_delta = self.token_update(context)
-        gate = torch.sigmoid(self.token_gate(self.token_norm(hidden_states)).float()).type_as(hidden_states)
+        gate = torch.sigmoid(self.token_gate(normed_tokens)).type_as(hidden_states)
         delta = raw_delta * gate * self.token_scale
 
         delta_norm = delta.float().norm(dim=-1, keepdim=True)
@@ -160,9 +167,9 @@ class LatentFieldCoupler(nn.Module):
             delta = delta * attention_mask.to(device=delta.device, dtype=delta.dtype).unsqueeze(-1)
 
         updated = hidden_states + delta
-        probs = weights_f.clamp_min(1e-6)
+        probs = weights.float().clamp_min(1e-6)
         entropy = -(probs * probs.log()).sum(dim=-1).mean().type_as(hidden_states)
-        read_max = weights_f.max(dim=-1).values.mean().type_as(hidden_states)
+        read_max = weights.max(dim=-1).values.mean().type_as(hidden_states)
         token_delta_norm = delta.float().norm(dim=-1).mean().type_as(hidden_states)
         token_delta_ratio = (
             delta.float().norm(dim=-1) / hidden_states.float().norm(dim=-1).clamp_min(1e-6)

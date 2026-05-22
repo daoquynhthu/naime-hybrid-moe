@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .norm import RMSNorm
+from .state_ops import state_softmax, state_softmax_matmul
 
 
 class RecursiveSelfState(nn.Module):
@@ -216,7 +217,7 @@ class RecursiveSelfState(nn.Module):
 
         normed_hidden = self.hidden_norm(hidden_states)
         boundary_logits = self.boundary(normed_hidden.float()) / self.boundary_temperature
-        boundary_probs = torch.softmax(boundary_logits, dim=-1).to(dtype=hidden_states.dtype)
+        boundary_probs = state_softmax(boundary_logits, dim=-1).to(dtype=hidden_states.dtype)
 
         hidden_summary = self._masked_mean(normed_hidden, attention_mask)
         if world_state is None:
@@ -234,9 +235,13 @@ class RecursiveSelfState(nn.Module):
         identity = identity.unsqueeze(0).expand_as(current)
         slot_queries = F.normalize((current + identity).float(), dim=-1).to(dtype=hidden_states.dtype)
         slot_scores = torch.einsum("bsd,btd->bst", slot_queries, residual_hidden) * self.context_score_scale
-        slot_scores = slot_scores.masked_fill(~attention_mask.unsqueeze(1), torch.finfo(slot_scores.dtype).min)
-        slot_weights_f = torch.softmax(slot_scores.float(), dim=-1)
-        slot_context = torch.bmm(slot_weights_f, residual_hidden.float()).to(dtype=hidden_states.dtype)
+        slot_context, _slot_weights = state_softmax_matmul(
+            slot_scores,
+            residual_hidden,
+            mask=~attention_mask.unsqueeze(1),
+            zero_invalid=True,
+            out_dtype=hidden_states.dtype,
+        )
 
         for _ in range(self.recursion_depth):
             pooled_self = self.self_norm(current).mean(dim=1)
@@ -355,7 +360,7 @@ class RecursiveSelfState(nn.Module):
         # Compute per-token norm + boundary once for the full sequence.
         normed_hidden = self.hidden_norm(hidden_states)
         boundary_logits = self.boundary(normed_hidden.float()) / self.boundary_temperature
-        boundary_probs = torch.softmax(boundary_logits, dim=-1).to(dtype=hidden_states.dtype)
+        boundary_probs = state_softmax(boundary_logits, dim=-1).to(dtype=hidden_states.dtype)
 
         # Pre-allocate output buffer so each block writes in-place.
         output = torch.empty_like(hidden_states)
@@ -433,9 +438,13 @@ class RecursiveSelfState(nn.Module):
             self_summary = self._masked_mean(residual_block, block_mask, block_boundary[..., 0:1])
             slot_queries = F.normalize((current + identity).float(), dim=-1).to(dtype=hidden_states.dtype)
             slot_scores = torch.einsum("bsd,btd->bst", slot_queries, residual_block) * self.context_score_scale
-            slot_scores = slot_scores.masked_fill(~block_mask.unsqueeze(1), torch.finfo(slot_scores.dtype).min)
-            slot_weights_f = torch.softmax(slot_scores.float(), dim=-1)
-            slot_context = torch.bmm(slot_weights_f, residual_block.float()).to(dtype=hidden_states.dtype)
+            slot_context, _slot_weights = state_softmax_matmul(
+                slot_scores,
+                residual_block,
+                mask=~block_mask.unsqueeze(1),
+                zero_invalid=True,
+                out_dtype=hidden_states.dtype,
+            )
 
             block_delta = hidden_states.new_tensor(0.0)
             for _ in range(self.recursion_depth):

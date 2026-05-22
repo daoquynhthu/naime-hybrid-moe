@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .norm import RMSNorm
+from .state_ops import state_softmax, state_softmax_matmul
 
 
 class WorldStateSlots(nn.Module):
@@ -45,20 +46,28 @@ class WorldStateSlots(nn.Module):
     def initial_state(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         return self.initial.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
 
-    def read(self, hidden_states: torch.Tensor, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        query = self.query_norm(hidden_states)
+    def _read_from_query(
+        self,
+        query: torch.Tensor,
+        slots: torch.Tensor,
+        *,
+        out_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if slots.ndim == 4:
             slots = slots[:, -1, :, :]
         key = self.slot_norm(slots)
         scores = torch.matmul(query, key.transpose(1, 2)) / (query.size(-1) ** 0.5)
-        weights_f = torch.softmax(scores.float(), dim=-1)
-        context = torch.matmul(weights_f, slots.float()).type_as(hidden_states)
+        context, weights = state_softmax_matmul(scores, slots, out_dtype=out_dtype)
         slot_quality = torch.sigmoid(self.confidence(key.float()))
         max_score_per_token = scores.detach().max(dim=-1, keepdim=True).values
         token_match = torch.sigmoid(max_score_per_token)
-        weighted_slot_quality = torch.sum(weights_f.unsqueeze(-1) * slot_quality.unsqueeze(1), dim=2)
-        confidence = (weighted_slot_quality * token_match).type_as(hidden_states)
-        return context, weights_f.type_as(hidden_states), confidence
+        weighted_slot_quality = torch.sum(weights.to(dtype=slot_quality.dtype).unsqueeze(-1) * slot_quality.unsqueeze(1), dim=2)
+        confidence = (weighted_slot_quality * token_match).to(dtype=out_dtype)
+        return context, weights.to(dtype=out_dtype), confidence
+
+    def read(self, hidden_states: torch.Tensor, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query = self.query_norm(hidden_states)
+        return self._read_from_query(query, slots, out_dtype=hidden_states.dtype)
 
     def _read_history(
         self,
@@ -74,11 +83,10 @@ class WorldStateSlots(nn.Module):
         query = self.query_norm(hidden_states)
         key = self.slot_norm(bank)
         scores = torch.matmul(query, key.transpose(1, 2)) / (query.size(-1) ** 0.5)
-        weights_f = torch.softmax(scores.float(), dim=-1)
-        context = torch.matmul(weights_f, bank.float()).type_as(hidden_states)
-        probs = weights_f.clamp_min(1e-6)
+        context, weights = state_softmax_matmul(scores, bank, out_dtype=hidden_states.dtype)
+        probs = weights.float().clamp_min(1e-6)
         entropy = -(probs * probs.log()).sum(dim=-1).mean().type_as(hidden_states)
-        focus = weights_f.max(dim=-1).values.mean().type_as(hidden_states)
+        focus = weights.max(dim=-1).values.mean().type_as(hidden_states)
         return context, entropy, focus
 
     def read_update_sequence(
@@ -136,23 +144,18 @@ class WorldStateSlots(nn.Module):
             # so every slot is masked there; avoid softmax(all -inf), which
             # creates NaNs that can poison BmmBackward even if the row is not
             # used by the block-level loop.
-            valid_history = limits > 0
-            masked_scores = scores.float().masked_fill(mask.unsqueeze(0), torch.finfo(torch.float32).min)
-            weights_history_f = torch.softmax(masked_scores, dim=-1)
-            weights_history_f = torch.where(
-                valid_history.view(1, seq_len, 1),
-                weights_history_f,
-                torch.zeros_like(weights_history_f),
+            precomputed_history_context, weights_history = state_softmax_matmul(
+                scores,
+                incoming_bank,
+                mask=mask.unsqueeze(0),
+                zero_invalid=True,
+                out_dtype=full_query.dtype,
             )
-            # Compute history context in fp32 before casting back. Keeping
-            # softmax probabilities in bf16 for this matmul can overflow its
-            # backward pass on large fused/compiled kernels.
-            precomputed_history_context = torch.matmul(weights_history_f, incoming_bank.float()).type_as(full_query)
 
             # Compute history telemetry in parallel outside the loop
-            probs = weights_history_f.clamp_min(1e-6)
+            probs = weights_history.float().clamp_min(1e-6)
             entropy = -(probs * probs.log()).sum(dim=-1)  # (batch, seq_len)
-            focus = weights_history_f.max(dim=-1).values  # (batch, seq_len)
+            focus = weights_history.max(dim=-1).values  # (batch, seq_len)
 
             # Calculate average telemetry for valid tokens (limits > 0)
             valid_mask = limits > 0
@@ -163,7 +166,11 @@ class WorldStateSlots(nn.Module):
         for block_idx in range(block_count):
             start = block_idx * stride
             end = min(seq_len, start + stride)
-            block_context, block_weights, block_confidence = self.read(hidden_states[:, start:end, :], current)
+            block_context, block_weights, block_confidence = self._read_from_query(
+                full_query[:, start:end, :],
+                current,
+                out_dtype=hidden_states.dtype,
+            )
 
             if incoming_trace is not None and block_idx > 0:
                 history_context = precomputed_history_context[:, start:end, :]
@@ -229,9 +236,9 @@ class WorldStateSlots(nn.Module):
             topk_scores, topk_idx = torch.topk(write_scores.float(), k=self.write_top_k, dim=-1)
             sparse_scores = torch.full_like(write_scores.float(), torch.finfo(write_scores.float().dtype).min)
             sparse_scores.scatter_(1, topk_idx, topk_scores)
-            slot_write_weights = torch.softmax(sparse_scores, dim=-1).type_as(slots)
+            slot_write_weights = state_softmax(sparse_scores, dim=-1).type_as(slots)
         else:
-            slot_write_weights = torch.softmax(write_scores.float(), dim=-1).type_as(slots)
+            slot_write_weights = state_softmax(write_scores, dim=-1).type_as(slots)
         pred_context = torch.sum(normalized_slots * slot_write_weights.unsqueeze(-1), dim=1)
         pred_summary = self.transition(pred_context)
         state_pred_loss = F.smooth_l1_loss(pred_summary.float(), summary.float())
