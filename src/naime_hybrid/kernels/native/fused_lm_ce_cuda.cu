@@ -7,6 +7,14 @@
 #include <cfloat>
 #include <vector>
 
+static inline int next_power_of_two_host(int value) {
+  int out = 1;
+  while (out < value) {
+    out <<= 1;
+  }
+  return out;
+}
+
 template <typename scalar_t>
 __global__ void fused_lm_ce_forward_kernel(
     const scalar_t* __restrict__ hidden,
@@ -126,4 +134,159 @@ std::vector<at::Tensor> fused_lm_ce_forward_cuda(
   auto valid = valid_counts.sum();
   auto loss = losses.sum() / valid.clamp_min(1).to(losses.dtype());
   return {loss, valid};
+}
+
+template <typename scalar_t>
+__global__ void fused_rms_norm_forward_kernel(
+    const scalar_t* __restrict__ input,
+    const float* __restrict__ weight,
+    scalar_t* __restrict__ output,
+    float* __restrict__ inv_rms,
+    int64_t rows,
+    int64_t dim,
+    float eps) {
+  extern __shared__ float shared[];
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int64_t base = row * dim;
+
+  float sumsq = 0.0f;
+  for (int64_t d = tid; d < dim; d += blockDim.x) {
+    const float x = static_cast<float>(input[base + d]);
+    sumsq += x * x;
+  }
+  shared[tid] = sumsq;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  const float row_inv = rsqrtf(shared[0] / static_cast<float>(dim) + eps);
+  if (tid == 0) {
+    inv_rms[row] = row_inv;
+  }
+
+  for (int64_t d = tid; d < dim; d += blockDim.x) {
+    const float x = static_cast<float>(input[base + d]);
+    const float y = x * row_inv * weight[d];
+    output[base + d] = static_cast<scalar_t>(y);
+  }
+}
+
+template <typename scalar_t>
+__global__ void fused_rms_norm_backward_kernel(
+    const scalar_t* __restrict__ grad_output,
+    const scalar_t* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ inv_rms,
+    scalar_t* __restrict__ grad_input,
+    float* __restrict__ grad_weight,
+    int64_t rows,
+    int64_t dim) {
+  extern __shared__ float shared[];
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int64_t base = row * dim;
+  const float row_inv = inv_rms[row];
+
+  float dot = 0.0f;
+  for (int64_t d = tid; d < dim; d += blockDim.x) {
+    const float go = static_cast<float>(grad_output[base + d]);
+    const float x = static_cast<float>(input[base + d]);
+    dot += go * weight[d] * x;
+  }
+  shared[tid] = dot;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float row_dot = shared[0];
+  const float correction_scale = row_inv * row_inv * row_dot / static_cast<float>(dim);
+
+  for (int64_t d = tid; d < dim; d += blockDim.x) {
+    const float go = static_cast<float>(grad_output[base + d]);
+    const float x = static_cast<float>(input[base + d]);
+    const float u = go * weight[d];
+    const float dx = row_inv * (u - x * correction_scale);
+    grad_input[base + d] = static_cast<scalar_t>(dx);
+    atomicAdd(&grad_weight[d], go * x * row_inv);
+  }
+}
+
+std::vector<at::Tensor> fused_rms_norm_forward_cuda(
+    at::Tensor input,
+    at::Tensor weight,
+    double eps) {
+  const c10::cuda::CUDAGuard device_guard(input.device());
+  const auto dim = input.size(-1);
+  const auto rows = input.numel() / dim;
+  auto output = at::empty_like(input);
+  auto inv_rms = at::empty({rows}, input.options().dtype(at::kFloat));
+
+  const int threads = std::min(1024, std::max(32, next_power_of_two_host(static_cast<int>(dim))));
+  const dim3 blocks(rows);
+  const size_t shared_bytes = static_cast<size_t>(threads) * sizeof(float);
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      input.scalar_type(),
+      "fused_rms_norm_forward_cuda",
+      [&] {
+        fused_rms_norm_forward_kernel<scalar_t><<<blocks, threads, shared_bytes, stream>>>(
+            input.data_ptr<scalar_t>(),
+            weight.data_ptr<float>(),
+            output.data_ptr<scalar_t>(),
+            inv_rms.data_ptr<float>(),
+            rows,
+            dim,
+            static_cast<float>(eps));
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {output, inv_rms};
+}
+
+std::vector<at::Tensor> fused_rms_norm_backward_cuda(
+    at::Tensor grad_output,
+    at::Tensor input,
+    at::Tensor weight,
+    at::Tensor inv_rms) {
+  const c10::cuda::CUDAGuard device_guard(input.device());
+  const auto dim = input.size(-1);
+  const auto rows = input.numel() / dim;
+  auto grad_input = at::empty_like(input);
+  auto grad_weight = at::zeros_like(weight, weight.options().dtype(at::kFloat));
+
+  const int threads = std::min(1024, std::max(32, next_power_of_two_host(static_cast<int>(dim))));
+  const dim3 blocks(rows);
+  const size_t shared_bytes = static_cast<size_t>(threads) * sizeof(float);
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      input.scalar_type(),
+      "fused_rms_norm_backward_cuda",
+      [&] {
+        fused_rms_norm_backward_kernel<scalar_t><<<blocks, threads, shared_bytes, stream>>>(
+            grad_output.data_ptr<scalar_t>(),
+            input.data_ptr<scalar_t>(),
+            weight.data_ptr<float>(),
+            inv_rms.data_ptr<float>(),
+            grad_input.data_ptr<scalar_t>(),
+            grad_weight.data_ptr<float>(),
+            rows,
+            dim);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {grad_input, grad_weight};
 }

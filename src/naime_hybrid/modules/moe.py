@@ -11,7 +11,11 @@ class SwiGLUExpert(nn.Module):
         self.w3 = nn.Linear(d_model, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2((F.silu(self.w1(x).float()) * self.w3(x).float()).type_as(x))
+        # Let autocast choose the matmul/activation dtype. Forcing the two
+        # expert projections through fp32 creates thousands of small cast/copy
+        # kernels in MoE-heavy V6 training without adding the same stability
+        # protection that router/state softmax paths need.
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class SemanticMoERouter(nn.Module):

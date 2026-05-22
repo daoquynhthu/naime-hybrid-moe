@@ -24,6 +24,24 @@ def _nvcc_name() -> str:
     return "nvcc.exe" if os.name == "nt" else "nvcc"
 
 
+def _prepend_path(path: Path) -> None:
+    if not path.exists():
+        return
+    current = os.environ.get("PATH", "")
+    parts = [part for part in current.split(os.pathsep) if part]
+    path_str = str(path)
+    if path_str not in parts:
+        os.environ["PATH"] = path_str + (os.pathsep + current if current else "")
+
+
+def _ensure_venv_tools_on_path() -> None:
+    # torch.utils.cpp_extension shells out to the ``ninja`` executable. When a
+    # remote launcher invokes the venv Python by absolute path, the venv Scripts
+    # directory is not guaranteed to be on PATH, so the extension can silently
+    # fall back even though ninja is installed in the active environment.
+    _prepend_path(Path(sys.executable).resolve().parent)
+
+
 def _find_cuda_home() -> Path | None:
     for path in _candidate_cuda_homes():
         if (path / "bin" / _nvcc_name()).exists():
@@ -67,6 +85,7 @@ def load_cuda_extension():
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA extension requested but torch.cuda is unavailable")
+    _ensure_venv_tools_on_path()
     cuda_home = _find_cuda_home()
     if cuda_home is not None:
         os.environ["CUDA_HOME"] = str(cuda_home)
