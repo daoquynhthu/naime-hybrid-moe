@@ -293,6 +293,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--world-state-diversity-margin", type=float, default=0.85)
     parser.add_argument("--world-state-stability-threshold", type=float, default=1e-3)
     parser.add_argument("--world-state-write-top-k", type=int, default=2)
+    parser.add_argument("--no-world-router-normalize", action="store_true")
+    parser.add_argument("--no-world-router-confidence-gate", action="store_true")
+    parser.add_argument("--world-router-max-ratio", type=float, default=0.08)
     parser.add_argument("--self-state-slots", type=int, default=0)
     parser.add_argument("--self-state-recursion-depth", type=int, default=1)
     parser.add_argument("--self-state-write-scale", type=float, default=0.03)
@@ -384,6 +387,9 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         world_state_diversity_margin=args.world_state_diversity_margin,
         world_state_stability_threshold=args.world_state_stability_threshold,
         world_state_write_top_k=args.world_state_write_top_k,
+        world_router_normalize=not args.no_world_router_normalize,
+        world_router_confidence_gate=not args.no_world_router_confidence_gate,
+        world_router_max_ratio=args.world_router_max_ratio,
         self_state_slots=args.self_state_slots,
         self_state_recursion_depth=args.self_state_recursion_depth,
         self_state_write_scale=args.self_state_write_scale,

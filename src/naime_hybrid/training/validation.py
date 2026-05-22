@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 
 from naime_hybrid.config import NAIMEStateMoEConfig
 
+from .masks import prepare_attention_mask_for_device
 from .losses import IGNORE_INDEX, collect_aux_losses, lm_loss
 
 
@@ -74,10 +75,12 @@ def evaluate_model(
             "v5_slot_read_entropy",
             "v5_slot_read_max",
             "v5_router_semantic_norm",
+            "v5_router_world_raw_norm",
             "v5_router_world_norm",
             "v5_router_world_ratio",
             "v5_router_world_cosine",
             "v5_router_world_gate",
+            "v5_router_world_cap",
             "v5_router_memory_norm",
             "v5_router_memory_ratio",
             "v5_router_effective_norm",
@@ -113,11 +116,12 @@ def evaluate_model(
                 break
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
-            attention_mask = batch.get("attention_mask")
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device, non_blocking=True)
+            attention_mask, infer_pad_mask = prepare_attention_mask_for_device(
+                batch.get("attention_mask"),
+                device,
+            )
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                out = model(input_ids, attention_mask=attention_mask)
+                out = model(input_ids, attention_mask=attention_mask, infer_pad_mask=infer_pad_mask)
                 loss = lm_loss(out["logits"], labels)
                 aux = collect_aux_losses(
                     out.get("aux", []),
@@ -169,10 +173,12 @@ def evaluate_model(
             totals["v5_slot_read_entropy"] += float(aux["v5_slot_read_entropy"].detach().cpu())
             totals["v5_slot_read_max"] += float(aux["v5_slot_read_max"].detach().cpu())
             totals["v5_router_semantic_norm"] += float(aux["v5_router_semantic_norm"].detach().cpu())
+            totals["v5_router_world_raw_norm"] += float(aux["v5_router_world_raw_norm"].detach().cpu())
             totals["v5_router_world_norm"] += float(aux["v5_router_world_norm"].detach().cpu())
             totals["v5_router_world_ratio"] += float(aux["v5_router_world_ratio"].detach().cpu())
             totals["v5_router_world_cosine"] += float(aux["v5_router_world_cosine"].detach().cpu())
             totals["v5_router_world_gate"] += float(aux["v5_router_world_gate"].detach().cpu())
+            totals["v5_router_world_cap"] += float(aux["v5_router_world_cap"].detach().cpu())
             totals["v5_router_memory_norm"] += float(aux["v5_router_memory_norm"].detach().cpu())
             totals["v5_router_memory_ratio"] += float(aux["v5_router_memory_ratio"].detach().cpu())
             totals["v5_router_effective_norm"] += float(aux["v5_router_effective_norm"].detach().cpu())
@@ -297,10 +303,12 @@ def evaluate_model(
         "val_v5_slot_read_entropy": totals["v5_slot_read_entropy"] / batches,
         "val_v5_slot_read_max": totals["v5_slot_read_max"] / batches,
         "val_v5_router_semantic_norm": totals["v5_router_semantic_norm"] / batches,
+        "val_v5_router_world_raw_norm": totals["v5_router_world_raw_norm"] / batches,
         "val_v5_router_world_norm": totals["v5_router_world_norm"] / batches,
         "val_v5_router_world_ratio": totals["v5_router_world_ratio"] / batches,
         "val_v5_router_world_cosine": totals["v5_router_world_cosine"] / batches,
         "val_v5_router_world_gate": totals["v5_router_world_gate"] / batches,
+        "val_v5_router_world_cap": totals["v5_router_world_cap"] / batches,
         "val_v5_router_memory_norm": totals["v5_router_memory_norm"] / batches,
         "val_v5_router_memory_ratio": totals["v5_router_memory_ratio"] / batches,
         "val_v5_router_effective_norm": totals["v5_router_effective_norm"] / batches,

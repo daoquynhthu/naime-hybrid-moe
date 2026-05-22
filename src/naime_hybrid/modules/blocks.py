@@ -43,6 +43,25 @@ def _mean_token_cosine(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     return F.cosine_similarity(left.float(), right.float(), dim=-1, eps=1e-6).mean().type_as(left)
 
 
+def _match_token_norm(source: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Rescale source to target's per-token norm without feeding norm gradients into target."""
+
+    source_norm = source.float().norm(dim=-1, keepdim=True).clamp_min(eps)
+    target_norm = target.detach().float().norm(dim=-1, keepdim=True).clamp_min(eps)
+    return (source.float() * (target_norm / source_norm)).type_as(source)
+
+
+def _cap_token_norm(source: torch.Tensor, reference: torch.Tensor, max_ratio: float, eps: float = 1e-6) -> torch.Tensor:
+    if max_ratio <= 0:
+        return source
+    bounded_ratio = min(max(max_ratio, 0.0), 0.95)
+    source_norm = source.float().norm(dim=-1, keepdim=True)
+    reference_norm = reference.detach().float().norm(dim=-1, keepdim=True)
+    max_norm = (reference_norm * bounded_ratio / max(1e-6, 1.0 - bounded_ratio)).clamp_min(eps)
+    scale = torch.minimum(torch.ones_like(source_norm), max_norm / source_norm.clamp_min(eps))
+    return (source.float() * scale).type_as(source)
+
+
 class DenseTransformerBlock(nn.Module):
     def __init__(self, config: NAIMEStateMoEConfig):
         super().__init__()
@@ -307,6 +326,24 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
         super().__init__(config, layer_idx=layer_idx)
         self.world_state_slots = world_state_slots
 
+    def _world_router_component(
+        self,
+        state_context: torch.Tensor,
+        token_semantic: torch.Tensor,
+        state_confidence: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        raw_component = self.state_proj(state_context)
+        world_basis = raw_component
+        if self.config.world_router_normalize:
+            world_basis = _match_token_norm(world_basis, token_semantic)
+
+        gate = torch.ones_like(state_confidence)
+        if self.config.world_router_confidence_gate or self.config.semantic_state_confidence_gate:
+            gate = state_confidence.to(device=world_basis.device, dtype=world_basis.dtype)
+        component = self.config.semantic_state_write_scale * gate * world_basis
+        component = _cap_token_norm(component, token_semantic, self.config.world_router_max_ratio)
+        return component, raw_component, gate
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -372,8 +409,9 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
 
         token_semantic = semantic["token_semantic_downstream"] * token_alpha
         router_semantic = token_semantic
-        state_scale = self.config.semantic_state_write_scale
         world_component = torch.zeros_like(router_semantic)
+        raw_world_component = torch.zeros_like(router_semantic)
+        world_router_gate = torch.ones(batch, seq_len, 1, device=hidden_states.device, dtype=hidden_states.dtype)
 
         memory_context = torch.zeros_like(router_semantic)
         memory_weights = torch.zeros(batch, seq_len, 1, device=hidden_states.device, dtype=hidden_states.dtype)
@@ -389,16 +427,18 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
                     stride=max(self.config.stride, self.config.causal_state_stride),
                 )
             )
-            effective_state_scale = (
-                state_scale * state_confidence if self.config.semantic_state_confidence_gate else state_scale
+            world_component, raw_world_component, world_router_gate = self._world_router_component(
+                state_context,
+                token_semantic,
+                state_confidence,
             )
-            world_component = effective_state_scale * self.state_proj(state_context)
             router_semantic = router_semantic + world_component
         elif not self.config.semantic_causal:
-            effective_state_scale = (
-                state_scale * state_confidence if self.config.semantic_state_confidence_gate else state_scale
+            world_component, raw_world_component, world_router_gate = self._world_router_component(
+                state_context,
+                token_semantic,
+                state_confidence,
             )
-            world_component = effective_state_scale * self.state_proj(state_context)
             router_semantic = router_semantic + world_component
 
         if self.memory is not None and memory is not None and not self.config.semantic_causal:
@@ -468,15 +508,12 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
         )
         semantic_norm = _mean_token_norm(token_semantic)
         world_norm = _mean_token_norm(world_component)
+        raw_world_norm = _mean_token_norm(raw_world_component)
         router_norm = _mean_token_norm(router_semantic)
         memory_write_norm = _mean_token_norm(memory_hidden_write)
         semantic_write_norm = _mean_token_norm(semantic_hidden_write)
         contribution_denom = (semantic_norm + world_norm).clamp_min(1e-6)
-        world_gate_metric = (
-            state_confidence.float().mean().type_as(hidden_states)
-            if self.config.semantic_state_confidence_gate
-            else torch.ones((), device=hidden_states.device, dtype=hidden_states.dtype)
-        )
+        world_gate_metric = world_router_gate.float().mean().type_as(hidden_states)
         aux = {
             "semantic": semantic,
             "moe": moe_aux,
@@ -505,10 +542,16 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
                 "slot_read_max": slot_read_max,
                 "slot_count": torch.tensor(slot_count, device=hidden_states.device, dtype=hidden_states.dtype),
                 "router_semantic_norm": semantic_norm,
+                "router_world_raw_norm": raw_world_norm,
                 "router_world_norm": world_norm,
                 "router_world_ratio": world_norm / contribution_denom,
                 "router_world_cosine": _mean_token_cosine(token_semantic, world_component),
                 "router_world_gate": world_gate_metric,
+                "router_world_cap": torch.tensor(
+                    self.config.world_router_max_ratio,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                ),
                 "router_memory_norm": torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype),
                 "router_memory_ratio": torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype),
                 "router_effective_norm": router_norm,

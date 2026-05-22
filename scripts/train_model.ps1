@@ -70,6 +70,9 @@ param(
     [double]$SemanticStateWriteScale = 0.0,
     [double]$SemanticMemoryHiddenScale = 0.0,
     [double]$SemanticGateMixerMaxStateWeight = 0.0,
+    [switch]$NoWorldRouterNormalize,
+    [switch]$NoWorldRouterConfidenceGate,
+    [double]$WorldRouterMaxRatio = 0.08,
     [int]$SelfStateSlots = 4,
     [int]$SelfStateRecursionDepth = 1,
     [double]$SelfStateWriteScale = 0.03,
@@ -370,10 +373,17 @@ if ($isStateModel) {
             "--lambda-slot-diversity", $(if ($LambdaSlotDiversity -gt 0.0) { "$LambdaSlotDiversity" } else { "0.01" }),
             "--lambda-slot-stability", "$LambdaSlotStability",
             "--world-state-stability-threshold", "$WorldStateStabilityThreshold",
+            "--world-router-max-ratio", "$WorldRouterMaxRatio",
             "--attention-type", "$AttentionType",
             "--mla-latent-dim", "$MlaLatentDim",
             "--mla-rope-per-head", "$MlaRopePerHead"
         )
+        if ($NoWorldRouterNormalize) {
+            $common += @("--no-world-router-normalize")
+        }
+        if ($NoWorldRouterConfidenceGate) {
+            $common += @("--no-world-router-confidence-gate")
+        }
         if ($SemanticRouterPriorGate) {
             $common += @("--semantic-router-prior-gate")
         }

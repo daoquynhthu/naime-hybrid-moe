@@ -146,8 +146,8 @@ class RecursiveSelfState(nn.Module):
         slot_queries = F.normalize((current + identity).float(), dim=-1).to(dtype=hidden_states.dtype)
         slot_scores = torch.einsum("bsd,btd->bst", slot_queries, residual_hidden) * self.context_score_scale
         slot_scores = slot_scores.masked_fill(~attention_mask.unsqueeze(1), torch.finfo(slot_scores.dtype).min)
-        slot_weights = torch.softmax(slot_scores.float(), dim=-1).to(dtype=hidden_states.dtype)
-        slot_context = torch.bmm(slot_weights, residual_hidden)
+        slot_weights_f = torch.softmax(slot_scores.float(), dim=-1)
+        slot_context = torch.bmm(slot_weights_f, residual_hidden.float()).to(dtype=hidden_states.dtype)
 
         for _ in range(self.recursion_depth):
             pooled_self = self.self_norm(current).mean(dim=1)
@@ -317,8 +317,8 @@ class RecursiveSelfState(nn.Module):
             slot_queries = F.normalize((current + identity).float(), dim=-1).to(dtype=hidden_states.dtype)
             slot_scores = torch.einsum("bsd,btd->bst", slot_queries, residual_block) * self.context_score_scale
             slot_scores = slot_scores.masked_fill(~block_mask.unsqueeze(1), torch.finfo(slot_scores.dtype).min)
-            slot_weights = torch.softmax(slot_scores.float(), dim=-1).to(dtype=hidden_states.dtype)
-            slot_context = torch.bmm(slot_weights, residual_block)
+            slot_weights_f = torch.softmax(slot_scores.float(), dim=-1)
+            slot_context = torch.bmm(slot_weights_f, residual_block.float()).to(dtype=hidden_states.dtype)
 
             block_delta = hidden_states.new_tensor(0.0)
             for _ in range(self.recursion_depth):

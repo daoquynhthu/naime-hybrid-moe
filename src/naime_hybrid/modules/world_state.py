@@ -51,14 +51,14 @@ class WorldStateSlots(nn.Module):
             slots = slots[:, -1, :, :]
         key = self.slot_norm(slots)
         scores = torch.matmul(query, key.transpose(1, 2)) / (query.size(-1) ** 0.5)
-        weights = torch.softmax(scores.float(), dim=-1).type_as(hidden_states)
-        context = torch.matmul(weights, slots)
+        weights_f = torch.softmax(scores.float(), dim=-1)
+        context = torch.matmul(weights_f, slots.float()).type_as(hidden_states)
         slot_quality = torch.sigmoid(self.confidence(key.float()))
         max_score_per_token = scores.detach().max(dim=-1, keepdim=True).values
         token_match = torch.sigmoid(max_score_per_token)
-        weighted_slot_quality = torch.sum(weights.unsqueeze(-1) * slot_quality.unsqueeze(1), dim=2)
+        weighted_slot_quality = torch.sum(weights_f.unsqueeze(-1) * slot_quality.unsqueeze(1), dim=2)
         confidence = (weighted_slot_quality * token_match).type_as(hidden_states)
-        return context, weights, confidence
+        return context, weights_f.type_as(hidden_states), confidence
 
     def _read_history(
         self,
@@ -74,11 +74,11 @@ class WorldStateSlots(nn.Module):
         query = self.query_norm(hidden_states)
         key = self.slot_norm(bank)
         scores = torch.matmul(query, key.transpose(1, 2)) / (query.size(-1) ** 0.5)
-        weights = torch.softmax(scores.float(), dim=-1).type_as(hidden_states)
-        context = torch.matmul(weights, bank)
-        probs = weights.float().clamp_min(1e-6)
+        weights_f = torch.softmax(scores.float(), dim=-1)
+        context = torch.matmul(weights_f, bank.float()).type_as(hidden_states)
+        probs = weights_f.clamp_min(1e-6)
         entropy = -(probs * probs.log()).sum(dim=-1).mean().type_as(hidden_states)
-        focus = weights.max(dim=-1).values.mean().type_as(hidden_states)
+        focus = weights_f.max(dim=-1).values.mean().type_as(hidden_states)
         return context, entropy, focus
 
     def read_update_sequence(
@@ -132,17 +132,27 @@ class WorldStateSlots(nn.Module):
             s_indices = torch.arange(total_slots, device=hidden_states.device)
             mask = s_indices.unsqueeze(0) >= limits.unsqueeze(1)  # True for future slots
 
-            # Apply mask and compute weights
-            scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
-            weights_history = torch.softmax(scores.float(), dim=-1).type_as(full_query)
-
-            # Compute history context: shape is (batch, seq_len, dim)
-            precomputed_history_context = torch.matmul(weights_history, incoming_bank)
+            # Apply the causal mask. The first block has no readable history,
+            # so every slot is masked there; avoid softmax(all -inf), which
+            # creates NaNs that can poison BmmBackward even if the row is not
+            # used by the block-level loop.
+            valid_history = limits > 0
+            masked_scores = scores.float().masked_fill(mask.unsqueeze(0), torch.finfo(torch.float32).min)
+            weights_history_f = torch.softmax(masked_scores, dim=-1)
+            weights_history_f = torch.where(
+                valid_history.view(1, seq_len, 1),
+                weights_history_f,
+                torch.zeros_like(weights_history_f),
+            )
+            # Compute history context in fp32 before casting back. Keeping
+            # softmax probabilities in bf16 for this matmul can overflow its
+            # backward pass on large fused/compiled kernels.
+            precomputed_history_context = torch.matmul(weights_history_f, incoming_bank.float()).type_as(full_query)
 
             # Compute history telemetry in parallel outside the loop
-            probs = weights_history.float().clamp_min(1e-6)
+            probs = weights_history_f.clamp_min(1e-6)
             entropy = -(probs * probs.log()).sum(dim=-1)  # (batch, seq_len)
-            focus = weights_history.max(dim=-1).values  # (batch, seq_len)
+            focus = weights_history_f.max(dim=-1).values  # (batch, seq_len)
 
             # Calculate average telemetry for valid tokens (limits > 0)
             valid_mask = limits > 0

@@ -14,6 +14,7 @@ from naime_hybrid import (
 from naime_hybrid.data import HFDiskCausalDataset
 from naime_hybrid.modules.gate import GumbelBlockGate
 from naime_hybrid.modules.moe import TopKMoE
+from naime_hybrid.modules.self_state import RecursiveSelfState
 from naime_hybrid.modules.world_state import WorldStateSlots
 from naime_hybrid.training.checkpoint import (
     build_model_payload,
@@ -23,6 +24,7 @@ from naime_hybrid.training.checkpoint import (
 from naime_hybrid.training.cli import build_train_config, parse_args
 from naime_hybrid.training.control import reference_value_at_step, update_sparse_lambda
 from naime_hybrid.training.losses import lm_loss
+from naime_hybrid.training.masks import prepare_attention_mask_for_device
 
 
 class _FakeCompiledWrapper(torch.nn.Module):
@@ -261,6 +263,84 @@ def test_world_state_history_reads_only_past_blocks():
     changed_context, _, _, _, _ = slots.read_update_sequence(hidden, semantic, changed_future_trace, stride=4)
 
     assert torch.allclose(context[:, :8, :], changed_context[:, :8, :], atol=1e-5, rtol=1e-5)
+
+
+def test_world_state_history_first_block_has_finite_backward():
+    torch.manual_seed(2028)
+    slots = WorldStateSlots(d_model=16, slots=3)
+    hidden = torch.randn(2, 12, 16, requires_grad=True)
+    semantic = torch.randn(2, 12, 16, requires_grad=True)
+    trace = torch.randn(2, 3, 3, 16, requires_grad=True)
+
+    context, _, _, traced_state, _ = slots.read_update_sequence(hidden, semantic, trace, stride=4)
+    loss = context[:, 4:, :].float().square().mean() + traced_state.float().square().mean()
+    loss.backward()
+
+    assert torch.isfinite(context).all()
+    assert torch.isfinite(traced_state).all()
+    assert trace.grad is not None
+    assert torch.isfinite(trace.grad).all()
+    assert hidden.grad is not None
+    assert torch.isfinite(hidden.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="bf16 CUDA backward stability test requires CUDA")
+def test_world_state_history_bf16_context_backward_is_finite():
+    torch.manual_seed(2029)
+    slots = WorldStateSlots(d_model=32, slots=4).cuda()
+    hidden = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    semantic = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    trace = torch.randn(2, 4, 4, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        context, _, _, traced_state, metrics = slots.read_update_sequence(hidden, semantic, trace, stride=4)
+    loss = (
+        context.float().square().mean()
+        + traced_state.float().square().mean()
+        + metrics["history_read_entropy"].float()
+    )
+    loss.backward()
+
+    assert torch.isfinite(context).all()
+    assert torch.isfinite(traced_state).all()
+    assert hidden.grad is not None
+    assert torch.isfinite(hidden.grad).all()
+    assert trace.grad is not None
+    assert torch.isfinite(trace.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="bf16 CUDA backward stability test requires CUDA")
+def test_recursive_self_state_bf16_slot_context_backward_is_finite():
+    torch.manual_seed(2030)
+    module = RecursiveSelfState(d_model=32, slots=4, hidden_scale=0.02).cuda()
+    hidden = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    world_trace = torch.randn(2, 4, 4, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    self_trace = torch.randn(2, 4, 4, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    attention_mask = torch.ones(2, 16, device="cuda", dtype=torch.bool)
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        output, next_state, metrics = module(
+            hidden,
+            attention_mask=attention_mask,
+            world_state=world_trace,
+            self_state=self_trace,
+            causal_safe=True,
+            block_size=4,
+        )
+    loss = (
+        output.float().square().mean()
+        + next_state.float().square().mean()
+        + metrics["self_pred"].float()
+        + metrics["slot_context_cosine"].float()
+    )
+    loss.backward()
+
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(next_state).all()
+    assert hidden.grad is not None
+    assert torch.isfinite(hidden.grad).all()
+    assert self_trace.grad is not None
+    assert torch.isfinite(self_trace.grad).all()
 
 
 def test_multiscale_semantic_architectures_do_not_leak_future_tokens():
@@ -772,6 +852,55 @@ def test_topk_moe_auto_dispatch_matches_dense_dispatch_for_small_expert_cuda_heu
     dense_loss.backward()
     auto_loss.backward()
     assert torch.allclose(x_auto.grad, x_dense.grad, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA dispatch heuristic only applies on GPU")
+def test_topk_moe_auto_dispatch_uses_dense_for_six_experts_on_cuda():
+    moe = TopKMoE(
+        d_model=16,
+        semantic_dim=16,
+        n_experts=6,
+        top_k=2,
+        expert_hidden_dim=32,
+        use_semantic_router=False,
+        dispatch_mode="auto",
+    ).cuda()
+    x = torch.randn(2, 512, 16, device="cuda")
+
+    assert moe._resolve_dispatch_mode(x) == "dense"
+
+
+def test_full_attention_mask_is_dropped_for_causal_fast_path():
+    mask = torch.ones(2, 8, dtype=torch.bool)
+
+    prepared, infer_pad_mask = prepare_attention_mask_for_device(mask, torch.device("cpu"))
+
+    assert prepared is None
+    assert infer_pad_mask is False
+
+
+def test_decoder_full_mask_matches_causal_fast_path_without_pad_inference():
+    torch.manual_seed(1234)
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        max_seq_len=16,
+        d_model=32,
+        n_layers=2,
+        n_dense_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        dropout=0.0,
+    )
+    model = NAIMEStateMoEDecoder(config).eval()
+    input_ids = torch.randint(1, config.vocab_size, (2, 16))
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    with torch.no_grad():
+        masked = model(input_ids, attention_mask=attention_mask, return_aux=False)["logits"]
+        fast = model(input_ids, attention_mask=None, infer_pad_mask=False, return_aux=False)["logits"]
+
+    assert torch.allclose(fast, masked, atol=1e-5)
 
 
 def test_mla_attention_forward_and_backward():

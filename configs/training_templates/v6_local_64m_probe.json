@@ -23,6 +23,7 @@
     "WorldStateSlots": 6,
     "SelfStateSlots": 6,
     "SemanticStateWriteScale": 0.075,
+    "WorldRouterMaxRatio": 0.08,
     "SemanticGateMixerMaxStateWeight": 0.35,
     "SelfStateWorldGateMin": 0.10,
     "VramFraction": 0.80,

@@ -30,6 +30,7 @@ from .cli import build_train_config, parse_args
 from .control import effective_kl_lambda, load_reference_curve, reference_value_at_step
 from .logging_utils import JsonlMetricLogger, metrics_jsonl_to_csv, setup_logger
 from .losses import collect_aux_losses, lm_loss
+from .masks import prepare_attention_mask_for_device
 from .prefetch import AsyncPrefetcher
 from .progress import TrainingProgress
 from .runtime import build_dataset, cycle_loader, probe_auto_batch_size, resolve_device, set_seed
@@ -763,12 +764,13 @@ def main() -> None:
                 batch = next(data_iter)
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 labels = batch["labels"].to(device, non_blocking=True)
-                attention_mask = batch.get("attention_mask")
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(device, non_blocking=True)
+                attention_mask, infer_pad_mask = prepare_attention_mask_for_device(
+                    batch.get("attention_mask"),
+                    device,
+                )
 
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                    out = model(input_ids, attention_mask=attention_mask)
+                    out = model(input_ids, attention_mask=attention_mask, infer_pad_mask=infer_pad_mask)
                     main_loss = lm_loss(out["logits"], labels)
                     aux = collect_aux_losses(
                         out.get("aux", []),
@@ -1214,9 +1216,11 @@ def main() -> None:
                     "v5_slot_write_max": metrics.get("v5_slot_write_max", 0.0),
                     "v5_slot_write_min": metrics.get("v5_slot_write_min", 0.0),
                     "v5_slot_write_active": metrics.get("v5_slot_write_active", 0.0),
+                    "v5_router_world_raw_norm": metrics.get("v5_router_world_raw_norm", 0.0),
                     "v5_router_world_ratio": metrics.get("v5_router_world_ratio", 0.0),
                     "v5_router_world_cosine": metrics.get("v5_router_world_cosine", 0.0),
                     "v5_router_world_gate": metrics.get("v5_router_world_gate", 0.0),
+                    "v5_router_world_cap": metrics.get("v5_router_world_cap", 0.0),
                     "v5_semantic_hidden_write_norm": metrics.get("v5_semantic_hidden_write_norm", 0.0),
                     "v6_self_pred": metrics.get("v6_self_pred", 0.0),
                     "v6_slot_diversity": metrics.get("v6_slot_diversity", 0.0),

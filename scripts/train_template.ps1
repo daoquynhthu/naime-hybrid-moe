@@ -32,6 +32,7 @@ param(
     [double]$SemanticStateWriteScale = -1.0,
     [double]$SemanticMemoryHiddenScale = -1.0,
     [double]$SemanticGateMixerMaxStateWeight = -1.0,
+    [double]$WorldRouterMaxRatio = -1.0,
     [double]$SelfStateWorldGateMin = -1.0,
     [double]$SelfStateWorldGateScale = -1.0,
     [string]$Device = "",
@@ -163,6 +164,7 @@ Add-Override $params "NumWorkers" $NumWorkers { $NumWorkers -ge 0 }
 Add-Override $params "SemanticStateWriteScale" $SemanticStateWriteScale { $SemanticStateWriteScale -gt 0.0 }
 Add-Override $params "SemanticMemoryHiddenScale" $SemanticMemoryHiddenScale { $SemanticMemoryHiddenScale -gt 0.0 }
 Add-Override $params "SemanticGateMixerMaxStateWeight" $SemanticGateMixerMaxStateWeight { $SemanticGateMixerMaxStateWeight -gt 0.0 }
+Add-Override $params "WorldRouterMaxRatio" $WorldRouterMaxRatio { $WorldRouterMaxRatio -gt 0.0 }
 Add-Override $params "SelfStateWorldGateMin" $SelfStateWorldGateMin { $SelfStateWorldGateMin -ge 0.0 }
 Add-Override $params "SelfStateWorldGateScale" $SelfStateWorldGateScale { $SelfStateWorldGateScale -gt 0.0 }
 Add-Override $params "Device" $Device { -not [string]::IsNullOrWhiteSpace($Device) }

@@ -88,10 +88,12 @@ def collect_aux_losses(
     v5_history_read_entropies = []
     v5_history_read_maxes = []
     v5_router_semantic_norms = []
+    v5_router_world_raw_norms = []
     v5_router_world_norms = []
     v5_router_world_ratios = []
     v5_router_world_cosines = []
     v5_router_world_gates = []
+    v5_router_world_caps = []
     v5_router_memory_norms = []
     v5_router_memory_ratios = []
     v5_router_effective_norms = []
@@ -242,6 +244,8 @@ def collect_aux_losses(
                 v5_history_read_maxes.append(v5["history_read_max"].float())
             if "router_semantic_norm" in v5:
                 v5_router_semantic_norms.append(v5["router_semantic_norm"].float())
+            if "router_world_raw_norm" in v5:
+                v5_router_world_raw_norms.append(v5["router_world_raw_norm"].float())
             if "router_world_norm" in v5:
                 v5_router_world_norms.append(v5["router_world_norm"].float())
             if "router_world_ratio" in v5:
@@ -250,6 +254,8 @@ def collect_aux_losses(
                 v5_router_world_cosines.append(v5["router_world_cosine"].float())
             if "router_world_gate" in v5:
                 v5_router_world_gates.append(v5["router_world_gate"].float())
+            if "router_world_cap" in v5:
+                v5_router_world_caps.append(v5["router_world_cap"].float())
             if "router_memory_norm" in v5:
                 v5_router_memory_norms.append(v5["router_memory_norm"].float())
             if "router_memory_ratio" in v5:
@@ -372,10 +378,14 @@ def collect_aux_losses(
         "v5_history_read_entropy": torch.stack(v5_history_read_entropies).mean() if v5_history_read_entropies else zero,
         "v5_history_read_max": torch.stack(v5_history_read_maxes).mean() if v5_history_read_maxes else zero,
         "v5_router_semantic_norm": torch.stack(v5_router_semantic_norms).mean() if v5_router_semantic_norms else zero,
+        "v5_router_world_raw_norm": torch.stack(v5_router_world_raw_norms).mean()
+        if v5_router_world_raw_norms
+        else zero,
         "v5_router_world_norm": torch.stack(v5_router_world_norms).mean() if v5_router_world_norms else zero,
         "v5_router_world_ratio": torch.stack(v5_router_world_ratios).mean() if v5_router_world_ratios else zero,
         "v5_router_world_cosine": torch.stack(v5_router_world_cosines).mean() if v5_router_world_cosines else zero,
         "v5_router_world_gate": torch.stack(v5_router_world_gates).mean() if v5_router_world_gates else zero,
+        "v5_router_world_cap": torch.stack(v5_router_world_caps).mean() if v5_router_world_caps else zero,
         "v5_router_memory_norm": torch.stack(v5_router_memory_norms).mean() if v5_router_memory_norms else zero,
         "v5_router_memory_ratio": torch.stack(v5_router_memory_ratios).mean() if v5_router_memory_ratios else zero,
         "v5_router_effective_norm": torch.stack(v5_router_effective_norms).mean()

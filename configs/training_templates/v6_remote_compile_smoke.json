@@ -25,6 +25,7 @@
     "WorldStateSlots": 2,
     "SelfStateSlots": 2,
     "SemanticStateWriteScale": 0.075,
+    "WorldRouterMaxRatio": 0.08,
     "SemanticGateMixerMaxStateWeight": 0.35,
     "SelfStateWorldGateMin": 0.10,
     "NoAutoBatch": true,

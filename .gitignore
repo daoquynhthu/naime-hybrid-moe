@@ -14,6 +14,8 @@ Include/
 libs/
 
 experiments/runs/
+experiments/debug_suite/
+experiments/profiles/
 *.pt
 *.pth
 *.safetensors
@@ -23,6 +25,7 @@ tmp_remote_*
 tmp_analyze_*
 scripts/tmp_remote_*
 scripts/tmp_analyze_*
+scripts/tmp_eval_*
 scripts/*.exe
 monitor_test_output.txt
 
@@ -33,4 +36,5 @@ cache/
 wandb/
 
 research/
+analysis/remote_runs/
 configs/workspace.local.json

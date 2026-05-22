@@ -12,6 +12,7 @@ from naime_hybrid.data import ByteTextDataset, HFDiskCausalDataset
 from naime_hybrid.models import build_model
 
 from .losses import IGNORE_INDEX, collect_aux_losses, lm_loss
+from .masks import prepare_attention_mask_for_device
 from .train import effective_kl_lambda, resolve_device
 
 
@@ -111,11 +112,12 @@ def main() -> None:
                 break
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
-            attention_mask = batch.get("attention_mask")
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device, non_blocking=True)
+            attention_mask, infer_pad_mask = prepare_attention_mask_for_device(
+                batch.get("attention_mask"),
+                device,
+            )
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                out = model(input_ids, attention_mask=attention_mask)
+                out = model(input_ids, attention_mask=attention_mask, infer_pad_mask=infer_pad_mask)
                 loss = lm_loss(out["logits"], labels)
                 aux = collect_aux_losses(
                     out.get("aux", []),

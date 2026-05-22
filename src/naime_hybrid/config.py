@@ -72,6 +72,9 @@ class NAIMEStateMoEConfig:
     world_state_pred_detach_target: bool = True
     world_state_stability_threshold: float = 1e-3
     world_state_write_top_k: int = 2
+    world_router_normalize: bool = True
+    world_router_confidence_gate: bool = True
+    world_router_max_ratio: float = 0.08
 
     # V6 recursive self-state system.
     self_state_slots: int = 0

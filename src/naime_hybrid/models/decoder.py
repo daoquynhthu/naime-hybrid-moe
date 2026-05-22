@@ -24,6 +24,19 @@ def _init_weights(module: nn.Module) -> None:
         nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 
+def _resolve_attention_mask(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    config: NAIMEStateMoEConfig,
+    infer_pad_mask: bool | None,
+) -> torch.Tensor | None:
+    if attention_mask is not None:
+        return attention_mask
+    if infer_pad_mask is False:
+        return None
+    return input_ids.ne(config.pad_token_id)
+
+
 class NAIMEStateMoEDecoder(nn.Module):
     def __init__(self, config: NAIMEStateMoEConfig):
         super().__init__()
@@ -46,9 +59,9 @@ class NAIMEStateMoEDecoder(nn.Module):
         attention_mask: torch.Tensor | None = None,
         tau: float | None = None,
         return_aux: bool = True,
+        infer_pad_mask: bool | None = None,
     ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
-        if attention_mask is None:
-            attention_mask = input_ids.ne(self.config.pad_token_id)
+        attention_mask = _resolve_attention_mask(input_ids, attention_mask, self.config, infer_pad_mask)
 
         hidden_states = self.embed_tokens(input_ids)
         aux_by_layer = []
@@ -113,9 +126,9 @@ class NAIMEV4StateMoEDecoder(nn.Module):
         attention_mask: torch.Tensor | None = None,
         tau: float | None = None,
         return_aux: bool = True,
+        infer_pad_mask: bool | None = None,
     ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
-        if attention_mask is None:
-            attention_mask = input_ids.ne(self.config.pad_token_id)
+        attention_mask = _resolve_attention_mask(input_ids, attention_mask, self.config, infer_pad_mask)
 
         hidden_states = self.embed_tokens(input_ids)
         batch_size = hidden_states.size(0)
@@ -201,9 +214,9 @@ class NAIMEV5WorldStateMoEDecoder(NAIMEV4StateMoEDecoder):
         attention_mask: torch.Tensor | None = None,
         tau: float | None = None,
         return_aux: bool = True,
+        infer_pad_mask: bool | None = None,
     ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
-        if attention_mask is None:
-            attention_mask = input_ids.ne(self.config.pad_token_id)
+        attention_mask = _resolve_attention_mask(input_ids, attention_mask, self.config, infer_pad_mask)
 
         hidden_states = self.embed_tokens(input_ids)
         batch_size = hidden_states.size(0)
@@ -277,9 +290,9 @@ class NAIMEV6RecursiveSelfMoEDecoder(NAIMEV5WorldStateMoEDecoder):
         attention_mask: torch.Tensor | None = None,
         tau: float | None = None,
         return_aux: bool = True,
+        infer_pad_mask: bool | None = None,
     ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
-        if attention_mask is None:
-            attention_mask = input_ids.ne(self.config.pad_token_id)
+        attention_mask = _resolve_attention_mask(input_ids, attention_mask, self.config, infer_pad_mask)
 
         hidden_states = self.embed_tokens(input_ids)
         batch_size = hidden_states.size(0)
@@ -346,10 +359,10 @@ class DenseDecoder(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         return_aux: bool = True,
+        infer_pad_mask: bool | None = None,
         **_: object,
     ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
-        if attention_mask is None:
-            attention_mask = input_ids.ne(self.config.pad_token_id)
+        attention_mask = _resolve_attention_mask(input_ids, attention_mask, self.config, infer_pad_mask)
 
         hidden_states = self.embed_tokens(input_ids)
         aux_by_layer = []
@@ -392,10 +405,10 @@ class TokenMoEDecoder(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         return_aux: bool = True,
+        infer_pad_mask: bool | None = None,
         **_: object,
     ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
-        if attention_mask is None:
-            attention_mask = input_ids.ne(self.config.pad_token_id)
+        attention_mask = _resolve_attention_mask(input_ids, attention_mask, self.config, infer_pad_mask)
 
         hidden_states = self.embed_tokens(input_ids)
         aux_by_layer = []

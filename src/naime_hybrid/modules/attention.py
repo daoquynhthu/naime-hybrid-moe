@@ -75,20 +75,29 @@ class GQAAttention(nn.Module):
         k = k.repeat_interleave(self.kv_repeat, dim=1)
         v = v.repeat_interleave(self.kv_repeat, dim=1)
 
-        causal_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=hidden_states.device).tril()
-        attn_mask = causal_mask.view(1, 1, seq_len, seq_len)
-        if attention_mask is not None:
+        if attention_mask is None:
+            attn_output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=True,
+                dropout_p=self.dropout if self.training else 0.0,
+                scale=1.0 / math.sqrt(self.head_dim),
+            )
+        else:
+            causal_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=hidden_states.device).tril()
+            attn_mask = causal_mask.view(1, 1, seq_len, seq_len)
             key_mask = attention_mask.to(torch.bool).view(batch, 1, 1, seq_len)
             attn_mask = attn_mask & key_mask
 
-        attn_output = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout if self.training else 0.0,
-            scale=1.0 / math.sqrt(self.head_dim),
-        )
+            attn_output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                scale=1.0 / math.sqrt(self.head_dim),
+            )
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch, seq_len, self.d_model)
         return self.o_proj(attn_output)
 
@@ -159,19 +168,28 @@ class MLAAttention(nn.Module):
         k = k.repeat_interleave(self.kv_repeat, dim=1)
         v = v.repeat_interleave(self.kv_repeat, dim=1)
 
-        causal_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=hidden_states.device).tril()
-        attn_mask = causal_mask.view(1, 1, seq_len, seq_len)
-        if attention_mask is not None:
+        if attention_mask is None:
+            attn_output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=True,
+                dropout_p=self.dropout if self.training else 0.0,
+                scale=1.0 / math.sqrt(self.head_dim),
+            )
+        else:
+            causal_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=hidden_states.device).tril()
+            attn_mask = causal_mask.view(1, 1, seq_len, seq_len)
             key_mask = attention_mask.to(torch.bool).view(batch, 1, 1, seq_len)
             attn_mask = attn_mask & key_mask
 
-        attn_output = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout if self.training else 0.0,
-            scale=1.0 / math.sqrt(self.head_dim),
-        )
+            attn_output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                scale=1.0 / math.sqrt(self.head_dim),
+            )
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch, seq_len, self.d_model)
         return self.o_proj(attn_output)

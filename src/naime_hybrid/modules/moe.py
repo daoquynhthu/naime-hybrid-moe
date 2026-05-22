@@ -11,7 +11,7 @@ class SwiGLUExpert(nn.Module):
         self.w3 = nn.Linear(d_model, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2((F.silu(self.w1(x).float()) * self.w3(x).float()).type_as(x))
 
 
 class SemanticMoERouter(nn.Module):
@@ -152,9 +152,11 @@ class TopKMoE(nn.Module):
         num_tokens = hidden_states.size(0) * hidden_states.size(1)
         if self.n_experts <= 2:
             return "dense"
-        if self.n_experts <= 4 and self.top_k * 2 >= self.n_experts and num_tokens >= 128:
+        if self.n_experts <= 4 and num_tokens >= 128:
             return "dense"
-        if hidden_states.is_cuda and self.n_experts <= 8 and self.top_k * 2 >= self.n_experts and num_tokens >= 256:
+        if hidden_states.is_cuda and self.n_experts <= 8 and num_tokens >= 256:
+            return "dense"
+        if self.n_experts <= 8 and self.top_k * 2 >= self.n_experts and num_tokens >= 512:
             return "dense"
         return "sparse"
 
