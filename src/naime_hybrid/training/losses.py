@@ -1,15 +1,12 @@
 import torch
-import torch.nn.functional as F
+
+from naime_hybrid.kernels import cross_entropy_loss
 
 IGNORE_INDEX = -100
 
 
-def lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    return F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)).float(),
-        labels.reshape(-1),
-        ignore_index=IGNORE_INDEX,
-    )
+def lm_loss(logits: torch.Tensor, labels: torch.Tensor, backend: str = "auto") -> torch.Tensor:
+    return cross_entropy_loss(logits, labels, ignore_index=IGNORE_INDEX, backend=backend)
 
 
 def _select_alpha(
@@ -39,8 +36,9 @@ def collect_aux_losses(
     target_sparsity: float,
     sparse_alpha: str = "alpha",
     alpha_cap: float = 0.0,
+    default_device: torch.device | None = None,
 ) -> dict[str, torch.Tensor]:
-    device = None
+    device = default_device
     load_losses = []
     sparse_losses = []
     kl_losses = []

@@ -775,12 +775,13 @@ def main() -> None:
 
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                     out = model(input_ids, attention_mask=attention_mask, infer_pad_mask=infer_pad_mask)
-                    main_loss = lm_loss(out["logits"], labels)
+                    main_loss = lm_loss(out["logits"], labels, backend=config.lm_loss_backend)
                     aux = collect_aux_losses(
                         out.get("aux", []),
                         config.model.target_sparsity,
                         sparse_alpha=config.model.semantic_sparse_alpha,
                         alpha_cap=config.model.semantic_router_alpha_cap,
+                        default_device=device,
                     )
 
                     # Fixed auxiliary weights keep the objective explicit. The

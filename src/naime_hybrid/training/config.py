@@ -50,6 +50,7 @@ class TrainConfig:
     structural_stop_warmup_steps: int = 1000
     keep_last_n: int = 2
     grad_accum_steps: int = 1
+    lm_loss_backend: str = "auto"
 
     learning_rate: float = 3e-4
     weight_decay: float = 0.01

@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument(
+        "--lm-loss-backend",
+        default="auto",
+        choices=["auto", "torch", "triton_ce"],
+        help="LM cross-entropy backend. auto uses safe accelerated kernels when available.",
+    )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -468,6 +474,7 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         structural_stop_warmup_steps=args.structural_stop_warmup_steps,
         keep_last_n=args.keep_last_n,
         grad_accum_steps=args.grad_accum_steps,
+        lm_loss_backend=args.lm_loss_backend,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,

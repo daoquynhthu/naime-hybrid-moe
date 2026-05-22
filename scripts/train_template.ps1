@@ -31,6 +31,8 @@ param(
     [int]$MetricsFlushEvery = -1,
     [int]$MetricsFsyncEvery = -1,
     [int]$NumWorkers = -1,
+    [ValidateSet("", "auto", "torch", "triton_ce")]
+    [string]$LmLossBackend = "",
     [double]$SemanticStateWriteScale = -1.0,
     [double]$SemanticMemoryHiddenScale = -1.0,
     [double]$SemanticGateMixerMaxStateWeight = -1.0,
@@ -166,6 +168,7 @@ Add-Override $params "LatestEvery" $LatestEvery { $LatestEvery -ge 0 }
 Add-Override $params "MetricsFlushEvery" $MetricsFlushEvery { $MetricsFlushEvery -gt 0 }
 Add-Override $params "MetricsFsyncEvery" $MetricsFsyncEvery { $MetricsFsyncEvery -ge 0 }
 Add-Override $params "NumWorkers" $NumWorkers { $NumWorkers -ge 0 }
+Add-Override $params "LmLossBackend" $LmLossBackend { -not [string]::IsNullOrWhiteSpace($LmLossBackend) }
 Add-Override $params "SemanticStateWriteScale" $SemanticStateWriteScale { $SemanticStateWriteScale -gt 0.0 }
 Add-Override $params "SemanticMemoryHiddenScale" $SemanticMemoryHiddenScale { $SemanticMemoryHiddenScale -gt 0.0 }
 Add-Override $params "SemanticGateMixerMaxStateWeight" $SemanticGateMixerMaxStateWeight { $SemanticGateMixerMaxStateWeight -gt 0.0 }

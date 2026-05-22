@@ -33,6 +33,8 @@ param(
     [switch]$NoAdaptiveDefaults,
     [int]$NumWorkers = 4,
     [int]$GradAccumSteps = 1,
+    [ValidateSet("auto", "torch", "triton_ce")]
+    [string]$LmLossBackend = "auto",
     [double]$LearningRate = 0.0003,
     [int]$WarmupSteps = 100,
     [double]$MinLrRatio = 0.1,
@@ -199,6 +201,7 @@ $common = @(
     "--batch-size", "$BatchSize",
     "--num-workers", "$NumWorkers",
     "--grad-accum-steps", "$GradAccumSteps",
+    "--lm-loss-backend", "$LmLossBackend",
     "--learning-rate", "$LearningRate",
     "--warmup-steps", "$WarmupSteps",
     "--min-lr-ratio", "$MinLrRatio",
