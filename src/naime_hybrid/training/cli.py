@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lm-loss-backend",
         default="auto",
-        choices=["auto", "torch", "triton_ce"],
+        choices=["auto", "torch", "triton_ce", "cuda_ext_fused_ce"],
         help="LM cross-entropy backend. auto uses safe accelerated kernels when available.",
     )
     parser.add_argument("--learning-rate", type=float, default=3e-4)

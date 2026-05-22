@@ -33,7 +33,7 @@ param(
     [switch]$NoAdaptiveDefaults,
     [int]$NumWorkers = 4,
     [int]$GradAccumSteps = 1,
-    [ValidateSet("auto", "torch", "triton_ce")]
+    [ValidateSet("auto", "torch", "triton_ce", "cuda_ext_fused_ce")]
     [string]$LmLossBackend = "auto",
     [double]$LearningRate = 0.0003,
     [int]$WarmupSteps = 100,

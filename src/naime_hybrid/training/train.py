@@ -29,7 +29,7 @@ from .checkpoint_policy import save_checkpoint_pair
 from .cli import build_train_config, parse_args
 from .control import effective_kl_lambda, load_reference_curve, reference_value_at_step
 from .logging_utils import JsonlMetricLogger, metrics_jsonl_to_csv, setup_logger
-from .losses import collect_aux_losses, lm_loss
+from .losses import collect_aux_losses, fused_lm_loss, lm_loss
 from .masks import prepare_attention_mask_for_device
 from .prefetch import AsyncPrefetcher
 from .progress import TrainingProgress
@@ -199,6 +199,14 @@ def _set_optimizer_base_lr(optimizer: torch.optim.Optimizer, scheduler, base_lr:
     if hasattr(scheduler, "base_lrs"):
         scheduler.base_lrs = [base_lr for _ in scheduler.optimizer.param_groups]
     scheduler._last_lr = [base_lr for _ in optimizer.param_groups]
+
+
+def _lm_head_weight(model: torch.nn.Module) -> torch.Tensor:
+    native_model = getattr(model, "_orig_mod", model)
+    lm_head = getattr(native_model, "lm_head", None)
+    if lm_head is None:
+        raise RuntimeError("fused LM loss backend requires model.lm_head")
+    return lm_head.weight
 
 
 def _apply_lr_safety_factor(optimizer, scheduler, factor: float) -> float:
@@ -420,6 +428,11 @@ def main() -> None:
         _configure_matmul_precision(logger)
         _configure_cuda_attention_backends(config, logger)
     logger.info("device=%s cuda=%s", device, device.type == "cuda")
+    if config.lm_loss_backend == "cuda_ext_fused_ce":
+        logger.warning(
+            "lm_loss_backend=cuda_ext_fused_ce is experimental: native forward is validated, "
+            "but backward currently recomputes with PyTorch and may be slower than backend=auto"
+        )
 
     # Phase 2: CUDA auto-batch probe (this will fail if DataLoader workers
     # are first spawned after CUDA context initialization.  On Windows we
@@ -774,8 +787,22 @@ def main() -> None:
                 )
 
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                    out = model(input_ids, attention_mask=attention_mask, infer_pad_mask=infer_pad_mask)
-                    main_loss = lm_loss(out["logits"], labels, backend=config.lm_loss_backend)
+                    use_fused_lm = config.lm_loss_backend == "cuda_ext_fused_ce"
+                    out = model(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        infer_pad_mask=infer_pad_mask,
+                        return_logits=not use_fused_lm,
+                    )
+                    if use_fused_lm:
+                        main_loss = fused_lm_loss(
+                            out["hidden_states"],
+                            _lm_head_weight(model),
+                            labels,
+                            backend=config.lm_loss_backend,
+                        )
+                    else:
+                        main_loss = lm_loss(out["logits"], labels, backend=config.lm_loss_backend)
                     aux = collect_aux_losses(
                         out.get("aux", []),
                         config.model.target_sparsity,

@@ -31,7 +31,7 @@ param(
     [int]$MetricsFlushEvery = -1,
     [int]$MetricsFsyncEvery = -1,
     [int]$NumWorkers = -1,
-    [ValidateSet("", "auto", "torch", "triton_ce")]
+    [ValidateSet("", "auto", "torch", "triton_ce", "cuda_ext_fused_ce")]
     [string]$LmLossBackend = "",
     [double]$SemanticStateWriteScale = -1.0,
     [double]$SemanticMemoryHiddenScale = -1.0,

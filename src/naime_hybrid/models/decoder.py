@@ -59,6 +59,7 @@ class NAIMEStateMoEDecoder(nn.Module):
         attention_mask: torch.Tensor | None = None,
         tau: float | None = None,
         return_aux: bool = True,
+        return_logits: bool = True,
         infer_pad_mask: bool | None = None,
     ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
         attention_mask = _resolve_attention_mask(input_ids, attention_mask, self.config, infer_pad_mask)
@@ -74,11 +75,11 @@ class NAIMEStateMoEDecoder(nn.Module):
                 aux_by_layer.append(aux)
 
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
         output: dict[str, torch.Tensor | list[dict[str, torch.Tensor]]] = {
-            "logits": logits,
             "hidden_states": hidden_states,
         }
+        if return_logits:
+            output["logits"] = self.lm_head(hidden_states)
         if return_aux:
             output["aux"] = aux_by_layer
         return output
@@ -126,6 +127,7 @@ class NAIMEV4StateMoEDecoder(nn.Module):
         attention_mask: torch.Tensor | None = None,
         tau: float | None = None,
         return_aux: bool = True,
+        return_logits: bool = True,
         infer_pad_mask: bool | None = None,
     ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
         attention_mask = _resolve_attention_mask(input_ids, attention_mask, self.config, infer_pad_mask)
@@ -164,11 +166,11 @@ class NAIMEV4StateMoEDecoder(nn.Module):
                 aux_by_layer.append(aux)
 
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
         output: dict[str, torch.Tensor | list[dict[str, torch.Tensor]]] = {
-            "logits": logits,
             "hidden_states": hidden_states,
         }
+        if return_logits:
+            output["logits"] = self.lm_head(hidden_states)
         if return_aux:
             output["aux"] = aux_by_layer
         return output
@@ -214,6 +216,7 @@ class NAIMEV5WorldStateMoEDecoder(NAIMEV4StateMoEDecoder):
         attention_mask: torch.Tensor | None = None,
         tau: float | None = None,
         return_aux: bool = True,
+        return_logits: bool = True,
         infer_pad_mask: bool | None = None,
     ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
         attention_mask = _resolve_attention_mask(input_ids, attention_mask, self.config, infer_pad_mask)
@@ -239,15 +242,15 @@ class NAIMEV5WorldStateMoEDecoder(NAIMEV4StateMoEDecoder):
                 aux_by_layer.append(aux)
 
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
         public_world_state = (
             world_state[:, -1, :, :] if world_state is not None and world_state.ndim == 4 else world_state
         )
         output: dict[str, torch.Tensor | list[dict[str, torch.Tensor]]] = {
-            "logits": logits,
             "hidden_states": hidden_states,
             "world_state": public_world_state,
         }
+        if return_logits:
+            output["logits"] = self.lm_head(hidden_states)
         if return_aux:
             output["aux"] = aux_by_layer
         return output
@@ -290,6 +293,7 @@ class NAIMEV6RecursiveSelfMoEDecoder(NAIMEV5WorldStateMoEDecoder):
         attention_mask: torch.Tensor | None = None,
         tau: float | None = None,
         return_aux: bool = True,
+        return_logits: bool = True,
         infer_pad_mask: bool | None = None,
     ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
         attention_mask = _resolve_attention_mask(input_ids, attention_mask, self.config, infer_pad_mask)
@@ -325,17 +329,17 @@ class NAIMEV6RecursiveSelfMoEDecoder(NAIMEV5WorldStateMoEDecoder):
                 aux_by_layer.append(aux)
 
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
         public_world_state = (
             world_state[:, -1, :, :] if world_state is not None and world_state.ndim == 4 else world_state
         )
         public_self_state = self_state[:, -1, :, :] if self_state is not None and self_state.ndim == 4 else self_state
         output: dict[str, torch.Tensor | list[dict[str, torch.Tensor]]] = {
-            "logits": logits,
             "hidden_states": hidden_states,
             "world_state": public_world_state,
             "self_state": public_self_state,
         }
+        if return_logits:
+            output["logits"] = self.lm_head(hidden_states)
         if return_aux:
             output["aux"] = aux_by_layer
         return output
@@ -359,6 +363,7 @@ class DenseDecoder(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         return_aux: bool = True,
+        return_logits: bool = True,
         infer_pad_mask: bool | None = None,
         **_: object,
     ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
@@ -372,11 +377,11 @@ class DenseDecoder(nn.Module):
                 aux_by_layer.append(aux)
 
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
         output: dict[str, torch.Tensor | list[dict[str, torch.Tensor]]] = {
-            "logits": logits,
             "hidden_states": hidden_states,
         }
+        if return_logits:
+            output["logits"] = self.lm_head(hidden_states)
         if return_aux:
             output["aux"] = aux_by_layer
         return output
@@ -405,6 +410,7 @@ class TokenMoEDecoder(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         return_aux: bool = True,
+        return_logits: bool = True,
         infer_pad_mask: bool | None = None,
         **_: object,
     ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
@@ -418,11 +424,11 @@ class TokenMoEDecoder(nn.Module):
                 aux_by_layer.append(aux)
 
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
         output: dict[str, torch.Tensor | list[dict[str, torch.Tensor]]] = {
-            "logits": logits,
             "hidden_states": hidden_states,
         }
+        if return_logits:
+            output["logits"] = self.lm_head(hidden_states)
         if return_aux:
             output["aux"] = aux_by_layer
         return output

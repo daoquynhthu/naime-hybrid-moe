@@ -1,12 +1,27 @@
 import torch
 
-from naime_hybrid.kernels import cross_entropy_loss
+from naime_hybrid.kernels import cross_entropy_loss, fused_lm_cross_entropy_loss
 
 IGNORE_INDEX = -100
 
 
 def lm_loss(logits: torch.Tensor, labels: torch.Tensor, backend: str = "auto") -> torch.Tensor:
     return cross_entropy_loss(logits, labels, ignore_index=IGNORE_INDEX, backend=backend)
+
+
+def fused_lm_loss(
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    labels: torch.Tensor,
+    backend: str = "auto",
+) -> torch.Tensor:
+    return fused_lm_cross_entropy_loss(
+        hidden_states,
+        lm_head_weight,
+        labels,
+        ignore_index=IGNORE_INDEX,
+        backend=backend,
+    )
 
 
 def _select_alpha(
