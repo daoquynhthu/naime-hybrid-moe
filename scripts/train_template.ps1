@@ -26,6 +26,8 @@ param(
     [int]$AutoBatchMax = -1,
     [int]$EvalEvery = -1,
     [int]$EvalMaxBatches = -1,
+    [switch]$EvalStateCarry,
+    [switch]$EvalLatentThoughtGain,
     [int]$SaveEvery = -1,
     [int]$LatestEvery = -1,
     [int]$MetricsFlushEvery = -1,
@@ -39,6 +41,15 @@ param(
     [double]$WorldRouterMaxRatio = -1.0,
     [double]$SelfStateWorldGateMin = -1.0,
     [double]$SelfStateWorldGateScale = -1.0,
+    [int]$LatentThoughtSteps = -1,
+    [ValidateSet("", "state_only", "final_hidden")]
+    [string]$LatentThoughtWriteMode = "",
+    [double]$LatentThoughtHiddenScale = -1.0,
+    [int]$StateEvolutionSteps = -1,
+    [switch]$NoStateEvolutionMemory,
+    [switch]$LatentFieldCoupling,
+    [double]$LatentFieldTokenScale = -1.0,
+    [double]$LatentFieldMaxRatio = -1.0,
     [string]$Device = "",
     [int]$MaxSteps = -1,
     [switch]$NoAutoBatch,
@@ -163,6 +174,12 @@ Add-Override $params "VramFraction" $VramFraction { $VramFraction -gt 0.0 }
 Add-Override $params "AutoBatchMax" $AutoBatchMax { $AutoBatchMax -gt 0 }
 Add-Override $params "EvalEvery" $EvalEvery { $EvalEvery -ge 0 }
 Add-Override $params "EvalMaxBatches" $EvalMaxBatches { $EvalMaxBatches -ge 0 }
+if ($EvalStateCarry) {
+    $params["EvalStateCarry"] = $true
+}
+if ($EvalLatentThoughtGain) {
+    $params["EvalLatentThoughtGain"] = $true
+}
 Add-Override $params "SaveEvery" $SaveEvery { $SaveEvery -ge 0 }
 Add-Override $params "LatestEvery" $LatestEvery { $LatestEvery -ge 0 }
 Add-Override $params "MetricsFlushEvery" $MetricsFlushEvery { $MetricsFlushEvery -gt 0 }
@@ -175,6 +192,18 @@ Add-Override $params "SemanticGateMixerMaxStateWeight" $SemanticGateMixerMaxStat
 Add-Override $params "WorldRouterMaxRatio" $WorldRouterMaxRatio { $WorldRouterMaxRatio -gt 0.0 }
 Add-Override $params "SelfStateWorldGateMin" $SelfStateWorldGateMin { $SelfStateWorldGateMin -ge 0.0 }
 Add-Override $params "SelfStateWorldGateScale" $SelfStateWorldGateScale { $SelfStateWorldGateScale -gt 0.0 }
+Add-Override $params "LatentThoughtSteps" $LatentThoughtSteps { $LatentThoughtSteps -ge 0 }
+Add-Override $params "LatentThoughtWriteMode" $LatentThoughtWriteMode { -not [string]::IsNullOrWhiteSpace($LatentThoughtWriteMode) }
+Add-Override $params "LatentThoughtHiddenScale" $LatentThoughtHiddenScale { $LatentThoughtHiddenScale -ge 0.0 }
+Add-Override $params "StateEvolutionSteps" $StateEvolutionSteps { $StateEvolutionSteps -ge 0 }
+if ($NoStateEvolutionMemory) {
+    $params["NoStateEvolutionMemory"] = $true
+}
+if ($LatentFieldCoupling) {
+    $params["LatentFieldCoupling"] = $true
+}
+Add-Override $params "LatentFieldTokenScale" $LatentFieldTokenScale { $LatentFieldTokenScale -ge 0.0 }
+Add-Override $params "LatentFieldMaxRatio" $LatentFieldMaxRatio { $LatentFieldMaxRatio -gt 0.0 }
 Add-Override $params "Device" $Device { -not [string]::IsNullOrWhiteSpace($Device) }
 Add-Override $params "MaxSteps" $MaxSteps { $MaxSteps -gt 0 }
 
@@ -201,6 +230,10 @@ $switchNames = @(
     "NoAmp",
     "AsyncLatest",
     "SyncLatest",
+    "EvalStateCarry",
+    "EvalLatentThoughtGain",
+    "NoStateEvolutionMemory",
+    "LatentFieldCoupling",
     "ResumeAllowFailed",
     "AllowLegacyResume",
     "SemanticRouterPriorGate",

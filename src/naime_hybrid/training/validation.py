@@ -9,6 +9,111 @@ from .masks import prepare_attention_mask_for_device
 from .losses import IGNORE_INDEX, collect_aux_losses, lm_loss
 
 
+def _supports_state_packet(model: torch.nn.Module) -> bool:
+    native_model = getattr(model, "_orig_mod", model)
+    return hasattr(native_model, "_initial_world_state")
+
+
+def _native_model(model: torch.nn.Module) -> torch.nn.Module:
+    return getattr(model, "_orig_mod", model)
+
+
+def _estimate_state_carry_gain(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    infer_pad_mask: bool | None,
+    use_amp: bool,
+) -> tuple[float, float, float] | None:
+    if not _supports_state_packet(model) or input_ids.size(1) < 4:
+        return None
+
+    split = input_ids.size(1) // 2
+    first_ids = input_ids[:, :split]
+    second_ids = input_ids[:, split:]
+    second_labels = labels[:, split:]
+    if second_labels.ne(IGNORE_INDEX).sum().item() == 0:
+        return None
+
+    first_mask = attention_mask[:, :split] if attention_mask is not None else None
+    second_mask = attention_mask[:, split:] if attention_mask is not None else None
+    device_type = input_ids.device.type
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
+        first_out = model(
+            first_ids,
+            attention_mask=first_mask,
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            return_logits=False,
+            return_state=True,
+        )
+        packet = first_out.get("state_packet")
+        if packet is None:
+            return None
+        stateful_out = model(
+            second_ids,
+            attention_mask=second_mask,
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            past_state=packet,
+        )
+        fresh_out = model(
+            second_ids,
+            attention_mask=second_mask,
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+        )
+        stateful_loss = lm_loss(stateful_out["logits"], second_labels)
+        fresh_loss = lm_loss(fresh_out["logits"], second_labels)
+    stateful = float(stateful_loss.detach().cpu())
+    fresh = float(fresh_loss.detach().cpu())
+    return fresh - stateful, stateful, fresh
+
+
+def _estimate_latent_thought_gain(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    infer_pad_mask: bool | None,
+    use_amp: bool,
+) -> tuple[float, float, float] | None:
+    native_model = _native_model(model)
+    self_state_slots = getattr(native_model, "self_state_slots", None)
+    if self_state_slots is None or getattr(self_state_slots, "latent_thought_steps", 0) <= 0:
+        return None
+    if labels.ne(IGNORE_INDEX).sum().item() == 0:
+        return None
+
+    device_type = input_ids.device.type
+    original_steps = self_state_slots.latent_thought_steps
+    try:
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
+            thought_out = model(
+                input_ids,
+                attention_mask=attention_mask,
+                infer_pad_mask=infer_pad_mask,
+                return_aux=False,
+            )
+            thought_loss = lm_loss(thought_out["logits"], labels)
+        self_state_slots.latent_thought_steps = 0
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
+            no_thought_out = model(
+                input_ids,
+                attention_mask=attention_mask,
+                infer_pad_mask=infer_pad_mask,
+                return_aux=False,
+            )
+            no_thought_loss = lm_loss(no_thought_out["logits"], labels)
+    finally:
+        self_state_slots.latent_thought_steps = original_steps
+
+    thought = float(thought_loss.detach().cpu())
+    no_thought = float(no_thought_loss.detach().cpu())
+    return no_thought - thought, thought, no_thought
+
+
 def evaluate_model(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -25,6 +130,8 @@ def evaluate_model(
     lambda_slot_stability: float = 0.0,
     lambda_self_pred: float = 0.0,
     lambda_self_slot_diversity: float = 0.0,
+    state_carry: bool = False,
+    latent_thought_gain: bool = False,
 ) -> dict[str, float]:
     was_training = model.training
     model.eval()
@@ -106,9 +213,31 @@ def evaluate_model(
             "v6_boundary_world",
             "v6_boundary_other",
             "v6_boundary_unknown",
+            "v6_latent_thought_delta",
+            "v6_latent_thought_velocity",
+            "v6_latent_thought_write_norm",
+            "v6_latent_thought_steps",
+            "v6_state_evolution_delta",
+            "v6_state_evolution_world_delta",
+            "v6_state_evolution_self_delta",
+            "v6_state_evolution_memory_delta",
+            "v6_state_evolution_steps",
+            "v6_latent_field_token_delta_norm",
+            "v6_latent_field_token_delta_ratio",
+            "v6_latent_field_read_entropy",
+            "v6_latent_field_read_max",
+            "v6_latent_field_gate",
+            "state_carry_gain_lm",
+            "state_carry_stateful_lm",
+            "state_carry_fresh_lm",
+            "latent_thought_gain_lm",
+            "latent_thought_lm",
+            "latent_thought_disabled_lm",
         ]
     }
     batches = 0
+    state_carry_batches = 0
+    latent_thought_gain_batches = 0
     tokens = 0
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
@@ -204,6 +333,54 @@ def evaluate_model(
             totals["v6_boundary_world"] += float(aux["v6_boundary_world"].detach().cpu())
             totals["v6_boundary_other"] += float(aux["v6_boundary_other"].detach().cpu())
             totals["v6_boundary_unknown"] += float(aux["v6_boundary_unknown"].detach().cpu())
+            totals["v6_latent_thought_delta"] += float(aux["v6_latent_thought_delta"].detach().cpu())
+            totals["v6_latent_thought_velocity"] += float(aux["v6_latent_thought_velocity"].detach().cpu())
+            totals["v6_latent_thought_write_norm"] += float(aux["v6_latent_thought_write_norm"].detach().cpu())
+            totals["v6_latent_thought_steps"] += float(aux["v6_latent_thought_steps"].detach().cpu())
+            totals["v6_state_evolution_delta"] += float(aux["v6_state_evolution_delta"].detach().cpu())
+            totals["v6_state_evolution_world_delta"] += float(aux["v6_state_evolution_world_delta"].detach().cpu())
+            totals["v6_state_evolution_self_delta"] += float(aux["v6_state_evolution_self_delta"].detach().cpu())
+            totals["v6_state_evolution_memory_delta"] += float(aux["v6_state_evolution_memory_delta"].detach().cpu())
+            totals["v6_state_evolution_steps"] += float(aux["v6_state_evolution_steps"].detach().cpu())
+            totals["v6_latent_field_token_delta_norm"] += float(
+                aux["v6_latent_field_token_delta_norm"].detach().cpu()
+            )
+            totals["v6_latent_field_token_delta_ratio"] += float(
+                aux["v6_latent_field_token_delta_ratio"].detach().cpu()
+            )
+            totals["v6_latent_field_read_entropy"] += float(aux["v6_latent_field_read_entropy"].detach().cpu())
+            totals["v6_latent_field_read_max"] += float(aux["v6_latent_field_read_max"].detach().cpu())
+            totals["v6_latent_field_gate"] += float(aux["v6_latent_field_gate"].detach().cpu())
+            if state_carry:
+                carry = _estimate_state_carry_gain(
+                    model,
+                    input_ids,
+                    labels,
+                    attention_mask,
+                    infer_pad_mask,
+                    use_amp,
+                )
+                if carry is not None:
+                    gain, stateful_loss, fresh_loss = carry
+                    totals["state_carry_gain_lm"] += gain
+                    totals["state_carry_stateful_lm"] += stateful_loss
+                    totals["state_carry_fresh_lm"] += fresh_loss
+                    state_carry_batches += 1
+            if latent_thought_gain:
+                thought = _estimate_latent_thought_gain(
+                    model,
+                    input_ids,
+                    labels,
+                    attention_mask,
+                    infer_pad_mask,
+                    use_amp,
+                )
+                if thought is not None:
+                    gain, thought_loss, disabled_loss = thought
+                    totals["latent_thought_gain_lm"] += gain
+                    totals["latent_thought_lm"] += thought_loss
+                    totals["latent_thought_disabled_lm"] += disabled_loss
+                    latent_thought_gain_batches += 1
             tokens += int(labels.ne(IGNORE_INDEX).sum().item())
             batches += 1
 
@@ -332,6 +509,40 @@ def evaluate_model(
         "val_v6_boundary_world": totals["v6_boundary_world"] / batches,
         "val_v6_boundary_other": totals["v6_boundary_other"] / batches,
         "val_v6_boundary_unknown": totals["v6_boundary_unknown"] / batches,
+        "val_v6_latent_thought_delta": totals["v6_latent_thought_delta"] / batches,
+        "val_v6_latent_thought_velocity": totals["v6_latent_thought_velocity"] / batches,
+        "val_v6_latent_thought_write_norm": totals["v6_latent_thought_write_norm"] / batches,
+        "val_v6_latent_thought_steps": totals["v6_latent_thought_steps"] / batches,
+        "val_v6_state_evolution_delta": totals["v6_state_evolution_delta"] / batches,
+        "val_v6_state_evolution_world_delta": totals["v6_state_evolution_world_delta"] / batches,
+        "val_v6_state_evolution_self_delta": totals["v6_state_evolution_self_delta"] / batches,
+        "val_v6_state_evolution_memory_delta": totals["v6_state_evolution_memory_delta"] / batches,
+        "val_v6_state_evolution_steps": totals["v6_state_evolution_steps"] / batches,
+        "val_v6_latent_field_token_delta_norm": totals["v6_latent_field_token_delta_norm"] / batches,
+        "val_v6_latent_field_token_delta_ratio": totals["v6_latent_field_token_delta_ratio"] / batches,
+        "val_v6_latent_field_read_entropy": totals["v6_latent_field_read_entropy"] / batches,
+        "val_v6_latent_field_read_max": totals["v6_latent_field_read_max"] / batches,
+        "val_v6_latent_field_gate": totals["v6_latent_field_gate"] / batches,
+        "val_state_carry_gain_lm": totals["state_carry_gain_lm"] / state_carry_batches
+        if state_carry_batches
+        else 0.0,
+        "val_state_carry_stateful_lm": totals["state_carry_stateful_lm"] / state_carry_batches
+        if state_carry_batches
+        else 0.0,
+        "val_state_carry_fresh_lm": totals["state_carry_fresh_lm"] / state_carry_batches
+        if state_carry_batches
+        else 0.0,
+        "val_state_carry_batches": float(state_carry_batches),
+        "val_latent_thought_gain_lm": totals["latent_thought_gain_lm"] / latent_thought_gain_batches
+        if latent_thought_gain_batches
+        else 0.0,
+        "val_latent_thought_lm": totals["latent_thought_lm"] / latent_thought_gain_batches
+        if latent_thought_gain_batches
+        else 0.0,
+        "val_latent_thought_disabled_lm": totals["latent_thought_disabled_lm"] / latent_thought_gain_batches
+        if latent_thought_gain_batches
+        else 0.0,
+        "val_latent_thought_gain_batches": float(latent_thought_gain_batches),
         "val_batches": float(batches),
         "val_tokens": float(tokens),
     }

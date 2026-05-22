@@ -130,6 +130,16 @@ def parse_args() -> argparse.Namespace:
         "--eval-seed", type=int, default=4321, help="Seed for deterministic random validation sampling."
     )
     parser.add_argument(
+        "--eval-state-carry",
+        action="store_true",
+        help="During validation, estimate whether StatePacket carryover improves the next chunk LM loss.",
+    )
+    parser.add_argument(
+        "--eval-latent-thought-gain",
+        action="store_true",
+        help="During validation, estimate whether latent thought steps improve LM loss versus steps=0.",
+    )
+    parser.add_argument(
         "--early-stop-patience",
         type=int,
         default=0,
@@ -330,6 +340,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-self-state-world-gate", action="store_true")
     parser.add_argument("--self-state-world-gate-min", type=float, default=0.10)
     parser.add_argument("--self-state-world-gate-scale", type=float, default=1.0)
+    parser.add_argument("--latent-thought-steps", type=int, default=0)
+    parser.add_argument(
+        "--latent-thought-write-mode",
+        default="state_only",
+        choices=["state_only", "final_hidden"],
+        help=(
+            "Implicit latent thought write permission. state_only is the canonical "
+            "continuous-state path; final_hidden is an experimental side-channel probe."
+        ),
+    )
+    parser.add_argument("--latent-thought-hidden-scale", type=float, default=0.0)
+    parser.add_argument("--state-evolution-steps", type=int, default=0)
+    parser.add_argument("--no-state-evolution-memory", action="store_true")
+    parser.add_argument(
+        "--latent-field-coupling",
+        action="store_true",
+        help="Enable experimental token/slot field coupling side-channel. Disabled in canonical V6.5.",
+    )
+    parser.add_argument("--latent-field-token-scale", type=float, default=0.02)
+    parser.add_argument("--latent-field-max-ratio", type=float, default=0.05)
     parser.add_argument("--n-experts", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=2)
     parser.add_argument("--expert-hidden-dim", type=int, default=512)
@@ -424,6 +454,14 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         self_state_world_gate=not args.no_self_state_world_gate,
         self_state_world_gate_min=args.self_state_world_gate_min,
         self_state_world_gate_scale=args.self_state_world_gate_scale,
+        latent_thought_steps=args.latent_thought_steps,
+        latent_thought_write_mode=args.latent_thought_write_mode,
+        latent_thought_hidden_scale=args.latent_thought_hidden_scale,
+        state_evolution_steps=args.state_evolution_steps,
+        state_evolution_memory=not args.no_state_evolution_memory,
+        latent_field_coupling=args.latent_field_coupling,
+        latent_field_token_scale=args.latent_field_token_scale,
+        latent_field_max_ratio=args.latent_field_max_ratio,
         n_experts=args.n_experts,
         top_k=args.top_k,
         expert_hidden_dim=args.expert_hidden_dim,
@@ -462,6 +500,8 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         eval_max_batches=args.eval_max_batches,
         eval_sampling=args.eval_sampling,
         eval_seed=args.eval_seed,
+        eval_state_carry=args.eval_state_carry,
+        eval_latent_thought_gain=args.eval_latent_thought_gain,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
         early_stop_min_evals=args.early_stop_min_evals,

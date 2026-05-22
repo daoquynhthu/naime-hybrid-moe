@@ -38,6 +38,8 @@ class TrainConfig:
     eval_max_batches: int = 10
     eval_sampling: str = "random"
     eval_seed: int = 4321
+    eval_state_carry: bool = False
+    eval_latent_thought_gain: bool = False
     early_stop_patience: int = 0
     early_stop_min_delta: float = 0.0
     early_stop_min_evals: int = 0

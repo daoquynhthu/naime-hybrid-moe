@@ -9,6 +9,7 @@ from .blocks import (
     TokenMoEBlock,
 )
 from .gate import GumbelBlockGate
+from .latent_field import LatentFieldCoupler
 from .loss_balancer import LossBalancer
 from .moe import SemanticMoERouter, SwiGLUExpert, TopKMoE
 from .norm import RMSNorm
@@ -22,6 +23,7 @@ __all__ = [
     "DenseTransformerBlock",
     "GQAAttention",
     "GumbelBlockGate",
+    "LatentFieldCoupler",
     "LossBalancer",
     "MLAAttention",
     "NAIMEStateMoEBlock",

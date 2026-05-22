@@ -3,6 +3,7 @@
 from .config import BaselineConfig, NAIMEStateMoEConfig
 from .models import (
     DenseDecoder,
+    NAIMEStatePacket,
     NAIMEStateMoEDecoder,
     NAIMEV4StateMoEDecoder,
     NAIMEV5WorldStateMoEDecoder,
@@ -14,6 +15,7 @@ from .models import (
 __all__ = [
     "BaselineConfig",
     "DenseDecoder",
+    "NAIMEStatePacket",
     "NAIMEStateMoEConfig",
     "NAIMEStateMoEDecoder",
     "NAIMEV4StateMoEDecoder",

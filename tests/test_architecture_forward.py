@@ -1,3 +1,4 @@
+import math
 import warnings
 
 import pytest
@@ -5,6 +6,7 @@ import torch
 
 from naime_hybrid import (
     NAIMEStateMoEConfig,
+    NAIMEStatePacket,
     NAIMEStateMoEDecoder,
     NAIMEV4StateMoEDecoder,
     NAIMEV5WorldStateMoEDecoder,
@@ -25,6 +27,7 @@ from naime_hybrid.training.cli import build_train_config, parse_args
 from naime_hybrid.training.control import reference_value_at_step, update_sparse_lambda
 from naime_hybrid.training.losses import lm_loss
 from naime_hybrid.training.masks import prepare_attention_mask_for_device
+from naime_hybrid.training.validation import evaluate_model
 
 
 class _FakeCompiledWrapper(torch.nn.Module):
@@ -771,6 +774,434 @@ def test_v6_recursive_self_state_forward_and_backward():
 
     loss = out["logits"].float().mean() + v6_aux["self_pred"] + v6_aux["slot_diversity"] * 0.0
     loss.backward()
+
+
+def test_v6_state_packet_carries_compact_latent_state_across_chunks():
+    torch.manual_seed(2031)
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        max_seq_len=64,
+        d_model=32,
+        n_layers=3,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=3,
+        top_k=2,
+        expert_hidden_dim=48,
+        semantic_router_mode="hybrid",
+        semantic_scales="local_mid_global",
+        mid_stride=8,
+        mid_window=16,
+        use_global_semantic=True,
+        semantic_fusion="concat",
+        semantic_gate_downstream="clean_prob",
+        semantic_sparse_alpha="downstream",
+        semantic_memory_slots=2,
+        semantic_gate_mixer=True,
+        world_state_slots=4,
+        self_state_slots=3,
+        self_state_recursion_depth=2,
+    )
+    model = build_model("naime_v6_recursive_self_moe", config)
+    first = torch.randint(1, config.vocab_size, (2, 17))
+    second = torch.randint(1, config.vocab_size, (2, 19))
+
+    out_first = model(first, return_state=True)
+    packet = out_first["state_packet"]
+
+    assert isinstance(packet, NAIMEStatePacket)
+    assert packet.world_state is not None
+    assert packet.self_state is not None
+    assert packet.memory is not None
+    assert packet.world_state.ndim == 4
+    assert packet.self_state.ndim == 4
+    assert out_first["world_state"].shape == (2, config.world_state_slots, config.d_model)
+    assert out_first["self_state"].shape == (2, config.self_state_slots, config.d_model)
+
+    out_second = model(second, past_state=packet, return_state=True)
+    next_packet = out_second["state_packet"]
+
+    assert isinstance(next_packet, NAIMEStatePacket)
+    assert out_second["logits"].shape == (2, 19, config.vocab_size)
+    assert next_packet.world_state is not None
+    assert next_packet.self_state is not None
+    assert next_packet.memory is not None
+
+    loss = out_second["logits"].float().mean()
+    loss.backward()
+
+
+def test_state_packet_rejects_batch_mismatch():
+    packet = NAIMEStatePacket(world_state=torch.randn(3, 4, 8))
+
+    with pytest.raises(ValueError, match="world_state batch mismatch"):
+        packet.validate_batch(2)
+
+
+def test_v6_latent_thought_state_only_metrics_and_backward():
+    torch.manual_seed(2032)
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        max_seq_len=64,
+        d_model=32,
+        n_layers=3,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=3,
+        top_k=2,
+        expert_hidden_dim=48,
+        semantic_router_mode="hybrid",
+        semantic_scales="local_mid_global",
+        mid_stride=8,
+        mid_window=16,
+        use_global_semantic=True,
+        semantic_fusion="concat",
+        semantic_gate_downstream="clean_prob",
+        semantic_sparse_alpha="downstream",
+        semantic_memory_slots=2,
+        semantic_gate_mixer=True,
+        world_state_slots=4,
+        self_state_slots=3,
+        self_state_recursion_depth=1,
+        latent_thought_steps=2,
+        latent_thought_write_mode="state_only",
+    )
+    model = build_model("naime_v6_recursive_self_moe", config)
+    input_ids = torch.randint(1, config.vocab_size, (2, 31))
+
+    out = model(input_ids, return_state=True)
+    v6_aux = out["aux"][-1]["v6"]
+
+    assert v6_aux["latent_thought_steps"].item() == pytest.approx(2.0)
+    assert torch.isfinite(v6_aux["latent_thought_delta"])
+    assert torch.isfinite(v6_aux["latent_thought_velocity"])
+    assert v6_aux["latent_thought_write_norm"].item() == pytest.approx(0.0)
+
+    loss = out["logits"].float().mean() + v6_aux["latent_thought_delta"] * 0.0
+    loss.backward()
+
+
+def test_v6_latent_thought_final_hidden_is_causal_and_observable():
+    torch.manual_seed(2037)
+    config = NAIMEStateMoEConfig(
+        vocab_size=96,
+        max_seq_len=64,
+        d_model=32,
+        n_layers=3,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=3,
+        top_k=2,
+        expert_hidden_dim=48,
+        semantic_router_mode="hybrid",
+        semantic_scales="local_mid_global",
+        mid_stride=8,
+        mid_window=16,
+        use_global_semantic=True,
+        semantic_fusion="concat",
+        semantic_gate_downstream="clean_prob",
+        semantic_sparse_alpha="downstream",
+        semantic_memory_slots=2,
+        semantic_gate_mixer=True,
+        world_state_slots=4,
+        self_state_slots=3,
+        self_state_recursion_depth=1,
+        latent_thought_steps=2,
+        latent_thought_write_mode="final_hidden",
+        latent_thought_hidden_scale=0.01,
+    )
+    model = build_model("naime_v6_recursive_self_moe", config).eval()
+    input_ids = torch.randint(1, config.vocab_size, (2, 31))
+    changed = input_ids.clone()
+    cutoff = 12
+    changed[:, cutoff:] = torch.randint(1, config.vocab_size, changed[:, cutoff:].shape)
+
+    with torch.no_grad():
+        original = model(input_ids)
+        changed_out = model(changed)
+
+    v6_aux = original["aux"][-1]["v6"]
+    assert v6_aux["latent_thought_steps"].item() == pytest.approx(2.0)
+    assert v6_aux["latent_thought_write_norm"].item() > 0.0
+    assert torch.allclose(original["logits"][:, :cutoff, :], changed_out["logits"][:, :cutoff, :], atol=1e-5, rtol=1e-5)
+
+    train_out = model(input_ids)
+    loss = train_out["logits"].float().mean()
+    loss.backward()
+
+
+def test_v6_state_evolution_updates_persistent_packet_without_hidden_write():
+    torch.manual_seed(2034)
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        max_seq_len=64,
+        d_model=32,
+        n_layers=3,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=3,
+        top_k=2,
+        expert_hidden_dim=48,
+        semantic_router_mode="hybrid",
+        semantic_scales="local_mid_global",
+        mid_stride=8,
+        mid_window=16,
+        use_global_semantic=True,
+        semantic_fusion="concat",
+        semantic_gate_downstream="clean_prob",
+        semantic_sparse_alpha="downstream",
+        semantic_memory_slots=2,
+        semantic_gate_mixer=True,
+        world_state_slots=4,
+        self_state_slots=3,
+        self_state_recursion_depth=1,
+        state_evolution_steps=2,
+    )
+    model = build_model("naime_v6_recursive_self_moe", config)
+    input_ids = torch.randint(1, config.vocab_size, (2, 31))
+
+    out = model(input_ids, return_state=True)
+    packet = out["state_packet"]
+    v6_aux = out["aux"][-1]["v6"]
+
+    assert isinstance(packet, NAIMEStatePacket)
+    assert packet.world_state is not None
+    assert packet.self_state is not None
+    assert packet.world_state.ndim == 4
+    assert packet.self_state.ndim == 4
+    assert packet.world_state.size(1) > math.ceil(input_ids.size(1) / config.causal_state_stride)
+    assert packet.self_state.size(1) > math.ceil(input_ids.size(1) / config.causal_state_stride)
+    assert v6_aux["state_evolution_steps"].item() == pytest.approx(2.0)
+    assert torch.isfinite(v6_aux["state_evolution_delta"])
+    assert torch.isfinite(v6_aux["state_evolution_world_delta"])
+    assert torch.isfinite(v6_aux["state_evolution_self_delta"])
+    assert torch.isfinite(v6_aux["state_evolution_memory_delta"])
+
+    loss = out["logits"].float().mean() + v6_aux["state_evolution_delta"] * 0.0
+    loss.backward()
+
+
+def test_v6_latent_field_coupling_is_bounded_and_trainable():
+    torch.manual_seed(2035)
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        max_seq_len=64,
+        d_model=32,
+        n_layers=3,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=3,
+        top_k=2,
+        expert_hidden_dim=48,
+        semantic_router_mode="hybrid",
+        semantic_scales="local_mid_global",
+        mid_stride=8,
+        mid_window=16,
+        use_global_semantic=True,
+        semantic_fusion="concat",
+        semantic_gate_downstream="clean_prob",
+        semantic_sparse_alpha="downstream",
+        semantic_memory_slots=2,
+        semantic_gate_mixer=True,
+        world_state_slots=4,
+        self_state_slots=3,
+        self_state_recursion_depth=1,
+        latent_field_coupling=True,
+        latent_field_token_scale=0.02,
+        latent_field_max_ratio=0.05,
+    )
+    model = build_model("naime_v6_recursive_self_moe", config)
+    first = torch.randint(1, config.vocab_size, (2, 17))
+    second = torch.randint(1, config.vocab_size, (2, 19))
+
+    first_out = model(first, return_state=True)
+    second_out = model(second, past_state=first_out["state_packet"], return_state=True)
+    v6_aux = second_out["aux"][-1]["v6"]
+
+    assert second_out["logits"].shape == (2, 19, config.vocab_size)
+    assert torch.isfinite(v6_aux["latent_field_token_delta_norm"])
+    assert torch.isfinite(v6_aux["latent_field_token_delta_ratio"])
+    assert torch.isfinite(v6_aux["latent_field_read_entropy"])
+    assert v6_aux["latent_field_token_delta_ratio"].item() <= config.latent_field_max_ratio + 1e-4
+    assert v6_aux["latent_field_gate"].item() >= 0.0
+
+    loss = second_out["logits"].float().mean() + v6_aux["latent_field_token_delta_norm"] * 0.0
+    loss.backward()
+
+
+def test_v6_latent_field_coupling_preserves_causal_prefix():
+    torch.manual_seed(2036)
+    config = NAIMEStateMoEConfig(
+        vocab_size=96,
+        max_seq_len=64,
+        d_model=32,
+        n_layers=3,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=3,
+        top_k=2,
+        expert_hidden_dim=48,
+        semantic_router_mode="hybrid",
+        semantic_scales="local_mid_global",
+        mid_stride=8,
+        mid_window=16,
+        use_global_semantic=True,
+        semantic_fusion="concat",
+        semantic_gate_downstream="clean_prob",
+        semantic_sparse_alpha="downstream",
+        semantic_memory_slots=2,
+        semantic_gate_mixer=True,
+        world_state_slots=4,
+        self_state_slots=3,
+        self_state_recursion_depth=1,
+        latent_field_coupling=True,
+        latent_field_token_scale=0.02,
+        latent_field_max_ratio=0.05,
+    )
+    model = build_model("naime_v6_recursive_self_moe", config).eval()
+    input_ids = torch.randint(1, config.vocab_size, (2, 31))
+    changed = input_ids.clone()
+    cutoff = 12
+    changed[:, cutoff:] = torch.randint(1, config.vocab_size, changed[:, cutoff:].shape)
+
+    with torch.no_grad():
+        original_logits = model(input_ids)["logits"]
+        changed_logits = model(changed)["logits"]
+
+    assert torch.allclose(original_logits[:, :cutoff, :], changed_logits[:, :cutoff, :], atol=1e-5, rtol=1e-5)
+
+
+def test_evaluate_model_reports_state_carry_gain_metric():
+    torch.manual_seed(2033)
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        max_seq_len=32,
+        d_model=32,
+        n_layers=2,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=2,
+        top_k=1,
+        expert_hidden_dim=48,
+        semantic_memory_slots=2,
+        world_state_slots=3,
+        self_state_slots=3,
+    )
+    model = build_model("naime_v6_recursive_self_moe", config)
+    samples = []
+    for _ in range(2):
+        input_ids = torch.randint(1, config.vocab_size, (config.max_seq_len,))
+        samples.append(
+            {
+                "input_ids": input_ids,
+                "labels": input_ids.clone(),
+                "attention_mask": torch.ones(config.max_seq_len, dtype=torch.bool),
+            }
+        )
+    loader = torch.utils.data.DataLoader(samples, batch_size=2)
+
+    metrics = evaluate_model(
+        model,
+        loader,
+        config,
+        torch.device("cpu"),
+        use_amp=False,
+        max_batches=1,
+        state_carry=True,
+    )
+
+    assert metrics["val_state_carry_batches"] == 1.0
+    assert math.isfinite(metrics["val_state_carry_gain_lm"])
+    assert math.isfinite(metrics["val_state_carry_stateful_lm"])
+    assert math.isfinite(metrics["val_state_carry_fresh_lm"])
+
+
+def test_evaluate_model_reports_latent_thought_gain_metric():
+    torch.manual_seed(2038)
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        max_seq_len=32,
+        d_model=32,
+        n_layers=2,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=2,
+        top_k=1,
+        expert_hidden_dim=48,
+        semantic_memory_slots=2,
+        world_state_slots=3,
+        self_state_slots=3,
+        latent_thought_steps=1,
+        latent_thought_write_mode="final_hidden",
+        latent_thought_hidden_scale=0.01,
+    )
+    model = build_model("naime_v6_recursive_self_moe", config)
+    samples = []
+    for _ in range(2):
+        input_ids = torch.randint(1, config.vocab_size, (config.max_seq_len,))
+        samples.append(
+            {
+                "input_ids": input_ids,
+                "labels": input_ids.clone(),
+                "attention_mask": torch.ones(config.max_seq_len, dtype=torch.bool),
+            }
+        )
+    loader = torch.utils.data.DataLoader(samples, batch_size=2)
+
+    metrics = evaluate_model(
+        model,
+        loader,
+        config,
+        torch.device("cpu"),
+        use_amp=False,
+        max_batches=1,
+        latent_thought_gain=True,
+    )
+
+    assert metrics["val_latent_thought_gain_batches"] == 1.0
+    assert math.isfinite(metrics["val_latent_thought_gain_lm"])
+    assert math.isfinite(metrics["val_latent_thought_lm"])
+    assert math.isfinite(metrics["val_latent_thought_disabled_lm"])
 
 
 def test_topk_moe_sparse_dispatch_matches_dense_dispatch():

@@ -136,6 +136,20 @@ def collect_aux_losses(
     v6_boundary_unknowns = []
     v6_history_self_norms = []
     v6_history_world_norms = []
+    v6_latent_thought_deltas = []
+    v6_latent_thought_velocities = []
+    v6_latent_thought_write_norms = []
+    v6_latent_thought_steps = []
+    v6_state_evolution_deltas = []
+    v6_state_evolution_world_deltas = []
+    v6_state_evolution_self_deltas = []
+    v6_state_evolution_memory_deltas = []
+    v6_state_evolution_steps = []
+    v6_latent_field_token_delta_norms = []
+    v6_latent_field_token_delta_ratios = []
+    v6_latent_field_read_entropies = []
+    v6_latent_field_read_maxes = []
+    v6_latent_field_gates = []
     dispatch_denses = []
 
     for layer_aux in aux_by_layer:
@@ -334,6 +348,34 @@ def collect_aux_losses(
                 v6_history_self_norms.append(v6["history_self_norm"].float())
             if "history_world_norm" in v6:
                 v6_history_world_norms.append(v6["history_world_norm"].float())
+            if "latent_thought_delta" in v6:
+                v6_latent_thought_deltas.append(v6["latent_thought_delta"].float())
+            if "latent_thought_velocity" in v6:
+                v6_latent_thought_velocities.append(v6["latent_thought_velocity"].float())
+            if "latent_thought_write_norm" in v6:
+                v6_latent_thought_write_norms.append(v6["latent_thought_write_norm"].float())
+            if "latent_thought_steps" in v6:
+                v6_latent_thought_steps.append(v6["latent_thought_steps"].float())
+            if "state_evolution_delta" in v6:
+                v6_state_evolution_deltas.append(v6["state_evolution_delta"].float())
+            if "state_evolution_world_delta" in v6:
+                v6_state_evolution_world_deltas.append(v6["state_evolution_world_delta"].float())
+            if "state_evolution_self_delta" in v6:
+                v6_state_evolution_self_deltas.append(v6["state_evolution_self_delta"].float())
+            if "state_evolution_memory_delta" in v6:
+                v6_state_evolution_memory_deltas.append(v6["state_evolution_memory_delta"].float())
+            if "state_evolution_steps" in v6:
+                v6_state_evolution_steps.append(v6["state_evolution_steps"].float())
+            if "latent_field_token_delta_norm" in v6:
+                v6_latent_field_token_delta_norms.append(v6["latent_field_token_delta_norm"].float())
+            if "latent_field_token_delta_ratio" in v6:
+                v6_latent_field_token_delta_ratios.append(v6["latent_field_token_delta_ratio"].float())
+            if "latent_field_read_entropy" in v6:
+                v6_latent_field_read_entropies.append(v6["latent_field_read_entropy"].float())
+            if "latent_field_read_max" in v6:
+                v6_latent_field_read_maxes.append(v6["latent_field_read_max"].float())
+            if "latent_field_gate" in v6:
+                v6_latent_field_gates.append(v6["latent_field_gate"].float())
             for value in v6.values():
                 if torch.is_tensor(value):
                     device = value.device
@@ -438,5 +480,41 @@ def collect_aux_losses(
         "v6_boundary_unknown": torch.stack(v6_boundary_unknowns).mean() if v6_boundary_unknowns else zero,
         "v6_history_self_norm": torch.stack(v6_history_self_norms).mean() if v6_history_self_norms else zero,
         "v6_history_world_norm": torch.stack(v6_history_world_norms).mean() if v6_history_world_norms else zero,
+        "v6_latent_thought_delta": torch.stack(v6_latent_thought_deltas).mean()
+        if v6_latent_thought_deltas
+        else zero,
+        "v6_latent_thought_velocity": torch.stack(v6_latent_thought_velocities).mean()
+        if v6_latent_thought_velocities
+        else zero,
+        "v6_latent_thought_write_norm": torch.stack(v6_latent_thought_write_norms).mean()
+        if v6_latent_thought_write_norms
+        else zero,
+        "v6_latent_thought_steps": torch.stack(v6_latent_thought_steps).mean() if v6_latent_thought_steps else zero,
+        "v6_state_evolution_delta": torch.stack(v6_state_evolution_deltas).mean()
+        if v6_state_evolution_deltas
+        else zero,
+        "v6_state_evolution_world_delta": torch.stack(v6_state_evolution_world_deltas).mean()
+        if v6_state_evolution_world_deltas
+        else zero,
+        "v6_state_evolution_self_delta": torch.stack(v6_state_evolution_self_deltas).mean()
+        if v6_state_evolution_self_deltas
+        else zero,
+        "v6_state_evolution_memory_delta": torch.stack(v6_state_evolution_memory_deltas).mean()
+        if v6_state_evolution_memory_deltas
+        else zero,
+        "v6_state_evolution_steps": torch.stack(v6_state_evolution_steps).mean() if v6_state_evolution_steps else zero,
+        "v6_latent_field_token_delta_norm": torch.stack(v6_latent_field_token_delta_norms).mean()
+        if v6_latent_field_token_delta_norms
+        else zero,
+        "v6_latent_field_token_delta_ratio": torch.stack(v6_latent_field_token_delta_ratios).mean()
+        if v6_latent_field_token_delta_ratios
+        else zero,
+        "v6_latent_field_read_entropy": torch.stack(v6_latent_field_read_entropies).mean()
+        if v6_latent_field_read_entropies
+        else zero,
+        "v6_latent_field_read_max": torch.stack(v6_latent_field_read_maxes).mean()
+        if v6_latent_field_read_maxes
+        else zero,
+        "v6_latent_field_gate": torch.stack(v6_latent_field_gates).mean() if v6_latent_field_gates else zero,
         "dispatch_dense": torch.stack(dispatch_denses).mean() if dispatch_denses else zero,
     }

@@ -9,9 +9,11 @@ from .decoder import (
     TokenMoEDecoder,
 )
 from .factory import build_model
+from .state_packet import NAIMEStatePacket
 
 __all__ = [
     "DenseDecoder",
+    "NAIMEStatePacket",
     "NAIMEStateMoEDecoder",
     "NAIMEV4StateMoEDecoder",
     "NAIMEV5WorldStateMoEDecoder",

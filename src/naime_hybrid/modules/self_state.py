@@ -29,6 +29,9 @@ class RecursiveSelfState(nn.Module):
         world_gate: bool = True,
         world_gate_min: float = 0.10,
         world_gate_scale: float = 1.0,
+        latent_thought_steps: int = 0,
+        latent_thought_write_mode: str = "state_only",
+        latent_thought_hidden_scale: float = 0.0,
     ) -> None:
         super().__init__()
         if slots <= 0:
@@ -47,6 +50,13 @@ class RecursiveSelfState(nn.Module):
         self.world_gate = world_gate
         self.world_gate_min = min(max(world_gate_min, 0.0), 1.0)
         self.world_gate_scale = max(world_gate_scale, 1e-6)
+        if latent_thought_steps < 0:
+            raise ValueError("latent_thought_steps must be non-negative")
+        if latent_thought_write_mode not in {"state_only", "final_hidden"}:
+            raise ValueError("latent_thought_write_mode must be state_only or final_hidden")
+        self.latent_thought_steps = latent_thought_steps
+        self.latent_thought_write_mode = latent_thought_write_mode
+        self.latent_thought_hidden_scale = max(latent_thought_hidden_scale, 0.0)
 
         self.initial = nn.Parameter(torch.zeros(slots, d_model))
         self.slot_identity = nn.Parameter(torch.zeros(slots, d_model))
@@ -100,6 +110,85 @@ class RecursiveSelfState(nn.Module):
         # normalized before this point, so identity projection is the safest
         # first implementation.
         return hidden_summary - world_summary.to(dtype=hidden_summary.dtype)
+
+    def _world_summary_from_state(
+        self,
+        world_state: torch.Tensor | None,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        dim: int,
+    ) -> torch.Tensor:
+        if world_state is None:
+            return torch.zeros(batch_size, dim, device=device, dtype=dtype)
+        state = world_state[:, -1, :, :] if world_state.ndim == 4 else world_state
+        return self.world_norm(state).mean(dim=1)
+
+    def _apply_latent_thought(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        world_state: torch.Tensor | None,
+        self_state: torch.Tensor,
+        causal_safe: bool,
+        steps: int | None = None,
+        metric_prefix: str = "latent_thought",
+        allow_hidden_write: bool | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        thought_steps = self.latent_thought_steps if steps is None else steps
+        if thought_steps <= 0:
+            zero = hidden_states.new_tensor(0.0)
+            return hidden_states, self_state, {
+                f"{metric_prefix}_delta": zero,
+                f"{metric_prefix}_velocity": zero,
+                f"{metric_prefix}_write_norm": zero,
+                f"{metric_prefix}_steps": zero,
+            }
+
+        batch_size, _, dim = hidden_states.shape
+        world_summary = self._world_summary_from_state(
+            world_state,
+            batch_size,
+            hidden_states.device,
+            hidden_states.dtype,
+            dim,
+        )
+        current = self_state[:, -1, :, :] if self_state.ndim == 4 else self_state
+        identity = self.slot_identity.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        identity = identity.unsqueeze(0).expand_as(current)
+        total_delta = hidden_states.new_tensor(0.0)
+        reflection = torch.zeros_like(world_summary)
+
+        for _ in range(thought_steps):
+            pooled_self = self.self_norm(current).mean(dim=1)
+            internal_residual = self._world_residual(pooled_self, world_summary)
+            reflection_input = torch.cat([internal_residual, pooled_self, world_summary, pooled_self], dim=-1)
+            reflection = torch.tanh(self.reflect(reflection_input))
+            reflection_slots = reflection.unsqueeze(1).expand_as(current)
+            update_input = torch.cat([current, reflection_slots + identity, identity], dim=-1)
+            candidate = torch.tanh(self.update(update_input))
+            gate = torch.sigmoid(self.update_gate(update_input)) * self.write_scale
+            next_state = current + gate * (candidate - current)
+            total_delta = total_delta + (next_state - current).float().pow(2).mean()
+            current = next_state
+
+        write_norm = hidden_states.new_tensor(0.0)
+        if allow_hidden_write is None:
+            allow_hidden_write = not causal_safe
+        if self.latent_thought_write_mode == "final_hidden" and allow_hidden_write and self.latent_thought_hidden_scale > 0:
+            hidden_write_gate = self._hidden_write_gate(world_summary)
+            hidden_write = self.hidden_modulation(reflection) * (self.latent_thought_hidden_scale * hidden_write_gate)
+            hidden_states = hidden_states + hidden_write.unsqueeze(1)
+            write_norm = hidden_write.float().norm(dim=-1).mean()
+
+        steps_t = hidden_states.new_tensor(float(thought_steps))
+        metrics = {
+            f"{metric_prefix}_delta": total_delta / steps_t.clamp_min(1.0),
+            f"{metric_prefix}_velocity": (total_delta / steps_t.clamp_min(1.0)).float().sqrt(),
+            f"{metric_prefix}_write_norm": write_norm,
+            f"{metric_prefix}_steps": steps_t,
+        }
+        return hidden_states, current, metrics
 
     def forward(
         self,
@@ -214,6 +303,14 @@ class RecursiveSelfState(nn.Module):
             "boundary_other": boundary_means[..., 2].mean(),
             "boundary_unknown": boundary_means[..., 3].mean(),
         }
+        hidden_states, current, thought_metrics = self._apply_latent_thought(
+            hidden_states,
+            world_state=world_state,
+            self_state=current,
+            causal_safe=causal_safe,
+        )
+        metrics.update(thought_metrics)
+        metrics["state_norm"] = current.float().norm(dim=-1).mean()
         return hidden_states, current, metrics
 
     def _forward_causal(
@@ -286,6 +383,10 @@ class RecursiveSelfState(nn.Module):
             "boundary_unknown": [],
             "history_self_norm": [],
             "history_world_norm": [],
+            "latent_thought_delta": [],
+            "latent_thought_velocity": [],
+            "latent_thought_write_norm": [],
+            "latent_thought_steps": [],
         }
         previous_delta = hidden_states.new_tensor(0.0)
 
@@ -299,6 +400,22 @@ class RecursiveSelfState(nn.Module):
             history_self_summary = precomputed_self_summaries[:, block_idx, :]
             world_summary = precomputed_world_summaries[:, block_idx, :]
             history_residual_summary = self._world_residual(history_self_summary, world_summary)
+
+            if self.latent_thought_steps > 0 and self.latent_thought_write_mode == "final_hidden":
+                block, current, thought_metrics = self._apply_latent_thought(
+                    block,
+                    world_state=world_summary.unsqueeze(1),
+                    self_state=current,
+                    causal_safe=True,
+                    allow_hidden_write=True,
+                )
+                for key in (
+                    "latent_thought_delta",
+                    "latent_thought_velocity",
+                    "latent_thought_write_norm",
+                    "latent_thought_steps",
+                ):
+                    metric_values[key].append(thought_metrics[key])
 
             pooled_self = self.self_norm(current).mean(dim=1)
             # The modulation applied to the current block is computed before
@@ -395,7 +512,28 @@ class RecursiveSelfState(nn.Module):
             metric_values["history_self_norm"].append(history_self_summary.float().norm(dim=-1).mean())
             metric_values["history_world_norm"].append(world_summary.float().norm(dim=-1).mean())
 
-        metrics = {key: torch.stack(values).mean() for key, values in metric_values.items()}
+        metrics = {key: torch.stack(values).mean() for key, values in metric_values.items() if values}
+        if self.latent_thought_steps > 0 and self.latent_thought_write_mode == "final_hidden":
+            for key in (
+                "latent_thought_delta",
+                "latent_thought_velocity",
+                "latent_thought_write_norm",
+                "latent_thought_steps",
+            ):
+                if metric_values[key]:
+                    metrics[key] = torch.stack(metric_values[key]).mean()
+                else:
+                    metrics[key] = hidden_states.new_tensor(0.0)
+        else:
+            output, current, thought_metrics = self._apply_latent_thought(
+                output,
+                world_state=world_state,
+                self_state=current,
+                causal_safe=True,
+            )
+            metrics.update(thought_metrics)
         metrics["state_norm"] = current.float().norm(dim=-1).mean()
+        if state_trace:
+            state_trace[-1] = current
         traced_state = torch.stack(state_trace, dim=1) if state_trace else current.unsqueeze(1)
         return output, traced_state, metrics

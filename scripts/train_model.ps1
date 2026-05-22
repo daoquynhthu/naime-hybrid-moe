@@ -64,6 +64,8 @@ param(
     [ValidateSet("random", "sequential")]
     [string]$EvalSampling = "random",
     [int]$EvalSeed = 4321,
+    [switch]$EvalStateCarry,
+    [switch]$EvalLatentThoughtGain,
     [int]$EarlyStopPatience = 0,
     [int]$EarlyStopMinEvals = 0,
     [double]$EarlyStopMinDelta = 0.0,
@@ -88,6 +90,15 @@ param(
     [switch]$NoSelfStateWorldGate,
     [double]$SelfStateWorldGateMin = 0.10,
     [double]$SelfStateWorldGateScale = 1.0,
+    [int]$LatentThoughtSteps = 0,
+    [ValidateSet("state_only", "final_hidden")]
+    [string]$LatentThoughtWriteMode = "state_only",
+    [double]$LatentThoughtHiddenScale = 0.0,
+    [int]$StateEvolutionSteps = 0,
+    [switch]$NoStateEvolutionMemory,
+    [switch]$LatentFieldCoupling,
+    [double]$LatentFieldTokenScale = 0.02,
+    [double]$LatentFieldMaxRatio = 0.05,
     [double]$LambdaStatePred = 0.0,
     [double]$LambdaSlotDiversity = 0.0,
     [double]$LambdaSlotStability = 0.0,
@@ -234,6 +245,12 @@ $common = @(
     "--stop-check-every", "$StopCheckEvery",
     "--target-tokens-mode", $TargetTokensMode
 )
+if ($EvalStateCarry) {
+    $common += "--eval-state-carry"
+}
+if ($EvalLatentThoughtGain) {
+    $common += "--eval-latent-thought-gain"
+}
 
 if (-not $NoAutoBatch) {
     $common += @(
@@ -411,9 +428,21 @@ if ($isStateModel) {
             "--self-state-context-score-scale", "$SelfStateContextScoreScale",
             "--self-state-world-gate-min", "$SelfStateWorldGateMin",
             "--self-state-world-gate-scale", "$SelfStateWorldGateScale",
+            "--latent-thought-steps", "$LatentThoughtSteps",
+            "--latent-thought-write-mode", "$LatentThoughtWriteMode",
+            "--latent-thought-hidden-scale", "$LatentThoughtHiddenScale",
+            "--state-evolution-steps", "$StateEvolutionSteps",
+            "--latent-field-token-scale", "$LatentFieldTokenScale",
+            "--latent-field-max-ratio", "$LatentFieldMaxRatio",
             "--lambda-self-pred", $(if ($LambdaSelfPred -gt 0.0) { "$LambdaSelfPred" } else { "0.01" }),
             "--lambda-self-slot-diversity", $(if ($LambdaSelfSlotDiversity -gt 0.0) { "$LambdaSelfSlotDiversity" } else { "0.02" })
         )
+        if ($LatentFieldCoupling) {
+            $common += "--latent-field-coupling"
+        }
+        if ($NoStateEvolutionMemory) {
+            $common += "--no-state-evolution-memory"
+        }
         if ($NoSelfStateWorldGate) {
             $common += "--no-self-state-world-gate"
         }

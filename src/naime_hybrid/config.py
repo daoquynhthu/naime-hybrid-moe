@@ -89,6 +89,14 @@ class NAIMEStateMoEConfig:
     self_state_world_gate: bool = True
     self_state_world_gate_min: float = 0.10
     self_state_world_gate_scale: float = 1.0
+    latent_thought_steps: int = 0
+    latent_thought_write_mode: str = "state_only"
+    latent_thought_hidden_scale: float = 0.0
+    state_evolution_steps: int = 0
+    state_evolution_memory: bool = True
+    latent_field_coupling: bool = False
+    latent_field_token_scale: float = 0.02
+    latent_field_max_ratio: float = 0.05
 
     # Stability / architecture toggles.
     qk_norm: bool = True

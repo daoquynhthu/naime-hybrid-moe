@@ -1083,6 +1083,8 @@ def main() -> None:
                     config.lambda_slot_stability,
                     float(w_self_pred),
                     float(w_self_slot_div),
+                    config.eval_state_carry,
+                    config.eval_latent_thought_gain,
                 )
                 log_payload.update(eval_metrics)
                 log_payload["record_type"] = "train_eval"
