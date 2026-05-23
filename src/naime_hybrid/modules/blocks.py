@@ -36,11 +36,11 @@ def _build_attention(config: NAIMEStateMoEConfig):
 
 
 def _mean_token_norm(values: torch.Tensor) -> torch.Tensor:
-    return values.float().norm(dim=-1).mean().type_as(values)
+    return values.detach().float().norm(dim=-1).mean().type_as(values)
 
 
 def _mean_token_cosine(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
-    return F.cosine_similarity(left.float(), right.float(), dim=-1, eps=1e-6).mean().type_as(left)
+    return F.cosine_similarity(left.detach().float(), right.detach().float(), dim=-1, eps=1e-6).mean().type_as(left)
 
 
 def _match_token_norm(source: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -490,13 +490,19 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
                 batch, 1, self.config.d_model, device=hidden_states.device, dtype=hidden_states.dtype
             )
 
+        telemetry_state_weights = state_weights.detach()
         slot_read_entropy = (
-            -(state_weights.clamp_min(1e-6).float() * state_weights.clamp_min(1e-6).float().log()).sum(dim=-1).mean()
+            -(
+                telemetry_state_weights.clamp_min(1e-6).float()
+                * telemetry_state_weights.clamp_min(1e-6).float().log()
+            )
+            .sum(dim=-1)
+            .mean()
             if world_state is not None
             else torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
         )
         slot_read_max = (
-            state_weights.max(dim=-1).values.mean()
+            telemetry_state_weights.max(dim=-1).values.mean()
             if world_state is not None
             else torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
         )

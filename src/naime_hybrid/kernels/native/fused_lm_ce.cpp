@@ -25,6 +25,13 @@ std::vector<torch::Tensor> fused_state_softmax_matmul_forward_cuda(
     torch::Tensor mask,
     bool zero_invalid);
 
+std::vector<torch::Tensor> fused_state_softmax_matmul_backward_cuda(
+    torch::Tensor grad_context,
+    torch::Tensor grad_weights,
+    torch::Tensor weights,
+    torch::Tensor values,
+    torch::Tensor mask);
+
 std::vector<torch::Tensor> fused_lm_ce_forward(
     torch::Tensor hidden,
     torch::Tensor weight,
@@ -108,6 +115,43 @@ std::vector<torch::Tensor> fused_state_softmax_matmul_forward(
       zero_invalid);
 }
 
+std::vector<torch::Tensor> fused_state_softmax_matmul_backward(
+    torch::Tensor grad_context,
+    torch::Tensor grad_weights,
+    torch::Tensor weights,
+    torch::Tensor values,
+    torch::Tensor mask) {
+  TORCH_CHECK(grad_context.is_cuda(), "grad_context must be a CUDA tensor");
+  TORCH_CHECK(weights.is_cuda(), "weights must be a CUDA tensor");
+  TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor");
+  TORCH_CHECK(grad_context.dim() == 3, "grad_context must be [B, T, D]");
+  TORCH_CHECK(weights.dim() == 3, "weights must be [B, T, S]");
+  TORCH_CHECK(values.dim() == 3, "values must be [B, S, D]");
+  TORCH_CHECK(grad_context.size(0) == weights.size(0), "grad_context and weights batch must match");
+  TORCH_CHECK(grad_context.size(1) == weights.size(1), "grad_context and weights tokens must match");
+  TORCH_CHECK(values.size(0) == weights.size(0), "values and weights batch must match");
+  TORCH_CHECK(values.size(1) == weights.size(2), "values slots must match weights");
+  TORCH_CHECK(values.size(2) == grad_context.size(2), "values dim must match grad_context");
+  TORCH_CHECK(grad_context.scalar_type() == weights.scalar_type(), "grad_context and weights dtype must match");
+  TORCH_CHECK(values.scalar_type() == weights.scalar_type(), "values and weights dtype must match");
+  if (grad_weights.numel() > 0) {
+    TORCH_CHECK(grad_weights.is_cuda(), "grad_weights must be a CUDA tensor");
+    TORCH_CHECK(grad_weights.sizes() == weights.sizes(), "grad_weights shape must match weights");
+    TORCH_CHECK(grad_weights.scalar_type() == weights.scalar_type(), "grad_weights dtype must match weights");
+  }
+  if (mask.numel() > 0) {
+    TORCH_CHECK(mask.is_cuda(), "mask must be a CUDA tensor");
+    TORCH_CHECK(mask.scalar_type() == torch::kBool, "mask must be bool");
+    TORCH_CHECK(mask.sizes() == weights.sizes(), "expanded mask shape must match weights");
+  }
+  return fused_state_softmax_matmul_backward_cuda(
+      grad_context.contiguous(),
+      grad_weights.numel() > 0 ? grad_weights.contiguous() : grad_weights,
+      weights.contiguous(),
+      values.contiguous(),
+      mask.numel() > 0 ? mask.contiguous() : mask);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_lm_ce_forward", &fused_lm_ce_forward, "Fused LM CE forward (CUDA)");
   m.def("fused_rms_norm_forward", &fused_rms_norm_forward, "Fused RMSNorm forward (CUDA)");
@@ -116,4 +160,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "fused_state_softmax_matmul_forward",
       &fused_state_softmax_matmul_forward,
       "Fused state softmax-matmul forward (CUDA)");
+  m.def(
+      "fused_state_softmax_matmul_backward",
+      &fused_state_softmax_matmul_backward,
+      "Fused state softmax-matmul backward (CUDA)");
 }

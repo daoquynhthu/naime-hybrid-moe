@@ -84,9 +84,10 @@ class WorldStateSlots(nn.Module):
         key = self.slot_norm(bank)
         scores = torch.matmul(query, key.transpose(1, 2)) / (query.size(-1) ** 0.5)
         context, weights = state_softmax_matmul(scores, bank, out_dtype=hidden_states.dtype)
-        probs = weights.float().clamp_min(1e-6)
+        telemetry_weights = weights.detach().float()
+        probs = telemetry_weights.clamp_min(1e-6)
         entropy = -(probs * probs.log()).sum(dim=-1).mean().type_as(hidden_states)
-        focus = weights.max(dim=-1).values.mean().type_as(hidden_states)
+        focus = telemetry_weights.max(dim=-1).values.mean().type_as(hidden_states)
         return context, entropy, focus
 
     def read_update_sequence(
@@ -153,9 +154,10 @@ class WorldStateSlots(nn.Module):
             )
 
             # Compute history telemetry in parallel outside the loop
-            probs = weights_history.float().clamp_min(1e-6)
+            telemetry_weights = weights_history.detach().float()
+            probs = telemetry_weights.clamp_min(1e-6)
             entropy = -(probs * probs.log()).sum(dim=-1)  # (batch, seq_len)
-            focus = weights_history.max(dim=-1).values  # (batch, seq_len)
+            focus = telemetry_weights.max(dim=-1).values  # (batch, seq_len)
 
             # Calculate average telemetry for valid tokens (limits > 0)
             valid_mask = limits > 0
@@ -258,22 +260,26 @@ class WorldStateSlots(nn.Module):
         slot_confidence_detached = confidence.detach()
         raw_stability = (slot_confidence_detached * (next_slots - slots).float().pow(2)).mean()
         stability_loss = below_threshold * raw_stability
-        write_entropy = -(slot_write_weights.clamp_min(1e-6).float() * slot_write_weights.clamp_min(1e-6).float().log())
+        telemetry_write_weights = slot_write_weights.detach()
+        write_entropy = -(
+            telemetry_write_weights.clamp_min(1e-6).float()
+            * telemetry_write_weights.clamp_min(1e-6).float().log()
+        )
         write_entropy = write_entropy.sum(dim=-1).mean().type_as(slots)
-        write_max = slot_write_weights.max(dim=-1).values.mean()
-        active_mask = slot_write_weights > 0
-        active_write_min = slot_write_weights.masked_fill(~active_mask, 1.0).min(dim=-1).values.mean()
+        write_max = telemetry_write_weights.max(dim=-1).values.mean()
+        active_mask = telemetry_write_weights > 0
+        active_write_min = telemetry_write_weights.masked_fill(~active_mask, 1.0).min(dim=-1).values.mean()
         active_write_count = active_mask.sum(dim=-1).float().mean().type_as(slots)
         metrics = {
-            "slot_update_gate": gate.mean(),
-            "slot_write_max": write_max,
-            "slot_write_min": active_write_min,
-            "slot_write_active": active_write_count,
+            "slot_update_gate": gate.detach().mean(),
+            "slot_write_max": write_max.detach(),
+            "slot_write_min": active_write_min.detach(),
+            "slot_write_active": active_write_count.detach(),
             "slot_write_entropy": write_entropy,
-            "slot_confidence": confidence.mean(),
-            "slot_confidence_std": confidence.float().std(unbiased=False),
-            "slot_delta": state_delta.mean(),
-            "slot_cosine": slot_cosine,
+            "slot_confidence": confidence.detach().mean(),
+            "slot_confidence_std": confidence.detach().float().std(unbiased=False),
+            "slot_delta": state_delta.detach().mean(),
+            "slot_cosine": slot_cosine.detach(),
             "slot_diversity": diversity_loss,
             "slot_stability": stability_loss,
             "state_pred": state_pred_loss,
@@ -283,7 +289,7 @@ class WorldStateSlots(nn.Module):
     def _mean_pairwise_cosine(self, slots: torch.Tensor) -> torch.Tensor:
         if self.slots < 2:
             return torch.zeros((), device=slots.device, dtype=slots.dtype)
-        normed = F.normalize(slots.float(), dim=-1)
+        normed = F.normalize(slots.detach().float(), dim=-1)
         cosine = torch.matmul(normed, normed.transpose(1, 2))
         mask = ~torch.eye(self.slots, device=slots.device, dtype=torch.bool).unsqueeze(0)
         return cosine.masked_select(mask).mean().type_as(slots)

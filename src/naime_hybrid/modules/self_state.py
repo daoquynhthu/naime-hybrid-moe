@@ -180,7 +180,7 @@ class RecursiveSelfState(nn.Module):
             hidden_write_gate = self._hidden_write_gate(world_summary)
             hidden_write = self.hidden_modulation(reflection) * (self.latent_thought_hidden_scale * hidden_write_gate)
             hidden_states = hidden_states + hidden_write.unsqueeze(1)
-            write_norm = hidden_write.float().norm(dim=-1).mean()
+            write_norm = hidden_write.detach().float().norm(dim=-1).mean()
 
         steps_t = hidden_states.new_tensor(float(thought_steps))
         metrics = {
@@ -265,9 +265,9 @@ class RecursiveSelfState(nn.Module):
         pred_target = self_summary.detach() if self.pred_detach_target else self_summary
         self_pred_loss = F.smooth_l1_loss(pred_summary.float(), pred_target.float())
 
-        normalized = F.normalize(current.float(), dim=-1)
+        normalized = F.normalize(current.detach().float(), dim=-1)
         cosine = torch.bmm(normalized, normalized.transpose(1, 2))
-        context_normalized = F.normalize(slot_context.float(), dim=-1)
+        context_normalized = F.normalize(slot_context.detach().float(), dim=-1)
         context_cosine = torch.bmm(context_normalized, context_normalized.transpose(1, 2))
         off_diag = ~torch.eye(self.slots, dtype=torch.bool, device=cosine.device).unsqueeze(0)
         off_diag_cosine = cosine.masked_select(off_diag)
@@ -281,7 +281,7 @@ class RecursiveSelfState(nn.Module):
             slot_cosine = off_diag_cosine.mean()
             slot_context_cosine = off_diag_context_cosine.mean()
 
-        probs = boundary_probs.float().clamp_min(1e-8)
+        probs = boundary_probs.detach().float().clamp_min(1e-8)
         entropy = -(probs * probs.log()).sum(dim=-1)
         mask_f = attention_mask.float()
         boundary_entropy = (entropy * mask_f).sum() / mask_f.sum().clamp_min(1.0)
@@ -292,15 +292,15 @@ class RecursiveSelfState(nn.Module):
             "slot_diversity": slot_diversity,
             "slot_cosine": slot_cosine,
             "slot_context_cosine": slot_context_cosine,
-            "state_delta": recursion_delta / self.recursion_depth,
-            "state_norm": current.float().norm(dim=-1).mean(),
-            "reflection_norm": reflection.float().norm(dim=-1).mean(),
-            "world_explained_norm": world_summary.float().norm(dim=-1).mean(),
-            "hidden_residual_norm": hidden_residual_summary.float().norm(dim=-1).mean(),
-            "world_residual_ratio": hidden_residual_summary.float().norm(dim=-1).mean()
-            / (hidden_summary.float().norm(dim=-1).mean() + hidden_summary.new_tensor(1e-6)),
-            "hidden_write_gate": hidden_write_gate.float().mean(),
-            "hidden_write_norm": hidden_write.float().norm(dim=-1).mean(),
+            "state_delta": (recursion_delta / self.recursion_depth).detach(),
+            "state_norm": current.detach().float().norm(dim=-1).mean(),
+            "reflection_norm": reflection.detach().float().norm(dim=-1).mean(),
+            "world_explained_norm": world_summary.detach().float().norm(dim=-1).mean(),
+            "hidden_residual_norm": hidden_residual_summary.detach().float().norm(dim=-1).mean(),
+            "world_residual_ratio": hidden_residual_summary.detach().float().norm(dim=-1).mean()
+            / (hidden_summary.detach().float().norm(dim=-1).mean() + hidden_summary.new_tensor(1e-6)),
+            "hidden_write_gate": hidden_write_gate.detach().float().mean(),
+            "hidden_write_norm": hidden_write.detach().float().norm(dim=-1).mean(),
             "hidden_write_scale": hidden_states.new_tensor(self.hidden_scale),
             "boundary_entropy": boundary_entropy,
             "boundary_self": boundary_means[..., 0].mean(),
@@ -315,7 +315,7 @@ class RecursiveSelfState(nn.Module):
             causal_safe=causal_safe,
         )
         metrics.update(thought_metrics)
-        metrics["state_norm"] = current.float().norm(dim=-1).mean()
+        metrics["state_norm"] = current.detach().float().norm(dim=-1).mean()
         return hidden_states, current, metrics
 
     def _forward_causal(
@@ -467,9 +467,9 @@ class RecursiveSelfState(nn.Module):
             pred_target = self_summary.detach() if self.pred_detach_target else self_summary
             self_pred_loss = F.smooth_l1_loss(pred_summary.float(), pred_target.float())
 
-            normalized = F.normalize(current.float(), dim=-1)
+            normalized = F.normalize(current.detach().float(), dim=-1)
             cosine = torch.bmm(normalized, normalized.transpose(1, 2))
-            context_normalized = F.normalize(slot_context.float(), dim=-1)
+            context_normalized = F.normalize(slot_context.detach().float(), dim=-1)
             context_cosine = torch.bmm(context_normalized, context_normalized.transpose(1, 2))
             off_diag = ~torch.eye(self.slots, dtype=torch.bool, device=cosine.device).unsqueeze(0)
             off_diag_cosine = cosine.masked_select(off_diag)
@@ -483,7 +483,7 @@ class RecursiveSelfState(nn.Module):
                 slot_cosine = off_diag_cosine.mean()
                 slot_context_cosine = off_diag_context_cosine.mean()
 
-            probs = block_boundary.float().clamp_min(1e-8)
+            probs = block_boundary.detach().float().clamp_min(1e-8)
             entropy = -(probs * probs.log()).sum(dim=-1)
             mask_f = block_mask.float()
             boundary_entropy = (entropy * mask_f).sum() / mask_f.sum().clamp_min(1.0)
@@ -498,28 +498,28 @@ class RecursiveSelfState(nn.Module):
             metric_values["slot_diversity"].append(slot_diversity)
             metric_values["slot_cosine"].append(slot_cosine)
             metric_values["slot_context_cosine"].append(slot_context_cosine)
-            metric_values["state_delta"].append(state_delta)
-            metric_values["state_velocity"].append(state_velocity)
-            metric_values["state_acceleration"].append(state_acceleration)
-            metric_values["reflection_norm"].append(reflection.float().norm(dim=-1).mean())
-            world_explained_norm = world_summary.float().norm(dim=-1).mean()
-            hidden_residual_norm = hidden_residual_summary.float().norm(dim=-1).mean()
-            hidden_summary_norm = hidden_summary.float().norm(dim=-1).mean()
+            metric_values["state_delta"].append(state_delta.detach())
+            metric_values["state_velocity"].append(state_velocity.detach())
+            metric_values["state_acceleration"].append(state_acceleration.detach())
+            metric_values["reflection_norm"].append(reflection.detach().float().norm(dim=-1).mean())
+            world_explained_norm = world_summary.detach().float().norm(dim=-1).mean()
+            hidden_residual_norm = hidden_residual_summary.detach().float().norm(dim=-1).mean()
+            hidden_summary_norm = hidden_summary.detach().float().norm(dim=-1).mean()
             metric_values["world_explained_norm"].append(world_explained_norm)
             metric_values["hidden_residual_norm"].append(hidden_residual_norm)
             metric_values["world_residual_ratio"].append(
                 hidden_residual_norm / (hidden_summary_norm + hidden_states.new_tensor(1e-6))
             )
-            metric_values["hidden_write_gate"].append(hidden_write_gate.float().mean())
-            metric_values["hidden_write_norm"].append(hidden_write.float().norm(dim=-1).mean())
+            metric_values["hidden_write_gate"].append(hidden_write_gate.detach().float().mean())
+            metric_values["hidden_write_norm"].append(hidden_write.detach().float().norm(dim=-1).mean())
             metric_values["hidden_write_scale"].append(hidden_states.new_tensor(self.hidden_scale))
             metric_values["boundary_entropy"].append(boundary_entropy)
             metric_values["boundary_self"].append(boundary_means[..., 0].mean())
             metric_values["boundary_world"].append(boundary_means[..., 1].mean())
             metric_values["boundary_other"].append(boundary_means[..., 2].mean())
             metric_values["boundary_unknown"].append(boundary_means[..., 3].mean())
-            metric_values["history_self_norm"].append(history_self_summary.float().norm(dim=-1).mean())
-            metric_values["history_world_norm"].append(world_summary.float().norm(dim=-1).mean())
+            metric_values["history_self_norm"].append(history_self_summary.detach().float().norm(dim=-1).mean())
+            metric_values["history_world_norm"].append(world_summary.detach().float().norm(dim=-1).mean())
 
         metrics = {key: torch.stack(values).mean() for key, values in metric_values.items() if values}
         if self.latent_thought_steps > 0 and self.latent_thought_write_mode == "final_hidden":
@@ -541,7 +541,7 @@ class RecursiveSelfState(nn.Module):
                 causal_safe=True,
             )
             metrics.update(thought_metrics)
-        metrics["state_norm"] = current.float().norm(dim=-1).mean()
+        metrics["state_norm"] = current.detach().float().norm(dim=-1).mean()
         if state_trace:
             state_trace[-1] = current
         traced_state = torch.stack(state_trace, dim=1) if state_trace else current.unsqueeze(1)

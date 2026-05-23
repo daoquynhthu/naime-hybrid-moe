@@ -11,7 +11,10 @@ def force_fp32_state_attention() -> bool:
 
 
 def use_fused_state_attention() -> bool:
-    return os.environ.get("NAIME_USE_FUSED_STATE_ATTENTION", "1") != "0"
+    # The native forward/backward prototype is kept as an opt-in experiment.
+    # Benchmarks show it only helps tiny masked slot banks; for larger V6
+    # history banks PyTorch's bmm/softmax kernels are materially faster.
+    return os.environ.get("NAIME_USE_FUSED_STATE_ATTENTION", "0") == "1"
 
 
 _fused_disabled_after_error = False
@@ -46,19 +49,24 @@ class _FusedStateSoftmaxMatmulFn(torch.autograd.Function):
         grad_context: torch.Tensor,
         grad_weights: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, None, None]:
+        from naime_hybrid.kernels.cuda_ext import load_cuda_extension
+
         weights, values, mask = ctx.saved_tensors
-        grad_context_f = grad_context.float()
-        weights_f = weights.float()
-        values_f = values.float()
-        grad_values = torch.bmm(weights_f.transpose(1, 2), grad_context_f)
-        grad_w = torch.bmm(grad_context_f, values_f.transpose(1, 2))
-        if grad_weights is not None:
-            grad_w = grad_w + grad_weights.float()
-        dot = (grad_w * weights_f).sum(dim=-1, keepdim=True)
-        grad_scores = weights_f * (grad_w - dot)
-        if ctx.has_mask:
-            grad_scores = grad_scores.masked_fill(mask, 0.0)
-        return grad_scores.to(dtype=weights.dtype), grad_values.to(dtype=values.dtype), None, None
+        ext = load_cuda_extension()
+        grad_weights_arg = (
+            torch.empty(0, device=weights.device, dtype=weights.dtype)
+            if grad_weights is None
+            else grad_weights.to(dtype=weights.dtype)
+        )
+        mask_arg = mask if ctx.has_mask else torch.empty(0, device=weights.device, dtype=torch.bool)
+        grad_scores, grad_values = ext.fused_state_softmax_matmul_backward(
+            grad_context.to(dtype=weights.dtype),
+            grad_weights_arg,
+            weights,
+            values,
+            mask_arg,
+        )
+        return grad_scores, grad_values, None, None
 
 
 def _can_use_fused_state_attention(scores: torch.Tensor, values: torch.Tensor, mask: torch.Tensor | None) -> bool:

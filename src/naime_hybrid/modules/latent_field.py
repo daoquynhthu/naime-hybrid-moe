@@ -167,17 +167,19 @@ class LatentFieldCoupler(nn.Module):
             delta = delta * attention_mask.to(device=delta.device, dtype=delta.dtype).unsqueeze(-1)
 
         updated = hidden_states + delta
-        probs = weights.float().clamp_min(1e-6)
+        telemetry_weights = weights.detach().float()
+        probs = telemetry_weights.clamp_min(1e-6)
         entropy = -(probs * probs.log()).sum(dim=-1).mean().type_as(hidden_states)
-        read_max = weights.max(dim=-1).values.mean().type_as(hidden_states)
-        token_delta_norm = delta.float().norm(dim=-1).mean().type_as(hidden_states)
+        read_max = telemetry_weights.max(dim=-1).values.mean().type_as(hidden_states)
+        telemetry_delta = delta.detach().float()
+        token_delta_norm = telemetry_delta.norm(dim=-1).mean().type_as(hidden_states)
         token_delta_ratio = (
-            delta.float().norm(dim=-1) / hidden_states.float().norm(dim=-1).clamp_min(1e-6)
+            telemetry_delta.norm(dim=-1) / hidden_states.detach().float().norm(dim=-1).clamp_min(1e-6)
         ).mean().type_as(hidden_states)
         return updated, {
             "latent_field_token_delta_norm": token_delta_norm,
             "latent_field_token_delta_ratio": token_delta_ratio,
             "latent_field_read_entropy": entropy,
             "latent_field_read_max": read_max,
-            "latent_field_gate": gate.float().mean().type_as(hidden_states),
+            "latent_field_gate": gate.detach().float().mean().type_as(hidden_states),
         }
