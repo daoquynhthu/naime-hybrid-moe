@@ -19,6 +19,12 @@ std::vector<torch::Tensor> fused_rms_norm_backward_cuda(
     torch::Tensor weight,
     torch::Tensor inv_rms);
 
+std::vector<torch::Tensor> fused_state_softmax_matmul_forward_cuda(
+    torch::Tensor scores,
+    torch::Tensor values,
+    torch::Tensor mask,
+    bool zero_invalid);
+
 std::vector<torch::Tensor> fused_lm_ce_forward(
     torch::Tensor hidden,
     torch::Tensor weight,
@@ -75,8 +81,39 @@ std::vector<torch::Tensor> fused_rms_norm_backward(
       inv_rms.contiguous());
 }
 
+std::vector<torch::Tensor> fused_state_softmax_matmul_forward(
+    torch::Tensor scores,
+    torch::Tensor values,
+    torch::Tensor mask,
+    bool zero_invalid) {
+  TORCH_CHECK(scores.is_cuda(), "scores must be a CUDA tensor");
+  TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor");
+  TORCH_CHECK(scores.dim() == 3, "scores must be [B, T, S]");
+  TORCH_CHECK(values.dim() == 3, "values must be [B, S, D]");
+  TORCH_CHECK(scores.size(0) == values.size(0), "scores and values batch must match");
+  TORCH_CHECK(scores.size(2) == values.size(1), "scores slots must match values slots");
+  TORCH_CHECK(scores.scalar_type() == values.scalar_type(), "scores and values dtype must match");
+  if (mask.numel() > 0) {
+    TORCH_CHECK(mask.is_cuda(), "mask must be a CUDA tensor");
+    TORCH_CHECK(mask.scalar_type() == torch::kBool, "mask must be bool");
+    TORCH_CHECK(mask.dim() == 3, "mask must be [B or 1, T, S]");
+    TORCH_CHECK(mask.size(0) == 1 || mask.size(0) == scores.size(0), "mask batch must be 1 or B");
+    TORCH_CHECK(mask.size(1) == scores.size(1), "mask tokens must match scores");
+    TORCH_CHECK(mask.size(2) == scores.size(2), "mask slots must match scores");
+  }
+  return fused_state_softmax_matmul_forward_cuda(
+      scores.contiguous(),
+      values.contiguous(),
+      mask.numel() > 0 ? mask.contiguous() : mask,
+      zero_invalid);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_lm_ce_forward", &fused_lm_ce_forward, "Fused LM CE forward (CUDA)");
   m.def("fused_rms_norm_forward", &fused_rms_norm_forward, "Fused RMSNorm forward (CUDA)");
   m.def("fused_rms_norm_backward", &fused_rms_norm_backward, "Fused RMSNorm backward (CUDA)");
+  m.def(
+      "fused_state_softmax_matmul_forward",
+      &fused_state_softmax_matmul_forward,
+      "Fused state softmax-matmul forward (CUDA)");
 }

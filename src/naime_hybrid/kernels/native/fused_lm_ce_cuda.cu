@@ -290,3 +290,145 @@ std::vector<at::Tensor> fused_rms_norm_backward_cuda(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {grad_input, grad_weight};
 }
+
+template <typename scalar_t>
+__global__ void fused_state_softmax_matmul_forward_kernel(
+    const scalar_t* __restrict__ scores,
+    const scalar_t* __restrict__ values,
+    const bool* __restrict__ mask,
+    scalar_t* __restrict__ context,
+    scalar_t* __restrict__ weights,
+    int64_t batch,
+    int64_t tokens,
+    int64_t slots,
+    int64_t dim,
+    int64_t mask_batch,
+    bool has_mask,
+    bool zero_invalid) {
+  extern __shared__ float shared[];
+  float* reduce = shared;
+  float* row_weights = shared + blockDim.x;
+
+  const int64_t row = blockIdx.x;
+  const int64_t b = row / tokens;
+  const int64_t t = row - b * tokens;
+  const int tid = threadIdx.x;
+  const int64_t score_base = (b * tokens + t) * slots;
+  const int64_t mask_b = mask_batch == 1 ? 0 : b;
+  const int64_t mask_base = (mask_b * tokens + t) * slots;
+
+  int valid_count = 0;
+  float local_max = -FLT_MAX;
+  for (int64_t s = tid; s < slots; s += blockDim.x) {
+    const bool masked = has_mask && mask[mask_base + s];
+    if (!masked) {
+      const float score = static_cast<float>(scores[score_base + s]);
+      local_max = fmaxf(local_max, score);
+      valid_count += 1;
+    }
+  }
+  reduce[tid] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+    }
+    __syncthreads();
+  }
+  const float row_max = reduce[0];
+
+  reduce[tid] = static_cast<float>(valid_count);
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] += reduce[tid + stride];
+    }
+    __syncthreads();
+  }
+  const bool row_valid = reduce[0] > 0.0f;
+
+  float local_sum = 0.0f;
+  for (int64_t s = tid; s < slots; s += blockDim.x) {
+    const bool masked = has_mask && mask[mask_base + s];
+    float w = 0.0f;
+    if (row_valid && !masked) {
+      w = expf(static_cast<float>(scores[score_base + s]) - row_max);
+      local_sum += w;
+    }
+    row_weights[s] = w;
+  }
+  reduce[tid] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] += reduce[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float denom = reduce[0];
+
+  for (int64_t s = tid; s < slots; s += blockDim.x) {
+    float w = (row_valid && denom > 0.0f) ? row_weights[s] / denom : 0.0f;
+    if (!zero_invalid && !row_valid) {
+      w = 0.0f;
+    }
+    row_weights[s] = w;
+    weights[score_base + s] = static_cast<scalar_t>(w);
+  }
+  __syncthreads();
+
+  const int64_t context_base = (b * tokens + t) * dim;
+  const int64_t value_base = b * slots * dim;
+  for (int64_t d = tid; d < dim; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int64_t s = 0; s < slots; ++s) {
+      acc += row_weights[s] * static_cast<float>(values[value_base + s * dim + d]);
+    }
+    context[context_base + d] = static_cast<scalar_t>(acc);
+  }
+}
+
+std::vector<at::Tensor> fused_state_softmax_matmul_forward_cuda(
+    at::Tensor scores,
+    at::Tensor values,
+    at::Tensor mask,
+    bool zero_invalid) {
+  const c10::cuda::CUDAGuard device_guard(scores.device());
+  const auto batch = scores.size(0);
+  const auto tokens = scores.size(1);
+  const auto slots = scores.size(2);
+  const auto dim = values.size(2);
+  const bool has_mask = mask.numel() > 0;
+  const auto mask_batch = has_mask ? mask.size(0) : 0;
+
+  auto context = at::empty({batch, tokens, dim}, scores.options());
+  auto weights = at::empty_like(scores);
+
+  const int threads = std::min(1024, std::max(32, next_power_of_two_host(static_cast<int>(std::max(slots, dim)))));
+  const dim3 blocks(batch * tokens);
+  const size_t shared_bytes = static_cast<size_t>(threads + slots) * sizeof(float);
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      scores.scalar_type(),
+      "fused_state_softmax_matmul_forward_cuda",
+      [&] {
+        fused_state_softmax_matmul_forward_kernel<scalar_t><<<blocks, threads, shared_bytes, stream>>>(
+            scores.data_ptr<scalar_t>(),
+            values.data_ptr<scalar_t>(),
+            has_mask ? mask.data_ptr<bool>() : nullptr,
+            context.data_ptr<scalar_t>(),
+            weights.data_ptr<scalar_t>(),
+            batch,
+            tokens,
+            slots,
+            dim,
+            mask_batch,
+            has_mask,
+            zero_invalid);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {context, weights};
+}
