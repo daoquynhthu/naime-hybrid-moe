@@ -13,6 +13,8 @@ venv/
 Include/
 libs/
 
+Agent/
+
 experiments/runs/
 experiments/debug_suite/
 experiments/profiles/

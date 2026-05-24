@@ -55,8 +55,8 @@ param(
     [int]$KeepLastN = 2,
     [switch]$AsyncLatest,
     [switch]$SyncLatest,
-    [int]$MetricsFlushEvery = 1,
-    [int]$MetricsFsyncEvery = 100,
+    [int]$MetricsFlushEvery = 50,
+    [int]$MetricsFsyncEvery = 1000,
     [ValidateSet("full", "model")]
     [string]$BestCheckpointMode = "model",
     [int]$EvalEvery = 100,

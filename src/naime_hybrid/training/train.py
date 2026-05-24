@@ -1149,7 +1149,6 @@ def main() -> None:
                             save_payload(model_dir / "model_best.pt", best_model_payload)
                         else:
                             checkpoint_writer.submit(model_dir / "model_best.pt", best_model_payload)
-                            checkpoint_writer.wait()
                     else:
                         save_checkpoint_pair(
                             checkpoint_writer,

@@ -2,8 +2,10 @@ import csv
 import json
 import logging
 import os
+import queue
 import re
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -77,35 +79,107 @@ def setup_logger(run_dir: Path) -> logging.Logger:
     return logger
 
 
+class _MetricFlushRequest:
+    def __init__(self, *, force_sync: bool):
+        self.force_sync = force_sync
+        self.done = threading.Event()
+
+
 class JsonlMetricLogger:
-    def __init__(self, path: Path, *, flush_every: int = 1, fsync_every: int = 100):
+    """Asynchronous JSONL metric writer.
+
+    Training writes are intentionally cheap: enqueue a shallow payload copy and
+    let a single background thread handle JSON serialization, flushing, and
+    optional fsync.  Explicit flush/close calls still provide a synchronization
+    point for checkpoints and graceful shutdown.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        flush_every: int = 50,
+        fsync_every: int = 1000,
+        max_queue: int = 8192,
+        submit_timeout: float = 30.0,
+    ):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.flush_every = max(1, int(flush_every))
         self.fsync_every = max(0, int(fsync_every))
+        self._submit_timeout = float(submit_timeout)
         self._writes = 0
-        self._file = self.path.open("a", encoding="utf-8")
+        self._error: BaseException | None = None
+        self._closed = False
+        self._queue: queue.Queue[dict[str, Any] | _MetricFlushRequest | None] = queue.Queue(maxsize=max_queue)
+        self._thread = threading.Thread(target=self._run, name="metric-jsonl-writer", daemon=False)
+        self._thread.start()
+
+    def _run(self) -> None:
+        with self.path.open("a", encoding="utf-8") as file:
+            while True:
+                item = self._queue.get()
+                try:
+                    if item is None:
+                        file.flush()
+                        if self.fsync_every > 0:
+                            os.fsync(file.fileno())
+                        return
+                    if isinstance(item, _MetricFlushRequest):
+                        file.flush()
+                        if item.force_sync:
+                            os.fsync(file.fileno())
+                        item.done.set()
+                        continue
+
+                    file.write(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n")
+                    self._writes += 1
+                    should_flush = self._writes % self.flush_every == 0
+                    should_fsync = self.fsync_every > 0 and self._writes % self.fsync_every == 0
+                    if should_flush or should_fsync:
+                        file.flush()
+                    if should_fsync:
+                        os.fsync(file.fileno())
+                except BaseException as exc:
+                    self._error = exc
+                    if isinstance(item, _MetricFlushRequest):
+                        item.done.set()
+                finally:
+                    self._queue.task_done()
+
+    def _submit(self, item: dict[str, Any] | _MetricFlushRequest | None) -> None:
+        self.raise_if_failed()
+        if self._closed:
+            raise RuntimeError("metric logger is closed")
+        try:
+            self._queue.put(item, timeout=self._submit_timeout)
+        except queue.Full as exc:
+            raise RuntimeError(f"metric logger queue stayed full for {self._submit_timeout:.0f}s") from exc
+        self.raise_if_failed()
 
     def write(self, payload: dict[str, Any], *, force_sync: bool = False) -> None:
-        self._file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-        self._writes += 1
-        should_flush = force_sync or self._writes % self.flush_every == 0
-        should_fsync = force_sync or (self.fsync_every > 0 and self._writes % self.fsync_every == 0)
-        if should_flush or should_fsync:
-            self._file.flush()
-        if should_fsync:
-            os.fsync(self._file.fileno())
+        self._submit(dict(payload))
+        if force_sync:
+            self.flush(force_sync=True)
 
     def flush(self, *, force_sync: bool = False) -> None:
-        self._file.flush()
-        if force_sync:
-            os.fsync(self._file.fileno())
+        request = _MetricFlushRequest(force_sync=force_sync)
+        self._submit(request)
+        request.done.wait()
+        self.raise_if_failed()
 
     def close(self) -> None:
-        if self._file.closed:
+        if self._closed:
             return
         self.flush(force_sync=True)
-        self._file.close()
+        self._queue.put(None)
+        self._thread.join()
+        self._closed = True
+        self.raise_if_failed()
+
+    def raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("metric logger failed") from self._error
 
 
 def metrics_jsonl_to_csv(jsonl_path: Path, csv_path: Path | None = None) -> Path | None:

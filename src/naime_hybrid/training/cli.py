@@ -100,13 +100,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metrics-flush-every",
         type=int,
-        default=1,
+        default=50,
         help="Flush metrics.jsonl to the OS page cache every N writes.",
     )
     parser.add_argument(
         "--metrics-fsync-every",
         type=int,
-        default=100,
+        default=1000,
         help="Force metrics.jsonl to disk every N writes. 0 disables periodic fsync; final close still fsyncs.",
     )
     parser.add_argument(

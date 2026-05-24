@@ -100,14 +100,13 @@ switch ($Command) {
 
     "eval" {
         $p = "$rr\$runName"
-        $cmd = '$m = Get-Content "' + $p + '\metrics.jsonl" -Tail 1 -ErrorAction SilentlyContinue | ConvertFrom-Json; '
-        $cmd += 'if ($m) { '
-        $cmd += 'Write-Output "step=$($m.step) loss_lm=$($m.loss_lm) ppl=$($m.ppl) tok/s=$($m.tokens_per_second) grad=$($m.grad_norm) alpha=$($m.alpha_mean) ent=$($m.router_entropy)"; '
-        $cmd += '}; '
-        $cmd += '$vm = Get-Content "' + $p + '\metrics.jsonl" -Tail 500 -ErrorAction SilentlyContinue | ConvertFrom-Json | Where-Object { $_.record_type -eq "validation" } | Select-Object -Last 1; '
-        $cmd += 'if ($vm) { '
-        $cmd += 'Write-Output "val_step=$($vm.step) val_lm=$($vm.val_lm_loss) val_ppl=$($vm.val_ppl) best=$($vm.best_val_lm)"; '
-        $cmd += '} else { Write-Output "no validation yet" }'
+        $cmd = '$last = Get-Content "' + $p + '\metrics.jsonl" -Tail 1 -ErrorAction SilentlyContinue | ConvertFrom-Json; '
+        $cmd += 'if ($last) { '
+        $cmd += 'Write-Output "train step=$($last.step) loss=$($last.loss_lm) ppl=$($last.ppl_lm) tok/s=$($last.tokens_per_second) grad=$($last.grad_norm) alpha=$($last.alpha_mean) ent=$($last.router_entropy)"; '
+        $cmd += '} else { Write-Output "no train metrics" }; '
+        $cmd += '$log = Get-Content "' + $p + '\train.log" -ErrorAction SilentlyContinue; '
+        $cmd += '$valLines = $log | Select-String "val \d+" | Select-Object -Last 1; '
+        $cmd += 'if ($valLines) { $valLines.Line } else { Write-Output "no validation" }'
         Run-R $cmd
     }
 

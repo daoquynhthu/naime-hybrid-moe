@@ -30,8 +30,8 @@ class TrainConfig:
     latest_sync: bool = False
     async_checkpoint: bool = True
     async_checkpoint_queue: int = 2
-    metrics_flush_every: int = 1
-    metrics_fsync_every: int = 100
+    metrics_flush_every: int = 50
+    metrics_fsync_every: int = 1000
     best_checkpoint_mode: str = "model"
     eval_every: int = 0
     eval_split: str = "validation"
