@@ -101,7 +101,9 @@ def load_cuda_extension():
         str(source_dir / "fused_lm_ce.cpp"),
         str(source_dir / "fused_lm_ce_cuda.cu"),
     ]
-    build_root = Path(os.environ.get("NAIME_EXT_BUILD_DIR", Path.home() / ".cache" / "naime_hybrid" / "torch_extensions"))
+    build_root = Path(
+        os.environ.get("NAIME_EXT_BUILD_DIR", Path.home() / ".cache" / "naime_hybrid" / "torch_extensions")
+    )
     build_root.mkdir(parents=True, exist_ok=True)
 
     cxx_flags = ["/O2"] if sys.platform == "win32" else ["-O3"]

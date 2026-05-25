@@ -16,6 +16,7 @@ from .norm import RMSNorm
 from .self_state import RecursiveSelfState
 from .semantic_compressor import SemanticCompressor
 from .state import CrossLayerSemanticState, SemanticGateMixer, SemanticMemory
+from .typed_dynamics import TypedLatentDynamics
 from .world_state import WorldStateSlots
 
 __all__ = [
@@ -38,5 +39,6 @@ __all__ = [
     "SwiGLUExpert",
     "TokenMoEBlock",
     "TopKMoE",
+    "TypedLatentDynamics",
     "WorldStateSlots",
 ]

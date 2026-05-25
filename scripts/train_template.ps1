@@ -28,13 +28,17 @@ param(
     [int]$EvalMaxBatches = -1,
     [switch]$EvalStateCarry,
     [switch]$EvalLatentThoughtGain,
+    [switch]$EvalV7DynamicsGain,
+    [switch]$EvalV7StateSwap,
+    [switch]$EvalV7StateErase,
     [int]$SaveEvery = -1,
     [int]$LatestEvery = -1,
     [int]$MetricsFlushEvery = -1,
     [int]$MetricsFsyncEvery = -1,
     [int]$NumWorkers = -1,
-    [ValidateSet("", "auto", "torch", "triton_ce", "cuda_ext_fused_ce")]
+    [ValidateSet("", "auto", "torch", "triton_ce", "cuda_ext_ce", "cuda_ext_fused_ce")]
     [string]$LmLossBackend = "",
+    [switch]$UseFusedStateAttention,
     [double]$SemanticStateWriteScale = -1.0,
     [double]$SemanticMemoryHiddenScale = -1.0,
     [double]$SemanticGateMixerMaxStateWeight = -1.0,
@@ -50,6 +54,17 @@ param(
     [switch]$LatentFieldCoupling,
     [double]$LatentFieldTokenScale = -1.0,
     [double]$LatentFieldMaxRatio = -1.0,
+    [int]$V7DynamicsSteps = -1,
+    [int]$V7LatentSlots = -1,
+    [double]$V7LatentWriteScale = -1.0,
+    [double]$V7HiddenWriteScale = -1.0,
+    [double]$V7MaxHiddenWriteRatio = -1.0,
+    [double]$V7StateWriteScale = -1.0,
+    [int]$V7PastLatentAdaptSteps = -1,
+    [switch]$V7DynamicDepth,
+    [int]$V7MinDynamicsSteps = -1,
+    [int]$V7MaxDynamicsSteps = -1,
+    [double]$V7DynamicConvergenceThreshold = -1.0,
     [string]$Device = "",
     [int]$MaxSteps = -1,
     [switch]$NoAutoBatch,
@@ -180,6 +195,18 @@ if ($EvalStateCarry) {
 if ($EvalLatentThoughtGain) {
     $params["EvalLatentThoughtGain"] = $true
 }
+if ($EvalV7DynamicsGain) {
+    $params["EvalV7DynamicsGain"] = $true
+}
+if ($EvalV7StateSwap) {
+    $params["EvalV7StateSwap"] = $true
+}
+if ($EvalV7StateErase) {
+    $params["EvalV7StateErase"] = $true
+}
+if ($UseFusedStateAttention) {
+    $params["UseFusedStateAttention"] = $true
+}
 Add-Override $params "SaveEvery" $SaveEvery { $SaveEvery -ge 0 }
 Add-Override $params "LatestEvery" $LatestEvery { $LatestEvery -ge 0 }
 Add-Override $params "MetricsFlushEvery" $MetricsFlushEvery { $MetricsFlushEvery -gt 0 }
@@ -204,6 +231,21 @@ if ($LatentFieldCoupling) {
 }
 Add-Override $params "LatentFieldTokenScale" $LatentFieldTokenScale { $LatentFieldTokenScale -ge 0.0 }
 Add-Override $params "LatentFieldMaxRatio" $LatentFieldMaxRatio { $LatentFieldMaxRatio -gt 0.0 }
+Add-Override $params "V7DynamicsSteps" $V7DynamicsSteps { $V7DynamicsSteps -ge 0 }
+Add-Override $params "V7LatentSlots" $V7LatentSlots { $V7LatentSlots -ge 0 }
+Add-Override $params "V7LatentWriteScale" $V7LatentWriteScale { $V7LatentWriteScale -ge 0.0 }
+Add-Override $params "V7HiddenWriteScale" $V7HiddenWriteScale { $V7HiddenWriteScale -ge 0.0 }
+Add-Override $params "V7MaxHiddenWriteRatio" $V7MaxHiddenWriteRatio { $V7MaxHiddenWriteRatio -gt 0.0 }
+Add-Override $params "V7StateWriteScale" $V7StateWriteScale { $V7StateWriteScale -ge 0.0 }
+Add-Override $params "V7PastLatentAdaptSteps" $V7PastLatentAdaptSteps { $V7PastLatentAdaptSteps -ge 0 }
+if ($V7DynamicDepth) {
+    $params["V7DynamicDepth"] = $true
+}
+Add-Override $params "V7MinDynamicsSteps" $V7MinDynamicsSteps { $V7MinDynamicsSteps -ge 0 }
+Add-Override $params "V7MaxDynamicsSteps" $V7MaxDynamicsSteps { $V7MaxDynamicsSteps -ge 0 }
+Add-Override $params "V7DynamicConvergenceThreshold" $V7DynamicConvergenceThreshold {
+    $V7DynamicConvergenceThreshold -ge 0.0
+}
 Add-Override $params "Device" $Device { -not [string]::IsNullOrWhiteSpace($Device) }
 Add-Override $params "MaxSteps" $MaxSteps { $MaxSteps -gt 0 }
 
@@ -232,6 +274,11 @@ $switchNames = @(
     "SyncLatest",
     "EvalStateCarry",
     "EvalLatentThoughtGain",
+    "EvalV7DynamicsGain",
+    "EvalV7StateSwap",
+    "EvalV7StateErase",
+    "UseFusedStateAttention",
+    "V7DynamicDepth",
     "NoStateEvolutionMemory",
     "LatentFieldCoupling",
     "ResumeAllowFailed",

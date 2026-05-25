@@ -6,6 +6,7 @@ from .decoder import (
     NAIMEV4StateMoEDecoder,
     NAIMEV5WorldStateMoEDecoder,
     NAIMEV6RecursiveSelfMoEDecoder,
+    NAIMEV7TypedDynamicsDecoder,
     TokenMoEDecoder,
 )
 from .factory import build_model
@@ -18,6 +19,7 @@ __all__ = [
     "NAIMEV4StateMoEDecoder",
     "NAIMEV5WorldStateMoEDecoder",
     "NAIMEV6RecursiveSelfMoEDecoder",
+    "NAIMEV7TypedDynamicsDecoder",
     "TokenMoEDecoder",
     "build_model",
 ]

@@ -5,6 +5,18 @@ from naime_hybrid.kernels import cross_entropy_loss, fused_lm_cross_entropy_loss
 IGNORE_INDEX = -100
 
 
+def _observed(value: torch.Tensor) -> torch.Tensor:
+    """Detach telemetry-only values before aggregation.
+
+    Auxiliary losses keep gradients through their explicit loss keys. Most
+    architecture diagnostics are observability, not objectives; detaching them
+    prevents metrics from extending the autograd graph and adding cast/copy
+    pressure during the training step.
+    """
+
+    return value.detach().float()
+
+
 def lm_loss(logits: torch.Tensor, labels: torch.Tensor, backend: str = "auto") -> torch.Tensor:
     return cross_entropy_loss(logits, labels, ignore_index=IGNORE_INDEX, backend=backend)
 
@@ -150,6 +162,7 @@ def collect_aux_losses(
     v6_latent_field_read_entropies = []
     v6_latent_field_read_maxes = []
     v6_latent_field_gates = []
+    v7_metric_values: dict[str, list[torch.Tensor]] = {}
     dispatch_denses = []
 
     for layer_aux in aux_by_layer:
@@ -381,11 +394,18 @@ def collect_aux_losses(
                     device = value.device
                     break
 
+        v7 = layer_aux.get("v7")
+        if v7 is not None:
+            for key, value in v7.items():
+                if torch.is_tensor(value):
+                    v7_metric_values.setdefault(key, []).append(_observed(value))
+                    device = value.device
+
     if device is None:
         device = torch.device("cpu")
 
     zero = torch.tensor(0.0, device=device)
-    return {
+    metrics = {
         "load": torch.stack(load_losses).mean() if load_losses else zero,
         "sparse": torch.stack(sparse_losses).mean() if sparse_losses else zero,
         "kl": torch.stack(kl_losses).mean() if kl_losses else zero,
@@ -518,3 +538,32 @@ def collect_aux_losses(
         "v6_latent_field_gate": torch.stack(v6_latent_field_gates).mean() if v6_latent_field_gates else zero,
         "dispatch_dense": torch.stack(dispatch_denses).mean() if dispatch_denses else zero,
     }
+    for key in (
+        "v7_thought_steps",
+        "v7_latent_delta",
+        "v7_latent_velocity",
+        "v7_latent_acceleration",
+        "v7_hidden_delta",
+        "v7_latent_hidden_write_norm",
+        "v7_hidden_write_ratio",
+        "v7_hidden_write_gate",
+        "v7_latent_read_entropy",
+        "v7_latent_read_max",
+        "v7_latent_state_norm",
+        "v7_world_state_norm",
+        "v7_self_state_norm",
+        "v7_world_delta",
+        "v7_self_delta",
+        "v7_world_write_gate",
+        "v7_self_write_gate",
+        "v7_dynamic_depth_enabled",
+        "v7_dynamic_depth_mean",
+        "v7_dynamic_halt_fraction",
+        "v7_dynamic_continue_score",
+        "v7_dynamic_convergence_threshold",
+        "v7_past_latent_adapt_steps",
+        "v7_past_latent_read_suppressed",
+    ):
+        values = v7_metric_values.get(key)
+        metrics[key] = torch.stack(values).mean() if values else zero
+    return metrics

@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import multiprocessing
 import os
 import sys
 import time
@@ -37,6 +38,32 @@ from .runtime import build_dataset, cycle_loader, probe_auto_batch_size, resolve
 from .scheduler import cosine_with_restarts, cosine_with_warmup
 from .signals import StopSignalMonitor
 from .validation import evaluate_model
+
+
+def _configure_windows_spawn_executable(logger: logging.Logger) -> None:
+    if os.name != "nt":
+        return
+    executable = sys.executable
+    scripts_dir = str(Path(executable).resolve().parent)
+    venv_dir = str(Path(scripts_dir).parent)
+    try:
+        sys._base_executable = executable  # type: ignore[attr-defined]
+    except Exception:
+        logger.warning("could not override sys._base_executable=%s", executable, exc_info=True)
+    os.environ["PYTHON_EXECUTABLE"] = executable
+    os.environ["VIRTUAL_ENV"] = venv_dir
+    os.environ["PATH"] = scripts_dir + os.pathsep + os.environ.get("PATH", "")
+    try:
+        multiprocessing.set_executable(executable)
+    except Exception:
+        logger.warning("could not set multiprocessing executable=%s", executable, exc_info=True)
+    set_torch_executable = getattr(torch.multiprocessing, "set_executable", None)
+    if set_torch_executable is not None:
+        try:
+            set_torch_executable(executable)
+        except Exception:
+            logger.warning("could not set torch multiprocessing executable=%s", executable, exc_info=True)
+    logger.info("windows spawn executable=%s", executable)
 
 
 class ResumableRandomSampler(Sampler[int]):
@@ -253,16 +280,32 @@ def _save_shutdown_checkpoint(
             logger.exception("checkpoint writer failed while flushing before %s checkpoint", reason_name)
 
     config_dict = config.to_dict()
-    full_payload = build_checkpoint_payload(model, optimizer, scheduler, scaler, step, config_dict, metrics)
-    model_payload = build_model_payload(model, step, config_dict, metrics)
-    save_payloads_in_subprocess(
-        [
-            (latest_path, full_payload),
-            (run_dir / f"{reason_name}.pt", full_payload),
-            (model_dir / "model_latest.pt", model_payload),
-            (model_dir / f"model_{reason_name}.pt", model_payload),
-        ]
+    full_payload = build_checkpoint_payload(
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        step,
+        config_dict,
+        metrics,
+        fallback_to_model_only=True,
     )
+    model_payload = build_model_payload(model, step, config_dict, metrics)
+    jobs = [
+        (latest_path, full_payload),
+        (run_dir / f"{reason_name}.pt", full_payload),
+        (model_dir / "model_latest.pt", model_payload),
+        (model_dir / f"model_{reason_name}.pt", model_payload),
+    ]
+    try:
+        save_payloads_in_subprocess(jobs)
+    except Exception:
+        # Large Windows checkpoints can fail to spawn a saver process when the
+        # OS cannot create PyTorch shared-memory mappings. Fall back to a
+        # synchronous save rather than losing the shutdown checkpoint.
+        logger.exception("checkpoint subprocess failed for %s; falling back to synchronous save", reason_name)
+        for path, payload in jobs:
+            save_payload(path, payload)
 
 
 def _assert_torch_compile_available() -> None:
@@ -385,6 +428,7 @@ def main() -> None:
 
     logger.info("run_dir=%s", run_dir)
     logger.info("architecture=%s", config.architecture)
+    _configure_windows_spawn_executable(logger)
 
     resume_probe_path = _resolve_resume_path(config.resume, run_dir, model_dir, config.resume_allow_failed)
     resume_probe_step = _extract_step(resume_probe_path) if resume_probe_path is not None else 0
@@ -397,10 +441,16 @@ def main() -> None:
     collate_fn = None
     if isinstance(dataset, HFDiskCausalDataset):
         collate_fn = partial(HFDiskCausalDataset.causal_collate, seq_len=config.model.max_seq_len)
+    initial_num_workers = config.num_workers
+    if os.name == "nt" and config.num_workers > 0:
+        logger.info(
+            "windows DataLoader workers disabled before CUDA to keep subprocesses inside the active venv"
+        )
+        initial_num_workers = 0
     loader = _build_loader(
         dataset,
         batch_size=config.batch_size,
-        num_workers=config.num_workers,
+        num_workers=initial_num_workers,
         shuffle=True,
         drop_last=True,
         pin_memory=False,
@@ -410,17 +460,20 @@ def main() -> None:
         grad_accum_steps=config.grad_accum_steps,
     )
     pre_cuda_iterator = None
-    if os.name == "nt" and config.num_workers > 0:
+    if os.name == "nt" and initial_num_workers > 0:
         pre_cuda_iterator = iter(loader)
         logger.info(
             "primed DataLoader workers before CUDA init workers=%d pin_memory=%s",
-            config.num_workers,
+            initial_num_workers,
             False,
         )
     data_iter = _cycle_loader(loader, pre_cuda_iterator)
     logger.info(
         "dataset_size=%s initial_batch_size=%s seq_len=%s", len(dataset), config.batch_size, config.model.max_seq_len
     )
+    os.environ["NAIME_USE_FUSED_STATE_ATTENTION"] = "1" if config.use_fused_state_attention else "0"
+    if config.use_fused_state_attention:
+        logger.info("native fused state attention enabled for small state-slot paths")
 
     device = resolve_device(config.device)
     if device.type == "cuda":
@@ -535,6 +588,14 @@ def main() -> None:
         if isinstance(eval_dataset, HFDiskCausalDataset):
             eval_collate_fn = partial(HFDiskCausalDataset.causal_collate, seq_len=config.model.max_seq_len)
         eval_workers = min(config.num_workers, 2)
+        if os.name == "nt" and device.type == "cuda":
+            # Validation is built after CUDA/compile initialization. On
+            # Windows, DataLoader uses spawn; importing the full torch/dynamo
+            # stack inside eval workers can fail under a large resident model
+            # (observed as sympy MemoryError followed by worker exit). Keep
+            # eval in-process; eval is infrequent and correctness/reliability
+            # matter more than a small CPU-side prefetch gain here.
+            eval_workers = 0
         eval_sampler = None
         eval_shuffle = False
         if config.eval_sampling == "random" and config.eval_max_batches != 0:
@@ -554,13 +615,14 @@ def main() -> None:
             collate_fn=eval_collate_fn,
         )
         logger.info(
-            "eval enabled split=%s dataset_size=%s eval_every=%s max_batches=%s sampling=%s seed=%s",
+            "eval enabled split=%s dataset_size=%s eval_every=%s max_batches=%s sampling=%s seed=%s workers=%s",
             config.eval_split,
             len(eval_dataset),
             config.eval_every,
             config.eval_max_batches,
             "random" if eval_sampler is not None else "sequential",
             config.eval_seed if eval_sampler is not None else "n/a",
+            eval_workers,
         )
     elif config.eval_every > 0:
         logger.warning("eval requested but skipped because random data or missing data path is in use")
@@ -1085,6 +1147,9 @@ def main() -> None:
                     float(w_self_slot_div),
                     config.eval_state_carry,
                     config.eval_latent_thought_gain,
+                    config.eval_v7_dynamics_gain,
+                    config.eval_v7_state_swap,
+                    config.eval_v7_state_erase,
                 )
                 log_payload.update(eval_metrics)
                 log_payload["record_type"] = "train_eval"
@@ -1187,7 +1252,14 @@ def main() -> None:
                     save_metrics = {k: float(v) if isinstance(v, (int, float)) else v for k, v in log_payload.items()}
                     stop_name = "structural_stopped" if structural_should_stop else "early_stopped"
                     full_payload = build_checkpoint_payload(
-                        model, optimizer, scheduler, scaler, step, config.to_dict(), save_metrics
+                        model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        step,
+                        config.to_dict(),
+                        save_metrics,
+                        fallback_to_model_only=True,
                     )
                     model_payload = build_model_payload(model, step, config.to_dict(), save_metrics)
                     if checkpoint_writer is None:
@@ -1342,7 +1414,14 @@ def main() -> None:
                 metrics_logger.flush(force_sync=should_save_step)
                 save_metrics = {k: float(v) if isinstance(v, (int, float)) else v for k, v in log_payload.items()}
                 full_payload = build_checkpoint_payload(
-                    model, optimizer, scheduler, scaler, step, config.to_dict(), save_metrics
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    step,
+                    config.to_dict(),
+                    save_metrics,
+                    fallback_to_model_only=True,
                 )
                 if checkpoint_writer is None:
                     save_payload(latest_path, full_payload)
@@ -1364,7 +1443,14 @@ def main() -> None:
             if should_check_stop and stop_path.exists():
                 save_metrics = {k: float(v) if isinstance(v, (int, float)) else v for k, v in log_payload.items()}
                 full_payload = build_checkpoint_payload(
-                    model, optimizer, scheduler, scaler, step, config.to_dict(), save_metrics
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    step,
+                    config.to_dict(),
+                    save_metrics,
+                    fallback_to_model_only=True,
                 )
                 model_payload = build_model_payload(model, step, config.to_dict(), save_metrics)
                 if checkpoint_writer is None:
@@ -1412,7 +1498,17 @@ def main() -> None:
             except Exception:
                 logger.exception("checkpoint writer failed while flushing before failure checkpoint")
         failed_step = locals().get("step", start_step)
-        save_checkpoint(run_dir / "failed.pt", model, optimizer, scheduler, scaler, failed_step, config.to_dict(), {})
+        save_checkpoint(
+            run_dir / "failed.pt",
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            failed_step,
+            config.to_dict(),
+            {},
+            fallback_to_model_only=True,
+        )
         raise
     finally:
         stop_signals.restore()

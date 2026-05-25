@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from .cuda_ext import load_cuda_extension
+
 try:
     import triton
     import triton.language as tl
@@ -127,6 +129,40 @@ class _TritonCrossEntropy(torch.autograd.Function):
         return grad_logits.reshape(ctx.input_shape), None, None
 
 
+class _CudaExtCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, labels: torch.Tensor, ignore_index: int) -> torch.Tensor:
+        flat_logits = logits.reshape(-1, logits.size(-1)).contiguous()
+        flat_labels = labels.reshape(-1).contiguous()
+        ext = load_cuda_extension()
+        loss, valid_count = ext.cross_entropy_forward(flat_logits, flat_labels, ignore_index)
+        ctx.save_for_backward(flat_logits, flat_labels, valid_count)
+        ctx.ignore_index = ignore_index
+        ctx.input_shape = tuple(logits.shape)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        flat_logits, flat_labels, valid_count = ctx.saved_tensors
+        ext = load_cuda_extension()
+        grad_logits = ext.cross_entropy_backward(
+            grad_output.float().contiguous(),
+            flat_logits,
+            flat_labels,
+            valid_count,
+            ctx.ignore_index,
+        )
+        return grad_logits.reshape(ctx.input_shape), None, None
+
+
+def _can_use_cuda_ext(logits: torch.Tensor, labels: torch.Tensor) -> bool:
+    if not logits.is_cuda or not labels.is_cuda:
+        return False
+    if logits.ndim < 2 or logits.size(-1) <= 1:
+        return False
+    return logits.is_floating_point() and labels.dtype == torch.long
+
+
 def cross_entropy_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -134,7 +170,7 @@ def cross_entropy_loss(
     ignore_index: int,
     backend: str = "auto",
 ) -> torch.Tensor:
-    """Compute causal LM cross entropy with an optional Triton backend.
+    """Compute causal LM cross entropy with optional fused CUDA backends.
 
     The Triton backend is intentionally conservative: it only handles CUDA
     logits with vocab size up to 65,536. Larger multilingual vocabularies fall
@@ -142,13 +178,15 @@ def cross_entropy_loss(
     implemented.
     """
 
-    if backend not in {"auto", "torch", "triton_ce"}:
-        raise ValueError("lm loss backend must be one of: auto, torch, triton_ce")
+    if backend not in {"auto", "torch", "triton_ce", "cuda_ext_ce"}:
+        raise ValueError("lm loss backend must be one of: auto, torch, triton_ce, cuda_ext_ce")
     if backend in {"auto", "torch"}:
         return _torch_cross_entropy(logits, labels, ignore_index)
-    if _can_use_triton(logits, labels):
+    if backend == "triton_ce" and _can_use_triton(logits, labels):
         return _TritonCrossEntropy.apply(logits, labels, ignore_index)
+    if backend == "cuda_ext_ce" and _can_use_cuda_ext(logits, labels):
+        return _CudaExtCrossEntropy.apply(logits, labels, ignore_index)
     raise RuntimeError(
-        "triton_ce backend is unavailable for this input. "
-        "Use backend='auto' for PyTorch fallback or reduce vocab size to <= 65536 on CUDA."
+        f"{backend} backend is unavailable for this input. "
+        "Use backend='auto' for PyTorch fallback or check CUDA/runtime availability."
     )

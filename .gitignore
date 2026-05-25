@@ -18,6 +18,7 @@ Agent/
 experiments/runs/
 experiments/debug_suite/
 experiments/profiles/
+runs/
 *.pt
 *.pth
 *.safetensors
@@ -39,4 +40,5 @@ wandb/
 
 research/
 analysis/remote_runs/
+analysis/remote_inspections/
 configs/workspace.local.json

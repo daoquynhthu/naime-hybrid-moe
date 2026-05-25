@@ -98,6 +98,19 @@ class NAIMEStateMoEConfig:
     latent_field_token_scale: float = 0.02
     latent_field_max_ratio: float = 0.05
 
+    # V7 typed internal dynamics.
+    v7_dynamics_steps: int = 0
+    v7_latent_slots: int = 0
+    v7_latent_write_scale: float = 0.03
+    v7_hidden_write_scale: float = 0.01
+    v7_max_hidden_write_ratio: float = 0.05
+    v7_state_write_scale: float = 0.02
+    v7_past_latent_adapt_steps: int = 1
+    v7_dynamic_depth: bool = False
+    v7_min_dynamics_steps: int = 1
+    v7_max_dynamics_steps: int = 0
+    v7_dynamic_convergence_threshold: float = 0.0
+
     # Stability / architecture toggles.
     qk_norm: bool = True
     rope_theta: float = 10000.0

@@ -18,21 +18,27 @@ class NAIMEStatePacket:
 
     world_state: torch.Tensor | None = None
     self_state: torch.Tensor | None = None
+    latent_field: torch.Tensor | None = None
     memory: torch.Tensor | None = None
     state_version: int = 1
+    protocol_version: str = "state-protocol-v1"
     architecture_id: str = "naime"
     causal_integrity_version: int = 2
+    tokenizer_hash: str | None = None
     created_step: int | None = None
     confidence: float | None = None
 
-    def detach(self) -> "NAIMEStatePacket":
+    def detach(self) -> NAIMEStatePacket:
         return NAIMEStatePacket(
             world_state=_detach_optional(self.world_state),
             self_state=_detach_optional(self.self_state),
+            latent_field=_detach_optional(self.latent_field),
             memory=_detach_optional(self.memory),
             state_version=self.state_version,
+            protocol_version=self.protocol_version,
             architecture_id=self.architecture_id,
             causal_integrity_version=self.causal_integrity_version,
+            tokenizer_hash=self.tokenizer_hash,
             created_step=self.created_step,
             confidence=self.confidence,
         )
@@ -42,14 +48,17 @@ class NAIMEStatePacket:
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
-    ) -> "NAIMEStatePacket":
+    ) -> NAIMEStatePacket:
         return NAIMEStatePacket(
             world_state=_to_optional(self.world_state, device=device, dtype=dtype),
             self_state=_to_optional(self.self_state, device=device, dtype=dtype),
+            latent_field=_to_optional(self.latent_field, device=device, dtype=dtype),
             memory=_to_optional(self.memory, device=device, dtype=dtype),
             state_version=self.state_version,
+            protocol_version=self.protocol_version,
             architecture_id=self.architecture_id,
             causal_integrity_version=self.causal_integrity_version,
+            tokenizer_hash=self.tokenizer_hash,
             created_step=self.created_step,
             confidence=self.confidence,
         )
@@ -58,6 +67,7 @@ class NAIMEStatePacket:
         for name, value in (
             ("world_state", self.world_state),
             ("self_state", self.self_state),
+            ("latent_field", self.latent_field),
             ("memory", self.memory),
         ):
             if value is not None and value.size(0) != batch_size:

@@ -161,20 +161,34 @@ def build_checkpoint_payload(
     step: int,
     config: dict,
     metrics: dict,
+    *,
+    fallback_to_model_only: bool = False,
 ) -> dict[str, Any]:
     config = dict(config)
     config.setdefault("causal_integrity_version", 2)
     model = unwrap_compiled_model(model)
-    return {
+    payload: dict[str, Any] = {
         "step": step,
         "model": _snapshot_value(_normalize_nested_compiled_prefixes(model.state_dict())),
-        "optimizer": _snapshot_value(optimizer.state_dict()),
-        "scheduler": _snapshot_value(scheduler.state_dict() if scheduler is not None else None),
-        "scaler": _snapshot_value(scaler.state_dict() if scaler is not None else None),
         "config": config,
         "metrics": metrics,
-        "rng": _snapshot_value(rng_state()),
+        "checkpoint_kind": "full",
     }
+    try:
+        payload["optimizer"] = _snapshot_value(optimizer.state_dict())
+        payload["scheduler"] = _snapshot_value(scheduler.state_dict() if scheduler is not None else None)
+        payload["scaler"] = _snapshot_value(scaler.state_dict() if scaler is not None else None)
+        payload["rng"] = _snapshot_value(rng_state())
+    except Exception as exc:
+        if not fallback_to_model_only:
+            raise
+        payload["optimizer"] = None
+        payload["scheduler"] = None
+        payload["scaler"] = None
+        payload["rng"] = None
+        payload["checkpoint_kind"] = "model_only_fallback"
+        payload["checkpoint_fallback_reason"] = f"{type(exc).__name__}: {exc}"
+    return payload
 
 
 def build_model_payload(
@@ -191,6 +205,7 @@ def build_model_payload(
         "model": _snapshot_value(_normalize_nested_compiled_prefixes(model.state_dict())),
         "config": config,
         "metrics": metrics,
+        "checkpoint_kind": "model_only",
     }
 
 
@@ -261,8 +276,22 @@ def save_checkpoint(
     step: int,
     config: dict,
     metrics: dict,
+    *,
+    fallback_to_model_only: bool = False,
 ) -> None:
-    _save_payload(path, build_checkpoint_payload(model, optimizer, scheduler, scaler, step, config, metrics))
+    _save_payload(
+        path,
+        build_checkpoint_payload(
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            step,
+            config,
+            metrics,
+            fallback_to_model_only=fallback_to_model_only,
+        ),
+    )
 
 
 def save_payload(path: Path, payload: dict[str, Any]) -> None:

@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
             "naime_v42_state_moe",
             "naime_v5_world_state_moe",
             "naime_v6_recursive_self_moe",
+            "naime_v7_typed_dynamics",
         ],
     )
     parser.add_argument("--run-name", default="debug")
@@ -63,8 +64,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lm-loss-backend",
         default="auto",
-        choices=["auto", "torch", "triton_ce", "cuda_ext_fused_ce"],
+        choices=["auto", "torch", "triton_ce", "cuda_ext_ce", "cuda_ext_fused_ce"],
         help="LM cross-entropy backend. auto uses safe accelerated kernels when available.",
+    )
+    parser.add_argument(
+        "--use-fused-state-attention",
+        action="store_true",
+        help="Use the native CUDA state softmax+matmul path for small slot banks.",
     )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -138,6 +144,21 @@ def parse_args() -> argparse.Namespace:
         "--eval-latent-thought-gain",
         action="store_true",
         help="During validation, estimate whether latent thought steps improve LM loss versus steps=0.",
+    )
+    parser.add_argument(
+        "--eval-v7-dynamics-gain",
+        action="store_true",
+        help="During validation, estimate whether V7 typed dynamics steps improve LM loss versus steps=0.",
+    )
+    parser.add_argument(
+        "--eval-v7-state-swap",
+        action="store_true",
+        help="During validation, swap StatePacket batch entries and measure whether wrong state hurts next chunk loss.",
+    )
+    parser.add_argument(
+        "--eval-v7-state-erase",
+        action="store_true",
+        help="During validation, erase world/self/latent packet fields and measure next chunk sensitivity.",
     )
     parser.add_argument(
         "--early-stop-patience",
@@ -360,6 +381,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--latent-field-token-scale", type=float, default=0.02)
     parser.add_argument("--latent-field-max-ratio", type=float, default=0.05)
+    parser.add_argument("--v7-dynamics-steps", type=int, default=0)
+    parser.add_argument("--v7-latent-slots", type=int, default=0)
+    parser.add_argument("--v7-latent-write-scale", type=float, default=0.03)
+    parser.add_argument("--v7-hidden-write-scale", type=float, default=0.01)
+    parser.add_argument("--v7-max-hidden-write-ratio", type=float, default=0.05)
+    parser.add_argument("--v7-state-write-scale", type=float, default=0.02)
+    parser.add_argument(
+        "--v7-past-latent-adapt-steps",
+        type=int,
+        default=1,
+        help="Suppress hidden reads from a carried V7 latent field for this many dynamics steps.",
+    )
+    parser.add_argument("--v7-dynamic-depth", action="store_true")
+    parser.add_argument("--v7-min-dynamics-steps", type=int, default=1)
+    parser.add_argument(
+        "--v7-max-dynamics-steps",
+        type=int,
+        default=0,
+        help="Maximum V7 dynamics steps when dynamic depth is enabled. 0 reuses --v7-dynamics-steps.",
+    )
+    parser.add_argument("--v7-dynamic-convergence-threshold", type=float, default=0.0)
     parser.add_argument("--n-experts", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=2)
     parser.add_argument("--expert-hidden-dim", type=int, default=512)
@@ -462,6 +504,17 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         latent_field_coupling=args.latent_field_coupling,
         latent_field_token_scale=args.latent_field_token_scale,
         latent_field_max_ratio=args.latent_field_max_ratio,
+        v7_dynamics_steps=args.v7_dynamics_steps,
+        v7_latent_slots=args.v7_latent_slots,
+        v7_latent_write_scale=args.v7_latent_write_scale,
+        v7_hidden_write_scale=args.v7_hidden_write_scale,
+        v7_max_hidden_write_ratio=args.v7_max_hidden_write_ratio,
+        v7_state_write_scale=args.v7_state_write_scale,
+        v7_past_latent_adapt_steps=args.v7_past_latent_adapt_steps,
+        v7_dynamic_depth=args.v7_dynamic_depth,
+        v7_min_dynamics_steps=args.v7_min_dynamics_steps,
+        v7_max_dynamics_steps=args.v7_max_dynamics_steps,
+        v7_dynamic_convergence_threshold=args.v7_dynamic_convergence_threshold,
         n_experts=args.n_experts,
         top_k=args.top_k,
         expert_hidden_dim=args.expert_hidden_dim,
@@ -502,6 +555,9 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         eval_seed=args.eval_seed,
         eval_state_carry=args.eval_state_carry,
         eval_latent_thought_gain=args.eval_latent_thought_gain,
+        eval_v7_dynamics_gain=args.eval_v7_dynamics_gain,
+        eval_v7_state_swap=args.eval_v7_state_swap,
+        eval_v7_state_erase=args.eval_v7_state_erase,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
         early_stop_min_evals=args.early_stop_min_evals,
@@ -515,6 +571,7 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         keep_last_n=args.keep_last_n,
         grad_accum_steps=args.grad_accum_steps,
         lm_loss_backend=args.lm_loss_backend,
+        use_fused_state_attention=args.use_fused_state_attention,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,

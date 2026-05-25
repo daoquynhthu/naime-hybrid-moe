@@ -459,7 +459,8 @@ class RecursiveSelfState(nn.Module):
                 candidate = torch.tanh(self.update(update_input))
                 gate = torch.sigmoid(self.update_gate(update_input)) * self.write_scale
                 next_state = current + gate * (candidate - current)
-                block_delta = block_delta + (next_state - current).float().pow(2).mean()
+                with torch.no_grad():
+                    block_delta = block_delta + (next_state - current).float().pow(2).mean()
                 current = next_state
 
             previous_summary = self.self_norm(state_before_block).mean(dim=1)
@@ -483,15 +484,16 @@ class RecursiveSelfState(nn.Module):
                 slot_cosine = off_diag_cosine.mean()
                 slot_context_cosine = off_diag_context_cosine.mean()
 
-            probs = block_boundary.detach().float().clamp_min(1e-8)
-            entropy = -(probs * probs.log()).sum(dim=-1)
-            mask_f = block_mask.float()
-            boundary_entropy = (entropy * mask_f).sum() / mask_f.sum().clamp_min(1.0)
-            boundary_means = self._masked_mean(block_boundary, block_mask)
-            state_delta = block_delta / self.recursion_depth
-            state_velocity = state_delta.float().sqrt()
-            state_acceleration = (state_velocity - previous_delta).abs()
-            previous_delta = state_velocity.detach()
+            with torch.no_grad():
+                probs = block_boundary.float().clamp_min(1e-8)
+                entropy = -(probs * probs.log()).sum(dim=-1)
+                mask_f = block_mask.float()
+                boundary_entropy = (entropy * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+                boundary_means = self._masked_mean(block_boundary.detach(), block_mask)
+                state_delta = block_delta / self.recursion_depth
+                state_velocity = state_delta.float().sqrt()
+                state_acceleration = (state_velocity - previous_delta).abs()
+                previous_delta = state_velocity
             state_trace.append(current)
 
             metric_values["self_pred"].append(self_pred_loss)

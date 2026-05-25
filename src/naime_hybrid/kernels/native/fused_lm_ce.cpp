@@ -8,6 +8,18 @@ std::vector<torch::Tensor> fused_lm_ce_forward_cuda(
     torch::Tensor labels,
     int64_t ignore_index);
 
+std::vector<torch::Tensor> cross_entropy_forward_cuda(
+    torch::Tensor logits,
+    torch::Tensor labels,
+    int64_t ignore_index);
+
+torch::Tensor cross_entropy_backward_cuda(
+    torch::Tensor grad_output,
+    torch::Tensor logits,
+    torch::Tensor labels,
+    torch::Tensor valid_count,
+    int64_t ignore_index);
+
 std::vector<torch::Tensor> fused_rms_norm_forward_cuda(
     torch::Tensor input,
     torch::Tensor weight,
@@ -50,6 +62,41 @@ std::vector<torch::Tensor> fused_lm_ce_forward(
       hidden.contiguous(),
       weight.contiguous(),
       labels.contiguous(),
+      ignore_index);
+}
+
+std::vector<torch::Tensor> cross_entropy_forward(
+    torch::Tensor logits,
+    torch::Tensor labels,
+    int64_t ignore_index) {
+  TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor");
+  TORCH_CHECK(labels.is_cuda(), "labels must be a CUDA tensor");
+  TORCH_CHECK(logits.dim() == 2, "logits must be [N, V]");
+  TORCH_CHECK(labels.dim() == 1, "labels must be [N]");
+  TORCH_CHECK(logits.size(0) == labels.size(0), "logit rows must match labels");
+  TORCH_CHECK(labels.scalar_type() == torch::kInt64, "labels must be int64");
+  return cross_entropy_forward_cuda(logits.contiguous(), labels.contiguous(), ignore_index);
+}
+
+torch::Tensor cross_entropy_backward(
+    torch::Tensor grad_output,
+    torch::Tensor logits,
+    torch::Tensor labels,
+    torch::Tensor valid_count,
+    int64_t ignore_index) {
+  TORCH_CHECK(grad_output.is_cuda(), "grad_output must be a CUDA tensor");
+  TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor");
+  TORCH_CHECK(labels.is_cuda(), "labels must be a CUDA tensor");
+  TORCH_CHECK(valid_count.is_cuda(), "valid_count must be a CUDA tensor");
+  TORCH_CHECK(logits.dim() == 2, "logits must be [N, V]");
+  TORCH_CHECK(labels.dim() == 1, "labels must be [N]");
+  TORCH_CHECK(logits.size(0) == labels.size(0), "logit rows must match labels");
+  TORCH_CHECK(labels.scalar_type() == torch::kInt64, "labels must be int64");
+  return cross_entropy_backward_cuda(
+      grad_output.contiguous(),
+      logits.contiguous(),
+      labels.contiguous(),
+      valid_count.contiguous(),
       ignore_index);
 }
 
@@ -154,6 +201,8 @@ std::vector<torch::Tensor> fused_state_softmax_matmul_backward(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_lm_ce_forward", &fused_lm_ce_forward, "Fused LM CE forward (CUDA)");
+  m.def("cross_entropy_forward", &cross_entropy_forward, "Cross entropy forward (CUDA)");
+  m.def("cross_entropy_backward", &cross_entropy_backward, "Cross entropy backward (CUDA)");
   m.def("fused_rms_norm_forward", &fused_rms_norm_forward, "Fused RMSNorm forward (CUDA)");
   m.def("fused_rms_norm_backward", &fused_rms_norm_backward, "Fused RMSNorm backward (CUDA)");
   m.def(

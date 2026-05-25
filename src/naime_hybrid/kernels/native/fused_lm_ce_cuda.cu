@@ -137,6 +137,205 @@ std::vector<at::Tensor> fused_lm_ce_forward_cuda(
 }
 
 template <typename scalar_t>
+__global__ void cross_entropy_forward_kernel(
+    const scalar_t* __restrict__ logits,
+    const int64_t* __restrict__ labels,
+    float* __restrict__ losses,
+    int64_t* __restrict__ valid_counts,
+    int64_t rows,
+    int64_t vocab,
+    int64_t ignore_index) {
+  extern __shared__ float shared[];
+  float* reduce = shared;
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int64_t label = labels[row];
+
+  if (label == ignore_index) {
+    if (tid == 0) {
+      losses[row] = 0.0f;
+      valid_counts[row] = 0;
+    }
+    return;
+  }
+
+  const int64_t base = row * vocab;
+  float local_max = -FLT_MAX;
+  for (int64_t v = tid; v < vocab; v += blockDim.x) {
+    local_max = fmaxf(local_max, static_cast<float>(logits[base + v]));
+  }
+  reduce[tid] = local_max;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+    }
+    __syncthreads();
+  }
+  const float row_max = reduce[0];
+
+  float local_sum = 0.0f;
+  for (int64_t v = tid; v < vocab; v += blockDim.x) {
+    local_sum += expf(static_cast<float>(logits[base + v]) - row_max);
+  }
+  reduce[tid] = local_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] += reduce[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const float target = static_cast<float>(logits[base + label]);
+    losses[row] = logf(reduce[0]) + row_max - target;
+    valid_counts[row] = 1;
+  }
+}
+
+std::vector<at::Tensor> cross_entropy_forward_cuda(
+    at::Tensor logits,
+    at::Tensor labels,
+    int64_t ignore_index) {
+  const c10::cuda::CUDAGuard device_guard(logits.device());
+  const auto rows = logits.size(0);
+  const auto vocab = logits.size(1);
+
+  auto losses = at::empty({rows}, logits.options().dtype(at::kFloat));
+  auto valid_counts = at::empty({rows}, labels.options());
+
+  const int threads = 256;
+  const dim3 blocks(rows);
+  const size_t shared_bytes = static_cast<size_t>(threads) * sizeof(float);
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      logits.scalar_type(),
+      "cross_entropy_forward_cuda",
+      [&] {
+        cross_entropy_forward_kernel<scalar_t><<<blocks, threads, shared_bytes, stream>>>(
+            logits.data_ptr<scalar_t>(),
+            labels.data_ptr<int64_t>(),
+            losses.data_ptr<float>(),
+            valid_counts.data_ptr<int64_t>(),
+            rows,
+            vocab,
+            ignore_index);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto valid = valid_counts.sum();
+  auto loss = losses.sum() / valid.clamp_min(1).to(losses.dtype());
+  return {loss, valid};
+}
+
+template <typename scalar_t>
+__global__ void cross_entropy_backward_kernel(
+    const scalar_t* __restrict__ logits,
+    const int64_t* __restrict__ labels,
+    const int64_t* __restrict__ valid_count,
+    const float* __restrict__ grad_output,
+    scalar_t* __restrict__ grad_logits,
+    int64_t rows,
+    int64_t vocab,
+    int64_t ignore_index) {
+  extern __shared__ float shared[];
+  float* reduce = shared;
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int64_t label = labels[row];
+  const int64_t base = row * vocab;
+
+  if (label == ignore_index) {
+    for (int64_t v = tid; v < vocab; v += blockDim.x) {
+      grad_logits[base + v] = static_cast<scalar_t>(0.0f);
+    }
+    return;
+  }
+
+  float local_max = -FLT_MAX;
+  for (int64_t v = tid; v < vocab; v += blockDim.x) {
+    local_max = fmaxf(local_max, static_cast<float>(logits[base + v]));
+  }
+  reduce[tid] = local_max;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+    }
+    __syncthreads();
+  }
+  const float row_max = reduce[0];
+
+  float local_sum = 0.0f;
+  for (int64_t v = tid; v < vocab; v += blockDim.x) {
+    local_sum += expf(static_cast<float>(logits[base + v]) - row_max);
+  }
+  reduce[tid] = local_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] += reduce[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float denom = reduce[0];
+  const int64_t valid = valid_count[0] > 1 ? valid_count[0] : 1;
+  const float scale = grad_output[0] / static_cast<float>(valid);
+
+  for (int64_t v = tid; v < vocab; v += blockDim.x) {
+    float grad = expf(static_cast<float>(logits[base + v]) - row_max) / denom;
+    if (v == label) {
+      grad -= 1.0f;
+    }
+    grad_logits[base + v] = static_cast<scalar_t>(grad * scale);
+  }
+}
+
+at::Tensor cross_entropy_backward_cuda(
+    at::Tensor grad_output,
+    at::Tensor logits,
+    at::Tensor labels,
+    at::Tensor valid_count,
+    int64_t ignore_index) {
+  const c10::cuda::CUDAGuard device_guard(logits.device());
+  const auto rows = logits.size(0);
+  const auto vocab = logits.size(1);
+  auto grad_logits = at::empty_like(logits);
+
+  const int threads = 256;
+  const dim3 blocks(rows);
+  const size_t shared_bytes = static_cast<size_t>(threads) * sizeof(float);
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      logits.scalar_type(),
+      "cross_entropy_backward_cuda",
+      [&] {
+        cross_entropy_backward_kernel<scalar_t><<<blocks, threads, shared_bytes, stream>>>(
+            logits.data_ptr<scalar_t>(),
+            labels.data_ptr<int64_t>(),
+            valid_count.data_ptr<int64_t>(),
+            grad_output.data_ptr<float>(),
+            grad_logits.data_ptr<scalar_t>(),
+            rows,
+            vocab,
+            ignore_index);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return grad_logits;
+}
+
+template <typename scalar_t>
 __global__ void fused_rms_norm_forward_kernel(
     const scalar_t* __restrict__ input,
     const float* __restrict__ weight,

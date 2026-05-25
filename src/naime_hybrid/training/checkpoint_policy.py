@@ -27,11 +27,30 @@ def save_checkpoint_pair(
 ) -> None:
     config_dict = config.to_dict()
     if writer is None:
-        save_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, step, config_dict, metrics)
+        save_checkpoint(
+            checkpoint_path,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            step,
+            config_dict,
+            metrics,
+            fallback_to_model_only=True,
+        )
         save_model_weights(model_path, model, step, config_dict, metrics)
         return
 
-    checkpoint_payload = build_checkpoint_payload(model, optimizer, scheduler, scaler, step, config_dict, metrics)
+    checkpoint_payload = build_checkpoint_payload(
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        step,
+        config_dict,
+        metrics,
+        fallback_to_model_only=True,
+    )
     writer.submit(checkpoint_path, checkpoint_payload)
     writer.wait()
     del checkpoint_payload
@@ -61,7 +80,16 @@ def save_checkpoint_bundle(
     can push Windows commit charge over the limit during long GPU runs.
     """
     config_dict = config.to_dict()
-    checkpoint_payload = build_checkpoint_payload(model, optimizer, scheduler, scaler, step, config_dict, metrics)
+    checkpoint_payload = build_checkpoint_payload(
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        step,
+        config_dict,
+        metrics,
+        fallback_to_model_only=True,
+    )
     if writer is None:
         for path in checkpoint_paths:
             save_payload(path, checkpoint_payload)

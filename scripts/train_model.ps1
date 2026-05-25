@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("dense", "token_moe", "naime_state_moe", "naime_v4_state_moe", "naime_v5_world_state_moe", "naime_v6_recursive_self_moe")]
+    [ValidateSet("dense", "token_moe", "naime_state_moe", "naime_v4_state_moe", "naime_v5_world_state_moe", "naime_v6_recursive_self_moe", "naime_v7_typed_dynamics")]
     [string]$Model,
     [switch]$UseVoice,
     [string]$RunName = "",
@@ -33,8 +33,9 @@ param(
     [switch]$NoAdaptiveDefaults,
     [int]$NumWorkers = 4,
     [int]$GradAccumSteps = 1,
-    [ValidateSet("auto", "torch", "triton_ce", "cuda_ext_fused_ce")]
+    [ValidateSet("auto", "torch", "triton_ce", "cuda_ext_ce", "cuda_ext_fused_ce")]
     [string]$LmLossBackend = "auto",
+    [switch]$UseFusedStateAttention,
     [double]$LearningRate = 0.0003,
     [int]$WarmupSteps = 100,
     [double]$MinLrRatio = 0.1,
@@ -66,6 +67,9 @@ param(
     [int]$EvalSeed = 4321,
     [switch]$EvalStateCarry,
     [switch]$EvalLatentThoughtGain,
+    [switch]$EvalV7DynamicsGain,
+    [switch]$EvalV7StateSwap,
+    [switch]$EvalV7StateErase,
     [int]$EarlyStopPatience = 0,
     [int]$EarlyStopMinEvals = 0,
     [double]$EarlyStopMinDelta = 0.0,
@@ -99,6 +103,17 @@ param(
     [switch]$LatentFieldCoupling,
     [double]$LatentFieldTokenScale = 0.02,
     [double]$LatentFieldMaxRatio = 0.05,
+    [int]$V7DynamicsSteps = 1,
+    [int]$V7LatentSlots = 0,
+    [double]$V7LatentWriteScale = 0.03,
+    [double]$V7HiddenWriteScale = 0.01,
+    [double]$V7MaxHiddenWriteRatio = 0.05,
+    [double]$V7StateWriteScale = 0.02,
+    [int]$V7PastLatentAdaptSteps = 1,
+    [switch]$V7DynamicDepth,
+    [int]$V7MinDynamicsSteps = 1,
+    [int]$V7MaxDynamicsSteps = 0,
+    [double]$V7DynamicConvergenceThreshold = 0.0,
     [double]$LambdaStatePred = 0.0,
     [double]$LambdaSlotDiversity = 0.0,
     [double]$LambdaSlotStability = 0.0,
@@ -140,7 +155,8 @@ if ([string]::IsNullOrWhiteSpace($RunName)) {
 $StateModels = @(
     "naime_v4_state_moe",
     "naime_v5_world_state_moe",
-    "naime_v6_recursive_self_moe"
+    "naime_v6_recursive_self_moe",
+    "naime_v7_typed_dynamics"
 )
 $HybridRouterModels = @(
     "naime_state_moe"
@@ -192,6 +208,7 @@ $architecture = switch ($Model) {
     "naime_v4_state_moe" { "naime_v4_state_moe" }
     "naime_v5_world_state_moe" { "naime_v5_world_state_moe" }
     "naime_v6_recursive_self_moe" { "naime_v6_recursive_self_moe" }
+    "naime_v7_typed_dynamics" { "naime_v7_typed_dynamics" }
     default { "naime_state_moe" }
 }
 
@@ -250,6 +267,18 @@ if ($EvalStateCarry) {
 }
 if ($EvalLatentThoughtGain) {
     $common += "--eval-latent-thought-gain"
+}
+if ($EvalV7DynamicsGain) {
+    $common += "--eval-v7-dynamics-gain"
+}
+if ($EvalV7StateSwap) {
+    $common += "--eval-v7-state-swap"
+}
+if ($EvalV7StateErase) {
+    $common += "--eval-v7-state-erase"
+}
+if ($UseFusedStateAttention) {
+    $common += "--use-fused-state-attention"
 }
 
 if (-not $NoAutoBatch) {
@@ -380,7 +409,7 @@ if ($isStateModel) {
             "--semantic-state-write-scale", "0.03"
         )
     }
-    if ($Model -in @("naime_v5_world_state_moe", "naime_v6_recursive_self_moe")) {
+    if ($Model -in @("naime_v5_world_state_moe", "naime_v6_recursive_self_moe", "naime_v7_typed_dynamics")) {
         $common += @(
             "--semantic-gate-mixer-temperature", "2.5",
             "--semantic-gate-mixer-min-weight", "0.08",
@@ -394,7 +423,7 @@ if ($isStateModel) {
             "--semantic-state-write-scale", $(if ($SemanticStateWriteScale -gt 0.0) { "$SemanticStateWriteScale" } else { "0.045" })
         )
     }
-    if ($Model -in @("naime_v5_world_state_moe", "naime_v6_recursive_self_moe")) {
+    if ($Model -in @("naime_v5_world_state_moe", "naime_v6_recursive_self_moe", "naime_v7_typed_dynamics")) {
         $common += @(
             "--world-state-slots", "$WorldStateSlots",
             "--semantic-memory-hidden-scale", $(if ($SemanticMemoryHiddenScale -gt 0.0) { "$SemanticMemoryHiddenScale" } else { "0.035" }),
@@ -417,7 +446,7 @@ if ($isStateModel) {
             $common += @("--semantic-router-prior-gate")
         }
     }
-    if ($Model -eq "naime_v6_recursive_self_moe") {
+    if ($Model -in @("naime_v6_recursive_self_moe", "naime_v7_typed_dynamics")) {
         $common += @(
             "--self-state-slots", "$SelfStateSlots",
             "--self-state-recursion-depth", "$SelfStateRecursionDepth",
@@ -445,6 +474,23 @@ if ($isStateModel) {
         }
         if ($NoSelfStateWorldGate) {
             $common += "--no-self-state-world-gate"
+        }
+        if ($Model -eq "naime_v7_typed_dynamics") {
+            $common += @(
+                "--v7-dynamics-steps", "$V7DynamicsSteps",
+                "--v7-latent-slots", "$V7LatentSlots",
+                "--v7-latent-write-scale", "$V7LatentWriteScale",
+                "--v7-hidden-write-scale", "$V7HiddenWriteScale",
+                "--v7-max-hidden-write-ratio", "$V7MaxHiddenWriteRatio",
+                "--v7-state-write-scale", "$V7StateWriteScale",
+                "--v7-past-latent-adapt-steps", "$V7PastLatentAdaptSteps",
+                "--v7-min-dynamics-steps", "$V7MinDynamicsSteps",
+                "--v7-max-dynamics-steps", "$V7MaxDynamicsSteps",
+                "--v7-dynamic-convergence-threshold", "$V7DynamicConvergenceThreshold"
+            )
+            if ($V7DynamicDepth) {
+                $common += "--v7-dynamic-depth"
+            }
         }
     }
 }

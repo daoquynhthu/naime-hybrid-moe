@@ -6,6 +6,7 @@ from .decoder import (
     NAIMEV4StateMoEDecoder,
     NAIMEV5WorldStateMoEDecoder,
     NAIMEV6RecursiveSelfMoEDecoder,
+    NAIMEV7TypedDynamicsDecoder,
     TokenMoEDecoder,
 )
 
@@ -34,4 +35,6 @@ def build_model(architecture: str, config: NAIMEStateMoEConfig):
         return NAIMEV5WorldStateMoEDecoder(config)
     if architecture in {"naime_v6", "naime_v6_recursive_self_moe", "recursive_self_moe_v6"}:
         return NAIMEV6RecursiveSelfMoEDecoder(config)
+    if architecture in {"naime_v7", "naime_v7_typed_dynamics", "typed_dynamics_v7"}:
+        return NAIMEV7TypedDynamicsDecoder(config)
     raise ValueError(f"unknown architecture: {architecture}")

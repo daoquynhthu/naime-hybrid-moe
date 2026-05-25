@@ -51,7 +51,7 @@ function Run-R {
 # ── Helper: get latest run name ────────────────────────────────────
 function Get-LatestRun {
     $r = & "$ScriptDir\ssh_cmd.ps1" -RemoteHost $sshHost -ScriptBlock `
-        ('Get-ChildItem "{0}" -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty Name' -f $rr)
+        ('Get-ChildItem "{0}" -Directory | Where-Object {{ (Test-Path (Join-Path $_.FullName "train.log")) -or (Test-Path (Join-Path $_.FullName "metrics.jsonl")) }} | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty Name' -f $rr)
     return $r[-1].Trim()
 }
 
@@ -86,7 +86,7 @@ switch ($Command) {
         Run-R ('Get-ChildItem "{0}" -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 8 Name,LastWriteTime | Format-Table -AutoSize' -f $rr)
         Write-Output ""
         Write-Output "========== Latest Log (tail 5) =========="
-        Run-R ('$r=Get-ChildItem "{0}" -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty Name; Write-Output "$r:"; Get-Content "{0}\$r\train.log" -Tail 5 -ErrorAction SilentlyContinue' -f $rr)
+        Run-R ('$r=Get-ChildItem "{0}" -Directory | Where-Object {{ (Test-Path (Join-Path $_.FullName "train.log")) -or (Test-Path (Join-Path $_.FullName "metrics.jsonl")) }} | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty Name; if ($r) {{ Write-Output "${{r}}:"; Get-Content "{0}\$r\train.log" -Tail 5 -ErrorAction SilentlyContinue }} else {{ Write-Output "no run logs found" }}' -f $rr)
     }
 
     "log" {

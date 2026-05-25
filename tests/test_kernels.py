@@ -47,6 +47,25 @@ def test_auto_cross_entropy_falls_back_for_large_vocab():
     assert logits.grad is not None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for native CUDA extension validation")
+def test_cuda_ext_cross_entropy_matches_torch_forward_and_backward():
+    torch.manual_seed(2345)
+    logits = torch.randn(3, 5, 97, device="cuda", dtype=torch.float32, requires_grad=True)
+    labels = torch.randint(0, 97, (3, 5), device="cuda")
+    labels[1, 3] = IGNORE_INDEX
+
+    ref_logits = logits.detach().clone().requires_grad_(True)
+    actual = lm_loss(logits, labels, backend="cuda_ext_ce")
+    expected = lm_loss(ref_logits, labels, backend="torch")
+
+    assert torch.allclose(actual, expected, atol=2e-5, rtol=2e-5)
+
+    actual.backward()
+    expected.backward()
+
+    assert torch.allclose(logits.grad, ref_logits.grad, atol=5e-5, rtol=5e-5)
+
+
 def test_fused_lm_loss_torch_backend_matches_explicit_logits():
     hidden = torch.randn(2, 3, 8, requires_grad=True)
     weight = torch.randn(17, 8, requires_grad=True)

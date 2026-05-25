@@ -2,6 +2,7 @@ import torch
 from torch import nn
 
 from naime_hybrid.config import NAIMEStateMoEConfig
+from naime_hybrid.models.state_packet import NAIMEStatePacket
 from naime_hybrid.modules.blocks import (
     DenseTransformerBlock,
     NAIMEStateMoEBlock,
@@ -13,8 +14,8 @@ from naime_hybrid.modules.latent_field import LatentFieldCoupler
 from naime_hybrid.modules.norm import RMSNorm
 from naime_hybrid.modules.self_state import RecursiveSelfState
 from naime_hybrid.modules.state import CrossLayerSemanticState
+from naime_hybrid.modules.typed_dynamics import TypedLatentDynamics
 from naime_hybrid.modules.world_state import WorldStateSlots
-from naime_hybrid.models.state_packet import NAIMEStatePacket
 
 
 def _init_weights(module: nn.Module) -> None:
@@ -569,6 +570,199 @@ class NAIMEV6RecursiveSelfMoEDecoder(NAIMEV5WorldStateMoEDecoder):
                 self_state=self_state,
                 memory=memory,
                 architecture_id="naime_v6_recursive_self_moe",
+            )
+        if return_logits:
+            output["logits"] = self.lm_head(hidden_states)
+        if return_aux:
+            output["aux"] = aux_by_layer
+        return output
+
+
+class NAIMEV7TypedDynamicsDecoder(NAIMEV6RecursiveSelfMoEDecoder):
+    """V7 decoder with typed internal dynamics before LM readout."""
+
+    def __init__(self, config: NAIMEStateMoEConfig):
+        super().__init__(config)
+        latent_slots = config.v7_latent_slots or max(1, config.self_state_slots or config.world_state_slots or 4)
+        self.typed_dynamics = TypedLatentDynamics(
+            config.d_model,
+            latent_slots=latent_slots,
+            latent_write_scale=config.v7_latent_write_scale,
+            hidden_write_scale=config.v7_hidden_write_scale,
+            max_hidden_write_ratio=config.v7_max_hidden_write_ratio,
+            state_write_scale=config.v7_state_write_scale,
+        )
+        self.typed_dynamics.apply(_init_weights)
+        nn.init.constant_(self.typed_dynamics.hidden_gate.bias, -3.0)
+
+    def _initial_latent_field(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return self.typed_dynamics.initial_state(batch_size, device, dtype)
+
+    def _resolve_latent_field(
+        self,
+        *,
+        past_state: NAIMEStatePacket | None,
+        past_latent_field: torch.Tensor | None,
+        detach_past_state: bool,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        latent_field = past_state.latent_field if past_state is not None else past_latent_field
+        if latent_field is None:
+            return None
+        if detach_past_state:
+            latent_field = latent_field.detach()
+        latent_field = latent_field.to(device=device, dtype=dtype)
+        if latent_field.size(0) != batch_size:
+            raise ValueError(f"latent_field batch mismatch: expected {batch_size}, got {latent_field.size(0)}")
+        return latent_field
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        tau: float | None = None,
+        return_aux: bool = True,
+        return_logits: bool = True,
+        infer_pad_mask: bool | None = None,
+        past_state: NAIMEStatePacket | None = None,
+        past_world_state: torch.Tensor | None = None,
+        past_self_state: torch.Tensor | None = None,
+        past_latent_field: torch.Tensor | None = None,
+        past_memory: torch.Tensor | None = None,
+        detach_past_state: bool = True,
+        return_state: bool = False,
+    ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
+        attention_mask = _resolve_attention_mask(input_ids, attention_mask, self.config, infer_pad_mask)
+
+        hidden_states = self.embed_tokens(input_ids)
+        batch_size = hidden_states.size(0)
+        world_state, self_state, memory = _resolve_state_packet(
+            past_state,
+            past_world_state=past_world_state,
+            past_self_state=past_self_state,
+            past_memory=past_memory,
+            detach_past_state=detach_past_state,
+            batch_size=batch_size,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        latent_field = self._resolve_latent_field(
+            past_state=past_state,
+            past_latent_field=past_latent_field,
+            detach_past_state=detach_past_state,
+            batch_size=batch_size,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        latent_field_is_past = latent_field is not None
+        if world_state is None:
+            world_state = self._initial_world_state(batch_size, hidden_states.device, hidden_states.dtype)
+        if self_state is None:
+            self_state = self._initial_self_state(batch_size, hidden_states.device, hidden_states.dtype)
+        if latent_field is None:
+            latent_field = self._initial_latent_field(batch_size, hidden_states.device, hidden_states.dtype)
+        if memory is None:
+            memory = self._initial_memory(batch_size, hidden_states.device, hidden_states.dtype)
+
+        aux_by_layer = []
+        field_trace_is_past = (
+            past_state is not None
+            or past_world_state is not None
+            or past_self_state is not None
+            or past_latent_field is not None
+            or past_memory is not None
+        )
+        for block in self.blocks:
+            if isinstance(block, NAIMEV5WorldStateMoEBlock):
+                field_aux = None
+                if self.latent_field is not None:
+                    field_memory = memory if field_trace_is_past else None
+                    hidden_states, field_aux = self.latent_field(
+                        hidden_states,
+                        world_state=world_state,
+                        self_state=self_state,
+                        memory=field_memory,
+                        attention_mask=attention_mask,
+                        block_size=max(self.config.stride, self.config.causal_state_stride),
+                        treat_trace_as_past=field_trace_is_past,
+                    )
+                    field_trace_is_past = False
+                hidden_states, aux, world_state, memory = block(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    tau=tau,
+                    world_state=world_state,
+                    memory=memory,
+                )
+                hidden_states, self_state, v6_aux = self.self_state_slots(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    world_state=world_state,
+                    self_state=self_state,
+                    causal_safe=self.config.semantic_causal,
+                    block_size=max(self.config.stride, self.config.causal_state_stride),
+                )
+                aux["v6"] = v6_aux
+                if field_aux is not None:
+                    aux["v6"].update(field_aux)
+            else:
+                hidden_states, aux = block(hidden_states, attention_mask=attention_mask)
+            if return_aux:
+                aux_by_layer.append(aux)
+
+        world_state, self_state, memory, evolution_metrics = self._evolve_internal_state(
+            hidden_states=hidden_states,
+            world_state=world_state,
+            self_state=self_state,
+            memory=memory,
+        )
+        v7_steps = (
+            int(self.config.v7_max_dynamics_steps or self.config.v7_dynamics_steps)
+            if self.config.v7_dynamic_depth
+            else int(self.config.v7_dynamics_steps)
+        )
+        hidden_states, world_state, self_state, latent_field, v7_metrics = self.typed_dynamics(
+            hidden_states,
+            world_state=world_state,
+            self_state=self_state,
+            latent_field=latent_field,
+            attention_mask=attention_mask,
+            steps=v7_steps,
+            dynamic_depth=bool(self.config.v7_dynamic_depth),
+            min_steps=int(self.config.v7_min_dynamics_steps),
+            convergence_threshold=float(self.config.v7_dynamic_convergence_threshold),
+            past_latent_field=latent_field_is_past,
+            past_latent_adapt_steps=int(self.config.v7_past_latent_adapt_steps),
+        )
+        if return_aux and aux_by_layer:
+            aux_by_layer[-1].setdefault("v6", {}).update(evolution_metrics)
+            aux_by_layer[-1]["v7"] = v7_metrics
+
+        hidden_states = self.norm(hidden_states)
+        public_world_state = _public_state(world_state)
+        public_self_state = _public_state(self_state)
+        output: dict[str, torch.Tensor | list[dict[str, torch.Tensor]]] = {
+            "hidden_states": hidden_states,
+            "world_state": public_world_state,
+            "self_state": public_self_state,
+            "latent_field": latent_field,
+        }
+        if memory is not None:
+            output["memory"] = memory
+        if return_state:
+            output["state_packet"] = NAIMEStatePacket(
+                world_state=world_state,
+                self_state=self_state,
+                latent_field=latent_field,
+                memory=memory,
+                architecture_id="naime_v7_typed_dynamics",
             )
         if return_logits:
             output["logits"] = self.lm_head(hidden_states)

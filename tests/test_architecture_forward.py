@@ -6,11 +6,12 @@ import torch
 
 from naime_hybrid import (
     NAIMEStateMoEConfig,
-    NAIMEStatePacket,
     NAIMEStateMoEDecoder,
+    NAIMEStatePacket,
     NAIMEV4StateMoEDecoder,
     NAIMEV5WorldStateMoEDecoder,
     NAIMEV6RecursiveSelfMoEDecoder,
+    NAIMEV7TypedDynamicsDecoder,
     build_model,
 )
 from naime_hybrid.data import HFDiskCausalDataset
@@ -19,8 +20,11 @@ from naime_hybrid.modules.moe import TopKMoE
 from naime_hybrid.modules.self_state import RecursiveSelfState
 from naime_hybrid.modules.world_state import WorldStateSlots
 from naime_hybrid.training.checkpoint import (
+    build_checkpoint_payload,
     build_model_payload,
+    load_checkpoint,
     normalize_state_dict_for_model,
+    save_checkpoint,
     save_payloads_in_subprocess,
 )
 from naime_hybrid.training.cli import build_train_config, parse_args
@@ -93,6 +97,82 @@ def test_model_payload_unwraps_compiled_prefix():
 
     assert payload["model"]
     assert all(not key.startswith("_orig_mod.") for key in payload["model"])
+
+
+def test_checkpoint_payload_falls_back_to_model_only_when_optimizer_snapshot_fails():
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        d_model=16,
+        n_layers=1,
+        n_heads=2,
+        n_kv_heads=1,
+        d_ff=32,
+    )
+    model = build_model("dense", config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    def broken_state_dict():
+        raise RuntimeError("simulated optimizer CPU snapshot failure")
+
+    optimizer.state_dict = broken_state_dict
+
+    payload = build_checkpoint_payload(
+        model,
+        optimizer,
+        scheduler=None,
+        scaler=None,
+        step=12,
+        config={},
+        metrics={"loss_lm": 1.25},
+        fallback_to_model_only=True,
+    )
+
+    assert payload["step"] == 12
+    assert payload["checkpoint_kind"] == "model_only_fallback"
+    assert "simulated optimizer" in payload["checkpoint_fallback_reason"]
+    assert payload["optimizer"] is None
+    assert payload["scheduler"] is None
+    assert payload["model"]
+
+
+def test_save_checkpoint_fallback_is_loadable_without_optimizer_state(tmp_path):
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        d_model=16,
+        n_layers=1,
+        n_heads=2,
+        n_kv_heads=1,
+        d_ff=32,
+    )
+    model = build_model("dense", config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    def broken_state_dict():
+        raise RuntimeError("simulated optimizer CPU snapshot failure")
+
+    optimizer.state_dict = broken_state_dict
+    path = tmp_path / "fallback_latest.pt"
+
+    save_checkpoint(
+        path,
+        model,
+        optimizer,
+        scheduler=None,
+        scaler=None,
+        step=21,
+        config={},
+        metrics={},
+        fallback_to_model_only=True,
+    )
+
+    restored = torch.load(path, map_location="cpu", weights_only=False)
+    assert restored["checkpoint_kind"] == "model_only_fallback"
+
+    fresh = build_model("dense", config)
+    fresh_optimizer = torch.optim.AdamW(fresh.parameters(), lr=1e-3)
+    step = load_checkpoint(path, fresh, fresh_optimizer, scheduler=None, scaler=None)
+
+    assert step == 21
 
 
 def test_eval_sampling_cli_defaults_to_random(monkeypatch):
@@ -298,9 +378,7 @@ def test_world_state_history_bf16_context_backward_is_finite():
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         context, _, _, traced_state, metrics = slots.read_update_sequence(hidden, semantic, trace, stride=4)
     loss = (
-        context.float().square().mean()
-        + traced_state.float().square().mean()
-        + metrics["history_read_entropy"].float()
+        context.float().square().mean() + traced_state.float().square().mean() + metrics["history_read_entropy"].float()
     )
     loss.backward()
 
@@ -428,10 +506,124 @@ def test_baseline_factory_forward():
         "naime_v42_state_moe",
         "naime_v5_world_state_moe",
         "naime_v6_recursive_self_moe",
+        "naime_v7_typed_dynamics",
     ]:
         model = build_model(architecture, config)
         out = model(input_ids)
         assert out["logits"].shape == (2, 13, config.vocab_size)
+
+
+def test_v7_typed_dynamics_forward_state_packet_and_backward():
+    torch.manual_seed(2040)
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        max_seq_len=64,
+        d_model=32,
+        n_layers=3,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=3,
+        top_k=2,
+        expert_hidden_dim=48,
+        semantic_router_mode="hybrid",
+        semantic_scales="local_mid_global",
+        mid_stride=8,
+        mid_window=16,
+        use_global_semantic=True,
+        semantic_fusion="concat",
+        semantic_gate_downstream="clean_prob",
+        semantic_sparse_alpha="downstream",
+        semantic_memory_slots=2,
+        semantic_gate_mixer=True,
+        world_state_slots=4,
+        self_state_slots=3,
+        self_state_recursion_depth=1,
+        v7_dynamics_steps=1,
+        v7_latent_slots=5,
+        v7_hidden_write_scale=0.01,
+        v7_max_hidden_write_ratio=0.05,
+    )
+    model = build_model("naime_v7_typed_dynamics", config)
+    assert isinstance(model, NAIMEV7TypedDynamicsDecoder)
+    input_ids = torch.randint(1, config.vocab_size, (2, 31))
+
+    out = model(input_ids, return_state=True)
+    packet = out["state_packet"]
+    v7_aux = out["aux"][-1]["v7"]
+
+    assert isinstance(packet, NAIMEStatePacket)
+    assert packet.world_state is not None
+    assert packet.self_state is not None
+    assert packet.latent_field is not None
+    assert packet.world_state.shape == (2, config.world_state_slots, config.d_model)
+    assert packet.self_state.shape == (2, config.self_state_slots, config.d_model)
+    assert packet.latent_field.shape == (2, 5, config.d_model)
+    assert packet.architecture_id == "naime_v7_typed_dynamics"
+    assert out["logits"].shape == (2, 31, config.vocab_size)
+    assert v7_aux["v7_thought_steps"].item() == pytest.approx(1.0)
+    assert torch.isfinite(v7_aux["v7_latent_delta"])
+    assert torch.isfinite(v7_aux["v7_hidden_delta"])
+    assert torch.isfinite(v7_aux["v7_world_delta"])
+    assert torch.isfinite(v7_aux["v7_self_delta"])
+    assert torch.isfinite(v7_aux["v7_world_write_gate"])
+    assert torch.isfinite(v7_aux["v7_self_write_gate"])
+    assert v7_aux["v7_past_latent_read_suppressed"].item() == pytest.approx(0.0)
+    assert v7_aux["v7_hidden_write_ratio"].item() <= config.v7_max_hidden_write_ratio + 1e-4
+
+    second = model(input_ids[:, :17], past_state=packet, return_state=True)
+    second_v7_aux = second["aux"][-1]["v7"]
+    assert second["state_packet"].world_state is not None
+    assert second["state_packet"].self_state is not None
+    assert second["state_packet"].latent_field is not None
+    assert second["logits"].shape == (2, 17, config.vocab_size)
+    assert second_v7_aux["v7_past_latent_adapt_steps"].item() == pytest.approx(1.0)
+    assert second_v7_aux["v7_past_latent_read_suppressed"].item() == pytest.approx(1.0)
+    assert second_v7_aux["v7_hidden_write_ratio"].item() == pytest.approx(0.0)
+
+    loss = out["logits"].float().mean() + v7_aux["v7_latent_delta"] * 0.0
+    loss.backward()
+
+
+def test_v7_dynamic_depth_halts_after_minimum_step():
+    torch.manual_seed(2042)
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        max_seq_len=16,
+        d_model=32,
+        n_layers=2,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=2,
+        top_k=1,
+        expert_hidden_dim=48,
+        semantic_memory_slots=2,
+        world_state_slots=3,
+        self_state_slots=3,
+        v7_dynamics_steps=3,
+        v7_latent_slots=3,
+        v7_dynamic_depth=True,
+        v7_min_dynamics_steps=1,
+        v7_dynamic_convergence_threshold=1e9,
+    )
+    model = build_model("naime_v7_typed_dynamics", config)
+    input_ids = torch.randint(1, config.vocab_size, (2, config.max_seq_len))
+    out = model(input_ids)
+    v7_aux = out["aux"][-1]["v7"]
+
+    assert v7_aux["v7_dynamic_depth_enabled"].item() == pytest.approx(1.0)
+    assert v7_aux["v7_thought_steps"].item() == pytest.approx(1.0)
+    assert v7_aux["v7_dynamic_halt_fraction"].item() == pytest.approx(1.0)
+    assert torch.isfinite(v7_aux["v7_dynamic_continue_score"])
 
 
 def test_semantic_router_prior_mode_forward_and_backward():
@@ -1204,6 +1396,62 @@ def test_evaluate_model_reports_latent_thought_gain_metric():
     assert math.isfinite(metrics["val_latent_thought_disabled_lm"])
 
 
+def test_evaluate_model_reports_v7_probe_metrics():
+    torch.manual_seed(2041)
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        max_seq_len=32,
+        d_model=32,
+        n_layers=2,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=2,
+        top_k=1,
+        expert_hidden_dim=48,
+        semantic_memory_slots=2,
+        world_state_slots=3,
+        self_state_slots=3,
+        v7_dynamics_steps=1,
+        v7_latent_slots=3,
+    )
+    model = build_model("naime_v7_typed_dynamics", config)
+    samples = []
+    for _ in range(2):
+        input_ids = torch.randint(1, config.vocab_size, (config.max_seq_len,))
+        samples.append(
+            {
+                "input_ids": input_ids,
+                "labels": input_ids.clone(),
+                "attention_mask": torch.ones(config.max_seq_len, dtype=torch.bool),
+            }
+        )
+    loader = torch.utils.data.DataLoader(samples, batch_size=2)
+
+    metrics = evaluate_model(
+        model,
+        loader,
+        config,
+        torch.device("cpu"),
+        use_amp=False,
+        max_batches=1,
+        v7_dynamics_gain=True,
+        v7_state_swap=True,
+        v7_state_erase=True,
+    )
+
+    assert metrics["val_v7_dynamics_gain_batches"] == 1.0
+    assert metrics["val_v7_state_swap_batches"] == 1.0
+    assert metrics["val_v7_state_erase_batches"] == 1.0
+    assert math.isfinite(metrics["val_v7_dynamics_gain_lm"])
+    assert math.isfinite(metrics["val_v7_state_swap_delta_lm"])
+    assert math.isfinite(metrics["val_v7_latent_erase_delta_lm"])
+
+
 def test_topk_moe_sparse_dispatch_matches_dense_dispatch():
     torch.manual_seed(1234)
     dense = TopKMoE(
@@ -1243,7 +1491,7 @@ def test_topk_moe_sparse_dispatch_matches_dense_dispatch():
     assert torch.allclose(x_sparse.grad, x_dense.grad, atol=1e-6)
 
 
-def test_topk_moe_auto_dispatch_matches_dense_dispatch_for_small_expert_cuda_heuristic():
+def test_topk_moe_auto_dispatch_matches_dense_dispatch_for_small_expert_cpu_heuristic():
     torch.manual_seed(1234)
     dense = TopKMoE(
         d_model=16,
@@ -1291,6 +1539,22 @@ def test_topk_moe_auto_dispatch_uses_sparse_for_six_experts_on_cuda():
         d_model=16,
         semantic_dim=16,
         n_experts=6,
+        top_k=2,
+        expert_hidden_dim=32,
+        use_semantic_router=False,
+        dispatch_mode="auto",
+    ).cuda()
+    x = torch.randn(2, 512, 16, device="cuda")
+
+    assert moe._resolve_dispatch_mode(x) == "sparse"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA dispatch heuristic only applies on GPU")
+def test_topk_moe_auto_dispatch_uses_sparse_for_four_experts_on_cuda():
+    moe = TopKMoE(
+        d_model=16,
+        semantic_dim=16,
+        n_experts=4,
         top_k=2,
         expert_hidden_dim=32,
         use_semantic_router=False,

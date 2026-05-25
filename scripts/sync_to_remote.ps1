@@ -158,7 +158,7 @@ Write-Output "SYNC_RESULT: files=`$fileCount errors=`$errorCount"
 if (`$errorCount -gt 0) { Write-Output ("SYNC_ERRORS: " + (`$errors -join '|')) }
 "@
 $remoteEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($remotePs))
-$result = ssh -o BatchMode=yes "$RemoteUser@$RemoteHost" "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $remoteEncoded"
+$result = ssh -o BatchMode=yes "$RemoteUser@$RemoteHost" "powershell -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand $remoteEncoded"
 Write-Host "Remote extraction result:"
 Write-Host $result
 
@@ -175,9 +175,9 @@ if (-not (Test-Path -LiteralPath $localManifestPath)) {
 }
 
 if (-not $KeepArchive) {
-    $cleanupRemote = "Remove-Item -LiteralPath '$remoteArchive' -Force -ErrorAction SilentlyContinue; if (Test-Path '$remoteManifestPath') { Remove-Item -LiteralPath '$remoteManifestPath' -Force -ErrorAction SilentlyContinue }"
+    $cleanupRemote = "`$ProgressPreference='SilentlyContinue'; Remove-Item -LiteralPath '$remoteArchive' -Force -ErrorAction SilentlyContinue; if (Test-Path '$remoteManifestPath') { Remove-Item -LiteralPath '$remoteManifestPath' -Force -ErrorAction SilentlyContinue }"
     $cleanupEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanupRemote))
-    ssh -o BatchMode=yes "$RemoteUser@$RemoteHost" "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $cleanupEncoded"
+    ssh -o BatchMode=yes "$RemoteUser@$RemoteHost" "powershell -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand $cleanupEncoded"
     Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue
 }
 

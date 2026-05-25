@@ -6,16 +6,29 @@ from torch import nn
 class SwiGLUExpert(nn.Module):
     def __init__(self, d_model: int, hidden_dim: int):
         super().__init__()
-        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.hidden_dim = hidden_dim
+        self.up_gate = nn.Linear(d_model, hidden_dim * 2, bias=False)
         self.w2 = nn.Linear(hidden_dim, d_model, bias=False)
-        self.w3 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.register_load_state_dict_pre_hook(self._migrate_legacy_swiglu_weights)
+
+    def _migrate_legacy_swiglu_weights(
+        self,
+        _module: nn.Module,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        *_: object,
+    ) -> None:
+        gate_key = prefix + "w1.weight"
+        up_key = prefix + "w3.weight"
+        packed_key = prefix + "up_gate.weight"
+        if packed_key not in state_dict and gate_key in state_dict and up_key in state_dict:
+            state_dict[packed_key] = torch.cat([state_dict.pop(gate_key), state_dict.pop(up_key)], dim=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Let autocast choose the matmul/activation dtype. Forcing the two
-        # expert projections through fp32 creates thousands of small cast/copy
-        # kernels in MoE-heavy V6 training without adding the same stability
-        # protection that router/state softmax paths need.
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        # SwiGLU needs two input projections. Keeping them in one packed GEMM
+        # preserves the math while cutting one launch/matmul per expert.
+        gate, up = self.up_gate(x).split(self.hidden_dim, dim=-1)
+        return self.w2(F.silu(gate) * up)
 
 
 class SemanticMoERouter(nn.Module):
@@ -156,6 +169,8 @@ class TopKMoE(nn.Module):
         num_tokens = hidden_states.size(0) * hidden_states.size(1)
         if self.n_experts <= 2:
             return "dense"
+        if hidden_states.is_cuda and self.n_experts >= 4 and self.top_k <= max(1, self.n_experts // 2):
+            return "sparse"
         if self.n_experts <= 4 and num_tokens >= 128:
             return "dense"
         if not hidden_states.is_cuda and self.n_experts <= 8 and self.top_k * 2 >= self.n_experts and num_tokens >= 512:
@@ -190,7 +205,7 @@ class TopKMoE(nn.Module):
         # Group by expert id to avoid scanning all routed edges with a boolean
         # mask per expert. This keeps sparse routing semantics but reduces
         # Python/tensor overhead in the dispatch path.
-        perm = torch.argsort(flat_expert_ids, stable=True)
+        perm = torch.argsort(flat_expert_ids)
         expert_ids_sorted = flat_expert_ids.index_select(0, perm)
         token_ids_sorted = token_ids.index_select(0, perm)
         weights_sorted = flat_weights.index_select(0, perm)
@@ -198,15 +213,15 @@ class TopKMoE(nn.Module):
         expert_input = flat_states.index_select(0, token_ids_sorted)
         routed = torch.zeros_like(flat_states)
 
-        counts = torch.bincount(expert_ids_sorted, minlength=self.n_experts)
-        for expert_idx in range(self.n_experts):
-            count = int(counts[expert_idx])
+        counts = torch.bincount(expert_ids_sorted, minlength=self.n_experts).detach().cpu().tolist()
+        start = 0
+        for expert_idx, count in enumerate(counts):
             if count == 0:
                 continue
-            start = int(counts[:expert_idx].sum())
             end = start + count
             out = self.experts[expert_idx](expert_input[start:end]) * weights_sorted[start:end]
             routed.index_add_(0, token_ids_sorted[start:end], out)
+            start = end
 
         return routed.view(batch, seq_len, d_model)
 

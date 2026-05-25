@@ -98,6 +98,9 @@ def main(argv: list[str] | None = None) -> int:
     env = os.environ.copy()
     env["NAIME_HYBRID_PYTHON"] = str(args.python)
     env["PYTHONPATH"] = str(repo / "src")
+    env["PYTHON_EXECUTABLE"] = str(args.python)
+    env["VIRTUAL_ENV"] = str(args.python.parent.parent)
+    env["PATH"] = str(args.python.parent) + os.pathsep + env.get("PATH", "")
 
     wrapper_args = list(args.wrapper_args)
     if wrapper_args and wrapper_args[0] == "--":

@@ -4,9 +4,10 @@ import torch
 from torch.utils.data import DataLoader
 
 from naime_hybrid.config import NAIMEStateMoEConfig
+from naime_hybrid.models.state_packet import NAIMEStatePacket
 
-from .masks import prepare_attention_mask_for_device
 from .losses import IGNORE_INDEX, collect_aux_losses, lm_loss
+from .masks import prepare_attention_mask_for_device
 
 
 def _supports_state_packet(model: torch.nn.Module) -> bool:
@@ -16,6 +17,43 @@ def _supports_state_packet(model: torch.nn.Module) -> bool:
 
 def _native_model(model: torch.nn.Module) -> torch.nn.Module:
     return getattr(model, "_orig_mod", model)
+
+
+def _packet_like(
+    packet: NAIMEStatePacket,
+    *,
+    world_state: torch.Tensor | None,
+    self_state: torch.Tensor | None,
+    latent_field: torch.Tensor | None,
+    memory: torch.Tensor | None,
+) -> NAIMEStatePacket:
+    return NAIMEStatePacket(
+        world_state=world_state,
+        self_state=self_state,
+        latent_field=latent_field,
+        memory=memory,
+        state_version=packet.state_version,
+        protocol_version=packet.protocol_version,
+        architecture_id=packet.architecture_id,
+        causal_integrity_version=packet.causal_integrity_version,
+        tokenizer_hash=packet.tokenizer_hash,
+        created_step=packet.created_step,
+        confidence=packet.confidence,
+    )
+
+
+def _roll_optional_batch(value: torch.Tensor | None) -> torch.Tensor | None:
+    return value.roll(shifts=1, dims=0) if value is not None else None
+
+
+def _swap_packet_batch(packet: NAIMEStatePacket) -> NAIMEStatePacket:
+    return _packet_like(
+        packet,
+        world_state=_roll_optional_batch(packet.world_state),
+        self_state=_roll_optional_batch(packet.self_state),
+        latent_field=_roll_optional_batch(packet.latent_field),
+        memory=_roll_optional_batch(packet.memory),
+    )
 
 
 def _estimate_state_carry_gain(
@@ -114,6 +152,199 @@ def _estimate_latent_thought_gain(
     return no_thought - thought, thought, no_thought
 
 
+def _estimate_v7_dynamics_gain(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    infer_pad_mask: bool | None,
+    use_amp: bool,
+) -> tuple[float, float, float] | None:
+    native_model = _native_model(model)
+    if getattr(native_model, "typed_dynamics", None) is None:
+        return None
+    original_steps = int(getattr(native_model.config, "v7_dynamics_steps", 0))
+    original_max_steps = int(getattr(native_model.config, "v7_max_dynamics_steps", 0))
+    effective_steps = original_max_steps or original_steps
+    if effective_steps <= 0 or labels.ne(IGNORE_INDEX).sum().item() == 0:
+        return None
+
+    device_type = input_ids.device.type
+    try:
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
+            dynamics_out = model(
+                input_ids,
+                attention_mask=attention_mask,
+                infer_pad_mask=infer_pad_mask,
+                return_aux=False,
+            )
+            dynamics_loss = lm_loss(dynamics_out["logits"], labels)
+        native_model.config.v7_dynamics_steps = 0
+        native_model.config.v7_max_dynamics_steps = 0
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
+            disabled_out = model(
+                input_ids,
+                attention_mask=attention_mask,
+                infer_pad_mask=infer_pad_mask,
+                return_aux=False,
+            )
+            disabled_loss = lm_loss(disabled_out["logits"], labels)
+    finally:
+        native_model.config.v7_dynamics_steps = original_steps
+        native_model.config.v7_max_dynamics_steps = original_max_steps
+
+    dynamics = float(dynamics_loss.detach().cpu())
+    disabled = float(disabled_loss.detach().cpu())
+    return disabled - dynamics, dynamics, disabled
+
+
+def _estimate_v7_state_swap_penalty(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    infer_pad_mask: bool | None,
+    use_amp: bool,
+) -> tuple[float, float, float] | None:
+    if not _supports_state_packet(model) or input_ids.size(0) < 2 or input_ids.size(1) < 4:
+        return None
+
+    split = input_ids.size(1) // 2
+    first_ids = input_ids[:, :split]
+    second_ids = input_ids[:, split:]
+    second_labels = labels[:, split:]
+    if second_labels.ne(IGNORE_INDEX).sum().item() == 0:
+        return None
+
+    first_mask = attention_mask[:, :split] if attention_mask is not None else None
+    second_mask = attention_mask[:, split:] if attention_mask is not None else None
+    device_type = input_ids.device.type
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
+        first_out = model(
+            first_ids,
+            attention_mask=first_mask,
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            return_logits=False,
+            return_state=True,
+        )
+        packet = first_out.get("state_packet")
+        if packet is None:
+            return None
+        correct_out = model(
+            second_ids,
+            attention_mask=second_mask,
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            past_state=packet,
+        )
+        swapped_out = model(
+            second_ids,
+            attention_mask=second_mask,
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            past_state=_swap_packet_batch(packet),
+        )
+        correct_loss = lm_loss(correct_out["logits"], second_labels)
+        swapped_loss = lm_loss(swapped_out["logits"], second_labels)
+    correct = float(correct_loss.detach().cpu())
+    swapped = float(swapped_loss.detach().cpu())
+    return swapped - correct, correct, swapped
+
+
+def _estimate_v7_state_erase_sensitivity(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    infer_pad_mask: bool | None,
+    use_amp: bool,
+) -> tuple[float, float, float, float] | None:
+    native_model = _native_model(model)
+    if getattr(native_model, "typed_dynamics", None) is None or input_ids.size(1) < 4:
+        return None
+
+    split = input_ids.size(1) // 2
+    first_ids = input_ids[:, :split]
+    second_ids = input_ids[:, split:]
+    second_labels = labels[:, split:]
+    if second_labels.ne(IGNORE_INDEX).sum().item() == 0:
+        return None
+
+    first_mask = attention_mask[:, :split] if attention_mask is not None else None
+    second_mask = attention_mask[:, split:] if attention_mask is not None else None
+    device_type = input_ids.device.type
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
+        first_out = model(
+            first_ids,
+            attention_mask=first_mask,
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            return_logits=False,
+            return_state=True,
+        )
+        packet = first_out.get("state_packet")
+        if packet is None:
+            return None
+        full_out = model(
+            second_ids,
+            attention_mask=second_mask,
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            past_state=packet,
+        )
+        world_erased_out = model(
+            second_ids,
+            attention_mask=second_mask,
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            past_state=_packet_like(
+                packet,
+                world_state=None,
+                self_state=packet.self_state,
+                latent_field=packet.latent_field,
+                memory=packet.memory,
+            ),
+        )
+        self_erased_out = model(
+            second_ids,
+            attention_mask=second_mask,
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            past_state=_packet_like(
+                packet,
+                world_state=packet.world_state,
+                self_state=None,
+                latent_field=packet.latent_field,
+                memory=packet.memory,
+            ),
+        )
+        latent_erased_out = model(
+            second_ids,
+            attention_mask=second_mask,
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            past_state=_packet_like(
+                packet,
+                world_state=packet.world_state,
+                self_state=packet.self_state,
+                latent_field=None,
+                memory=packet.memory,
+            ),
+        )
+        full_loss = lm_loss(full_out["logits"], second_labels)
+        world_loss = lm_loss(world_erased_out["logits"], second_labels)
+        self_loss = lm_loss(self_erased_out["logits"], second_labels)
+        latent_loss = lm_loss(latent_erased_out["logits"], second_labels)
+    full = float(full_loss.detach().cpu())
+    return (
+        float(world_loss.detach().cpu()) - full,
+        float(self_loss.detach().cpu()) - full,
+        float(latent_loss.detach().cpu()) - full,
+        full,
+    )
+
+
 def evaluate_model(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -132,6 +363,9 @@ def evaluate_model(
     lambda_self_slot_diversity: float = 0.0,
     state_carry: bool = False,
     latent_thought_gain: bool = False,
+    v7_dynamics_gain: bool = False,
+    v7_state_swap: bool = False,
+    v7_state_erase: bool = False,
 ) -> dict[str, float]:
     was_training = model.training
     model.eval()
@@ -227,17 +461,54 @@ def evaluate_model(
             "v6_latent_field_read_entropy",
             "v6_latent_field_read_max",
             "v6_latent_field_gate",
+            "v7_thought_steps",
+            "v7_latent_delta",
+            "v7_latent_velocity",
+            "v7_latent_acceleration",
+            "v7_hidden_delta",
+            "v7_latent_hidden_write_norm",
+            "v7_hidden_write_ratio",
+            "v7_hidden_write_gate",
+            "v7_latent_read_entropy",
+            "v7_latent_read_max",
+            "v7_latent_state_norm",
+            "v7_world_state_norm",
+            "v7_self_state_norm",
+            "v7_world_delta",
+            "v7_self_delta",
+            "v7_world_write_gate",
+            "v7_self_write_gate",
+            "v7_dynamic_depth_enabled",
+            "v7_dynamic_depth_mean",
+            "v7_dynamic_halt_fraction",
+            "v7_dynamic_continue_score",
+            "v7_dynamic_convergence_threshold",
+            "v7_past_latent_adapt_steps",
+            "v7_past_latent_read_suppressed",
             "state_carry_gain_lm",
             "state_carry_stateful_lm",
             "state_carry_fresh_lm",
             "latent_thought_gain_lm",
             "latent_thought_lm",
             "latent_thought_disabled_lm",
+            "v7_dynamics_gain_lm",
+            "v7_dynamics_lm",
+            "v7_dynamics_disabled_lm",
+            "v7_state_swap_delta_lm",
+            "v7_state_swap_correct_lm",
+            "v7_state_swap_wrong_lm",
+            "v7_world_erase_delta_lm",
+            "v7_self_erase_delta_lm",
+            "v7_latent_erase_delta_lm",
+            "v7_state_erase_full_lm",
         ]
     }
     batches = 0
     state_carry_batches = 0
     latent_thought_gain_batches = 0
+    v7_dynamics_gain_batches = 0
+    v7_state_swap_batches = 0
+    v7_state_erase_batches = 0
     tokens = 0
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
@@ -351,6 +622,34 @@ def evaluate_model(
             totals["v6_latent_field_read_entropy"] += float(aux["v6_latent_field_read_entropy"].detach().cpu())
             totals["v6_latent_field_read_max"] += float(aux["v6_latent_field_read_max"].detach().cpu())
             totals["v6_latent_field_gate"] += float(aux["v6_latent_field_gate"].detach().cpu())
+            totals["v7_thought_steps"] += float(aux["v7_thought_steps"].detach().cpu())
+            totals["v7_latent_delta"] += float(aux["v7_latent_delta"].detach().cpu())
+            totals["v7_latent_velocity"] += float(aux["v7_latent_velocity"].detach().cpu())
+            totals["v7_latent_acceleration"] += float(aux["v7_latent_acceleration"].detach().cpu())
+            totals["v7_hidden_delta"] += float(aux["v7_hidden_delta"].detach().cpu())
+            totals["v7_latent_hidden_write_norm"] += float(aux["v7_latent_hidden_write_norm"].detach().cpu())
+            totals["v7_hidden_write_ratio"] += float(aux["v7_hidden_write_ratio"].detach().cpu())
+            totals["v7_hidden_write_gate"] += float(aux["v7_hidden_write_gate"].detach().cpu())
+            totals["v7_latent_read_entropy"] += float(aux["v7_latent_read_entropy"].detach().cpu())
+            totals["v7_latent_read_max"] += float(aux["v7_latent_read_max"].detach().cpu())
+            totals["v7_latent_state_norm"] += float(aux["v7_latent_state_norm"].detach().cpu())
+            totals["v7_world_state_norm"] += float(aux["v7_world_state_norm"].detach().cpu())
+            totals["v7_self_state_norm"] += float(aux["v7_self_state_norm"].detach().cpu())
+            totals["v7_world_delta"] += float(aux["v7_world_delta"].detach().cpu())
+            totals["v7_self_delta"] += float(aux["v7_self_delta"].detach().cpu())
+            totals["v7_world_write_gate"] += float(aux["v7_world_write_gate"].detach().cpu())
+            totals["v7_self_write_gate"] += float(aux["v7_self_write_gate"].detach().cpu())
+            totals["v7_dynamic_depth_enabled"] += float(aux["v7_dynamic_depth_enabled"].detach().cpu())
+            totals["v7_dynamic_depth_mean"] += float(aux["v7_dynamic_depth_mean"].detach().cpu())
+            totals["v7_dynamic_halt_fraction"] += float(aux["v7_dynamic_halt_fraction"].detach().cpu())
+            totals["v7_dynamic_continue_score"] += float(aux["v7_dynamic_continue_score"].detach().cpu())
+            totals["v7_dynamic_convergence_threshold"] += float(
+                aux["v7_dynamic_convergence_threshold"].detach().cpu()
+            )
+            totals["v7_past_latent_adapt_steps"] += float(aux["v7_past_latent_adapt_steps"].detach().cpu())
+            totals["v7_past_latent_read_suppressed"] += float(
+                aux["v7_past_latent_read_suppressed"].detach().cpu()
+            )
             if state_carry:
                 carry = _estimate_state_carry_gain(
                     model,
@@ -381,6 +680,52 @@ def evaluate_model(
                     totals["latent_thought_lm"] += thought_loss
                     totals["latent_thought_disabled_lm"] += disabled_loss
                     latent_thought_gain_batches += 1
+            if v7_dynamics_gain:
+                dynamics = _estimate_v7_dynamics_gain(
+                    model,
+                    input_ids,
+                    labels,
+                    attention_mask,
+                    infer_pad_mask,
+                    use_amp,
+                )
+                if dynamics is not None:
+                    gain, dynamics_loss, disabled_loss = dynamics
+                    totals["v7_dynamics_gain_lm"] += gain
+                    totals["v7_dynamics_lm"] += dynamics_loss
+                    totals["v7_dynamics_disabled_lm"] += disabled_loss
+                    v7_dynamics_gain_batches += 1
+            if v7_state_swap:
+                swap = _estimate_v7_state_swap_penalty(
+                    model,
+                    input_ids,
+                    labels,
+                    attention_mask,
+                    infer_pad_mask,
+                    use_amp,
+                )
+                if swap is not None:
+                    delta, correct_loss, wrong_loss = swap
+                    totals["v7_state_swap_delta_lm"] += delta
+                    totals["v7_state_swap_correct_lm"] += correct_loss
+                    totals["v7_state_swap_wrong_lm"] += wrong_loss
+                    v7_state_swap_batches += 1
+            if v7_state_erase:
+                erase = _estimate_v7_state_erase_sensitivity(
+                    model,
+                    input_ids,
+                    labels,
+                    attention_mask,
+                    infer_pad_mask,
+                    use_amp,
+                )
+                if erase is not None:
+                    world_delta, self_delta, latent_delta, full_loss = erase
+                    totals["v7_world_erase_delta_lm"] += world_delta
+                    totals["v7_self_erase_delta_lm"] += self_delta
+                    totals["v7_latent_erase_delta_lm"] += latent_delta
+                    totals["v7_state_erase_full_lm"] += full_loss
+                    v7_state_erase_batches += 1
             tokens += int(labels.ne(IGNORE_INDEX).sum().item())
             batches += 1
 
@@ -523,6 +868,30 @@ def evaluate_model(
         "val_v6_latent_field_read_entropy": totals["v6_latent_field_read_entropy"] / batches,
         "val_v6_latent_field_read_max": totals["v6_latent_field_read_max"] / batches,
         "val_v6_latent_field_gate": totals["v6_latent_field_gate"] / batches,
+        "val_v7_thought_steps": totals["v7_thought_steps"] / batches,
+        "val_v7_latent_delta": totals["v7_latent_delta"] / batches,
+        "val_v7_latent_velocity": totals["v7_latent_velocity"] / batches,
+        "val_v7_latent_acceleration": totals["v7_latent_acceleration"] / batches,
+        "val_v7_hidden_delta": totals["v7_hidden_delta"] / batches,
+        "val_v7_latent_hidden_write_norm": totals["v7_latent_hidden_write_norm"] / batches,
+        "val_v7_hidden_write_ratio": totals["v7_hidden_write_ratio"] / batches,
+        "val_v7_hidden_write_gate": totals["v7_hidden_write_gate"] / batches,
+        "val_v7_latent_read_entropy": totals["v7_latent_read_entropy"] / batches,
+        "val_v7_latent_read_max": totals["v7_latent_read_max"] / batches,
+        "val_v7_latent_state_norm": totals["v7_latent_state_norm"] / batches,
+        "val_v7_world_state_norm": totals["v7_world_state_norm"] / batches,
+        "val_v7_self_state_norm": totals["v7_self_state_norm"] / batches,
+        "val_v7_world_delta": totals["v7_world_delta"] / batches,
+        "val_v7_self_delta": totals["v7_self_delta"] / batches,
+        "val_v7_world_write_gate": totals["v7_world_write_gate"] / batches,
+        "val_v7_self_write_gate": totals["v7_self_write_gate"] / batches,
+        "val_v7_dynamic_depth_enabled": totals["v7_dynamic_depth_enabled"] / batches,
+        "val_v7_dynamic_depth_mean": totals["v7_dynamic_depth_mean"] / batches,
+        "val_v7_dynamic_halt_fraction": totals["v7_dynamic_halt_fraction"] / batches,
+        "val_v7_dynamic_continue_score": totals["v7_dynamic_continue_score"] / batches,
+        "val_v7_dynamic_convergence_threshold": totals["v7_dynamic_convergence_threshold"] / batches,
+        "val_v7_past_latent_adapt_steps": totals["v7_past_latent_adapt_steps"] / batches,
+        "val_v7_past_latent_read_suppressed": totals["v7_past_latent_read_suppressed"] / batches,
         "val_state_carry_gain_lm": totals["state_carry_gain_lm"] / state_carry_batches
         if state_carry_batches
         else 0.0,
@@ -543,6 +912,39 @@ def evaluate_model(
         if latent_thought_gain_batches
         else 0.0,
         "val_latent_thought_gain_batches": float(latent_thought_gain_batches),
+        "val_v7_dynamics_gain_lm": totals["v7_dynamics_gain_lm"] / v7_dynamics_gain_batches
+        if v7_dynamics_gain_batches
+        else 0.0,
+        "val_v7_dynamics_lm": totals["v7_dynamics_lm"] / v7_dynamics_gain_batches
+        if v7_dynamics_gain_batches
+        else 0.0,
+        "val_v7_dynamics_disabled_lm": totals["v7_dynamics_disabled_lm"] / v7_dynamics_gain_batches
+        if v7_dynamics_gain_batches
+        else 0.0,
+        "val_v7_dynamics_gain_batches": float(v7_dynamics_gain_batches),
+        "val_v7_state_swap_delta_lm": totals["v7_state_swap_delta_lm"] / v7_state_swap_batches
+        if v7_state_swap_batches
+        else 0.0,
+        "val_v7_state_swap_correct_lm": totals["v7_state_swap_correct_lm"] / v7_state_swap_batches
+        if v7_state_swap_batches
+        else 0.0,
+        "val_v7_state_swap_wrong_lm": totals["v7_state_swap_wrong_lm"] / v7_state_swap_batches
+        if v7_state_swap_batches
+        else 0.0,
+        "val_v7_state_swap_batches": float(v7_state_swap_batches),
+        "val_v7_world_erase_delta_lm": totals["v7_world_erase_delta_lm"] / v7_state_erase_batches
+        if v7_state_erase_batches
+        else 0.0,
+        "val_v7_self_erase_delta_lm": totals["v7_self_erase_delta_lm"] / v7_state_erase_batches
+        if v7_state_erase_batches
+        else 0.0,
+        "val_v7_latent_erase_delta_lm": totals["v7_latent_erase_delta_lm"] / v7_state_erase_batches
+        if v7_state_erase_batches
+        else 0.0,
+        "val_v7_state_erase_full_lm": totals["v7_state_erase_full_lm"] / v7_state_erase_batches
+        if v7_state_erase_batches
+        else 0.0,
+        "val_v7_state_erase_batches": float(v7_state_erase_batches),
         "val_batches": float(batches),
         "val_tokens": float(tokens),
     }

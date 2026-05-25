@@ -84,10 +84,11 @@ class WorldStateSlots(nn.Module):
         key = self.slot_norm(bank)
         scores = torch.matmul(query, key.transpose(1, 2)) / (query.size(-1) ** 0.5)
         context, weights = state_softmax_matmul(scores, bank, out_dtype=hidden_states.dtype)
-        telemetry_weights = weights.detach().float()
-        probs = telemetry_weights.clamp_min(1e-6)
-        entropy = -(probs * probs.log()).sum(dim=-1).mean().type_as(hidden_states)
-        focus = telemetry_weights.max(dim=-1).values.mean().type_as(hidden_states)
+        with torch.no_grad():
+            telemetry_weights = weights.float()
+            probs = telemetry_weights.clamp_min(1e-6)
+            entropy = -(probs * probs.log()).sum(dim=-1).mean().type_as(hidden_states)
+            focus = telemetry_weights.max(dim=-1).values.mean().type_as(hidden_states)
         return context, entropy, focus
 
     def read_update_sequence(
@@ -153,17 +154,18 @@ class WorldStateSlots(nn.Module):
                 out_dtype=full_query.dtype,
             )
 
-            # Compute history telemetry in parallel outside the loop
-            telemetry_weights = weights_history.detach().float()
-            probs = telemetry_weights.clamp_min(1e-6)
-            entropy = -(probs * probs.log()).sum(dim=-1)  # (batch, seq_len)
-            focus = telemetry_weights.max(dim=-1).values  # (batch, seq_len)
+            with torch.no_grad():
+                # Compute history telemetry in parallel outside the loop.
+                telemetry_weights = weights_history.float()
+                probs = telemetry_weights.clamp_min(1e-6)
+                entropy = -(probs * probs.log()).sum(dim=-1)  # (batch, seq_len)
+                focus = telemetry_weights.max(dim=-1).values  # (batch, seq_len)
 
-            # Calculate average telemetry for valid tokens (limits > 0)
-            valid_mask = limits > 0
-            if valid_mask.any():
-                history_read_entropy = entropy[:, valid_mask].mean().type_as(hidden_states)
-                history_read_max = focus[:, valid_mask].mean().type_as(hidden_states)
+                # Calculate average telemetry for valid tokens (limits > 0).
+                valid_mask = limits > 0
+                if valid_mask.any():
+                    history_read_entropy = entropy[:, valid_mask].mean().type_as(hidden_states)
+                    history_read_max = focus[:, valid_mask].mean().type_as(hidden_states)
 
         for block_idx in range(block_count):
             start = block_idx * stride
@@ -184,10 +186,11 @@ class WorldStateSlots(nn.Module):
 
             summary = token_semantic[:, start:end, :].mean(dim=1)
             next_state, metrics = self.update_slots(current, summary)
-            state_delta = (next_state - current).float().pow(2).mean(dim=-1).sqrt().mean()
-            velocities.append(state_delta)
-            accelerations.append((state_delta - previous_delta).abs())
-            previous_delta = state_delta.detach()
+            with torch.no_grad():
+                state_delta = (next_state - current).float().pow(2).mean(dim=-1).sqrt().mean()
+                velocities.append(state_delta)
+                accelerations.append((state_delta - previous_delta).abs())
+                previous_delta = state_delta
             current = next_state
             state_trace.append(current)
 
@@ -260,16 +263,15 @@ class WorldStateSlots(nn.Module):
         slot_confidence_detached = confidence.detach()
         raw_stability = (slot_confidence_detached * (next_slots - slots).float().pow(2)).mean()
         stability_loss = below_threshold * raw_stability
-        telemetry_write_weights = slot_write_weights.detach()
-        write_entropy = -(
-            telemetry_write_weights.clamp_min(1e-6).float()
-            * telemetry_write_weights.clamp_min(1e-6).float().log()
-        )
-        write_entropy = write_entropy.sum(dim=-1).mean().type_as(slots)
-        write_max = telemetry_write_weights.max(dim=-1).values.mean()
-        active_mask = telemetry_write_weights > 0
-        active_write_min = telemetry_write_weights.masked_fill(~active_mask, 1.0).min(dim=-1).values.mean()
-        active_write_count = active_mask.sum(dim=-1).float().mean().type_as(slots)
+        with torch.no_grad():
+            telemetry_write_weights = slot_write_weights.float()
+            clamped_write = telemetry_write_weights.clamp_min(1e-6)
+            write_entropy = -(clamped_write * clamped_write.log())
+            write_entropy = write_entropy.sum(dim=-1).mean().type_as(slots)
+            write_max = telemetry_write_weights.max(dim=-1).values.mean()
+            active_mask = telemetry_write_weights > 0
+            active_write_min = telemetry_write_weights.masked_fill(~active_mask, 1.0).min(dim=-1).values.mean()
+            active_write_count = active_mask.sum(dim=-1).float().mean().type_as(slots)
         metrics = {
             "slot_update_gate": gate.detach().mean(),
             "slot_write_max": write_max.detach(),
