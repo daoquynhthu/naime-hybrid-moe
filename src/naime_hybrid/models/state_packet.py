@@ -11,9 +11,9 @@ class NAIMEStatePacket:
 
     The packet deliberately stores only compact model-owned latent state. It is
     not a KV cache, not hidden activations, and not a replayable computation
-    graph. ``world_state`` and ``self_state`` may be either final slot banks
-    ``[batch, slots, dim]`` or compact causal slot traces
-    ``[batch, blocks, slots, dim]``.
+    graph. Public packet tensors must use the compact final-slot form
+    ``[batch, slots, dim]`` so carried state has a single stable ingress
+    protocol across V5/V6/V7 paths.
     """
 
     world_state: torch.Tensor | None = None
@@ -74,7 +74,13 @@ class NAIMEStatePacket:
             ("memory", self.memory),
             ("controller_state", self.controller_state),
         ):
-            if value is not None and value.size(0) != batch_size:
+            if value is None:
+                continue
+            if value.ndim != 3:
+                raise ValueError(
+                    f"{name} must use compact final-slot shape [batch, slots, dim]; got ndim={value.ndim}"
+                )
+            if value.size(0) != batch_size:
                 raise ValueError(f"{name} batch mismatch: expected {batch_size}, got {value.size(0)}")
 
 

@@ -605,6 +605,18 @@ def test_v7_typed_dynamics_forward_state_packet_and_backward():
     loss.backward()
 
 
+def test_state_packet_rejects_traced_public_state():
+    packet = NAIMEStatePacket(
+        world_state=torch.randn(2, 3, 4, 32),
+        self_state=torch.randn(2, 3, 3, 32),
+        latent_field=torch.randn(2, 5, 32),
+        controller_state=torch.randn(2, 2, 32),
+    )
+
+    with pytest.raises(ValueError, match="compact final-slot shape"):
+        packet.validate_batch(2)
+
+
 def test_v7_typed_dynamics_preserves_causal_prefix_with_multiple_steps():
     torch.manual_seed(2041)
     config = NAIMEStateMoEConfig(

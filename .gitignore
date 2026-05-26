@@ -43,3 +43,6 @@ research/
 analysis/remote_runs/
 analysis/remote_inspections/
 configs/workspace.local.json
+
+analysis/
+bin/
