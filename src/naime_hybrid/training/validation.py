@@ -8,6 +8,7 @@ from naime_hybrid.models.state_packet import NAIMEStatePacket
 
 from .losses import IGNORE_INDEX, collect_aux_losses, lm_loss
 from .masks import prepare_attention_mask_for_device
+from .runtime import split_stateful_chunks
 
 
 def _supports_state_packet(model: torch.nn.Module) -> bool:
@@ -59,6 +60,25 @@ def _swap_packet_batch(packet: NAIMEStatePacket) -> NAIMEStatePacket:
     )
 
 
+def _stateful_chunk_pair(
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    *,
+    chunk_len: int | None,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]] | None:
+    chunks = split_stateful_chunks(
+        input_ids,
+        labels,
+        attention_mask,
+        chunk_len=chunk_len,
+        target_chunks=2,
+    )
+    if len(chunks) < 2:
+        return None
+    return chunks[0], chunks[1]
+
+
 def _estimate_state_carry_gain(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -66,24 +86,20 @@ def _estimate_state_carry_gain(
     attention_mask: torch.Tensor | None,
     infer_pad_mask: bool | None,
     use_amp: bool,
+    chunk_len: int | None,
 ) -> tuple[float, float, float] | None:
     if not _supports_state_packet(model) or input_ids.size(1) < 4:
         return None
 
-    split = input_ids.size(1) // 2
-    first_ids = input_ids[:, :split]
-    second_ids = input_ids[:, split:]
-    second_labels = labels[:, split:]
-    if second_labels.ne(IGNORE_INDEX).sum().item() == 0:
+    pair = _stateful_chunk_pair(input_ids, labels, attention_mask, chunk_len=chunk_len)
+    if pair is None:
         return None
-
-    first_mask = attention_mask[:, :split] if attention_mask is not None else None
-    second_mask = attention_mask[:, split:] if attention_mask is not None else None
+    first, second = pair
     device_type = input_ids.device.type
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
         first_out = model(
-            first_ids,
-            attention_mask=first_mask,
+            first["input_ids"],
+            attention_mask=first.get("attention_mask"),
             infer_pad_mask=infer_pad_mask,
             return_aux=False,
             return_logits=False,
@@ -93,20 +109,20 @@ def _estimate_state_carry_gain(
         if packet is None:
             return None
         stateful_out = model(
-            second_ids,
-            attention_mask=second_mask,
+            second["input_ids"],
+            attention_mask=second.get("attention_mask"),
             infer_pad_mask=infer_pad_mask,
             return_aux=False,
             past_state=packet,
         )
         fresh_out = model(
-            second_ids,
-            attention_mask=second_mask,
+            second["input_ids"],
+            attention_mask=second.get("attention_mask"),
             infer_pad_mask=infer_pad_mask,
             return_aux=False,
         )
-        stateful_loss = lm_loss(stateful_out["logits"], second_labels)
-        fresh_loss = lm_loss(fresh_out["logits"], second_labels)
+        stateful_loss = lm_loss(stateful_out["logits"], second["labels"])
+        fresh_loss = lm_loss(fresh_out["logits"], second["labels"])
     stateful = float(stateful_loss.detach().cpu())
     fresh = float(fresh_loss.detach().cpu())
     return fresh - stateful, stateful, fresh
@@ -208,24 +224,20 @@ def _estimate_v7_state_swap_penalty(
     attention_mask: torch.Tensor | None,
     infer_pad_mask: bool | None,
     use_amp: bool,
+    chunk_len: int | None,
 ) -> tuple[float, float, float] | None:
     if not _supports_state_packet(model) or input_ids.size(0) < 2 or input_ids.size(1) < 4:
         return None
 
-    split = input_ids.size(1) // 2
-    first_ids = input_ids[:, :split]
-    second_ids = input_ids[:, split:]
-    second_labels = labels[:, split:]
-    if second_labels.ne(IGNORE_INDEX).sum().item() == 0:
+    pair = _stateful_chunk_pair(input_ids, labels, attention_mask, chunk_len=chunk_len)
+    if pair is None:
         return None
-
-    first_mask = attention_mask[:, :split] if attention_mask is not None else None
-    second_mask = attention_mask[:, split:] if attention_mask is not None else None
+    first, second = pair
     device_type = input_ids.device.type
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
         first_out = model(
-            first_ids,
-            attention_mask=first_mask,
+            first["input_ids"],
+            attention_mask=first.get("attention_mask"),
             infer_pad_mask=infer_pad_mask,
             return_aux=False,
             return_logits=False,
@@ -235,21 +247,21 @@ def _estimate_v7_state_swap_penalty(
         if packet is None:
             return None
         correct_out = model(
-            second_ids,
-            attention_mask=second_mask,
+            second["input_ids"],
+            attention_mask=second.get("attention_mask"),
             infer_pad_mask=infer_pad_mask,
             return_aux=False,
             past_state=packet,
         )
         swapped_out = model(
-            second_ids,
-            attention_mask=second_mask,
+            second["input_ids"],
+            attention_mask=second.get("attention_mask"),
             infer_pad_mask=infer_pad_mask,
             return_aux=False,
             past_state=_swap_packet_batch(packet),
         )
-        correct_loss = lm_loss(correct_out["logits"], second_labels)
-        swapped_loss = lm_loss(swapped_out["logits"], second_labels)
+        correct_loss = lm_loss(correct_out["logits"], second["labels"])
+        swapped_loss = lm_loss(swapped_out["logits"], second["labels"])
     correct = float(correct_loss.detach().cpu())
     swapped = float(swapped_loss.detach().cpu())
     return swapped - correct, correct, swapped
@@ -262,25 +274,21 @@ def _estimate_v7_state_erase_sensitivity(
     attention_mask: torch.Tensor | None,
     infer_pad_mask: bool | None,
     use_amp: bool,
+    chunk_len: int | None,
 ) -> tuple[float, float, float, float] | None:
     native_model = _native_model(model)
     if getattr(native_model, "typed_dynamics", None) is None or input_ids.size(1) < 4:
         return None
 
-    split = input_ids.size(1) // 2
-    first_ids = input_ids[:, :split]
-    second_ids = input_ids[:, split:]
-    second_labels = labels[:, split:]
-    if second_labels.ne(IGNORE_INDEX).sum().item() == 0:
+    pair = _stateful_chunk_pair(input_ids, labels, attention_mask, chunk_len=chunk_len)
+    if pair is None:
         return None
-
-    first_mask = attention_mask[:, :split] if attention_mask is not None else None
-    second_mask = attention_mask[:, split:] if attention_mask is not None else None
+    first, second = pair
     device_type = input_ids.device.type
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
         first_out = model(
-            first_ids,
-            attention_mask=first_mask,
+            first["input_ids"],
+            attention_mask=first.get("attention_mask"),
             infer_pad_mask=infer_pad_mask,
             return_aux=False,
             return_logits=False,
@@ -290,15 +298,15 @@ def _estimate_v7_state_erase_sensitivity(
         if packet is None:
             return None
         full_out = model(
-            second_ids,
-            attention_mask=second_mask,
+            second["input_ids"],
+            attention_mask=second.get("attention_mask"),
             infer_pad_mask=infer_pad_mask,
             return_aux=False,
             past_state=packet,
         )
         world_erased_out = model(
-            second_ids,
-            attention_mask=second_mask,
+            second["input_ids"],
+            attention_mask=second.get("attention_mask"),
             infer_pad_mask=infer_pad_mask,
             return_aux=False,
             past_state=_packet_like(
@@ -311,8 +319,8 @@ def _estimate_v7_state_erase_sensitivity(
             ),
         )
         self_erased_out = model(
-            second_ids,
-            attention_mask=second_mask,
+            second["input_ids"],
+            attention_mask=second.get("attention_mask"),
             infer_pad_mask=infer_pad_mask,
             return_aux=False,
             past_state=_packet_like(
@@ -325,8 +333,8 @@ def _estimate_v7_state_erase_sensitivity(
             ),
         )
         latent_erased_out = model(
-            second_ids,
-            attention_mask=second_mask,
+            second["input_ids"],
+            attention_mask=second.get("attention_mask"),
             infer_pad_mask=infer_pad_mask,
             return_aux=False,
             past_state=_packet_like(
@@ -338,16 +346,96 @@ def _estimate_v7_state_erase_sensitivity(
                 controller_state=packet.controller_state,
             ),
         )
-        full_loss = lm_loss(full_out["logits"], second_labels)
-        world_loss = lm_loss(world_erased_out["logits"], second_labels)
-        self_loss = lm_loss(self_erased_out["logits"], second_labels)
-        latent_loss = lm_loss(latent_erased_out["logits"], second_labels)
+        full_loss = lm_loss(full_out["logits"], second["labels"])
+        world_loss = lm_loss(world_erased_out["logits"], second["labels"])
+        self_loss = lm_loss(self_erased_out["logits"], second["labels"])
+        latent_loss = lm_loss(latent_erased_out["logits"], second["labels"])
     full = float(full_loss.detach().cpu())
     return (
         float(world_loss.detach().cpu()) - full,
         float(self_loss.detach().cpu()) - full,
         float(latent_loss.detach().cpu()) - full,
         full,
+    )
+
+
+def _estimate_doc_continuity(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    infer_pad_mask: bool | None,
+    use_amp: bool,
+    *,
+    chunk_len: int | None,
+    target_chunks: int,
+) -> tuple[float, float, float, float, float] | None:
+    if not _supports_state_packet(model) or target_chunks < 2:
+        return None
+
+    chunks = split_stateful_chunks(
+        input_ids,
+        labels,
+        attention_mask,
+        chunk_len=chunk_len,
+        target_chunks=target_chunks,
+    )
+    if len(chunks) < 2:
+        return None
+
+    gains: list[float] = []
+    stateful_losses: list[float] = []
+    fresh_losses: list[float] = []
+    packet = None
+    device_type = input_ids.device.type
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
+        for chunk in chunks:
+            fresh_out = model(
+                chunk["input_ids"],
+                attention_mask=chunk.get("attention_mask"),
+                infer_pad_mask=infer_pad_mask,
+                return_aux=False,
+            )
+            fresh_loss = lm_loss(fresh_out["logits"], chunk["labels"])
+            if packet is None:
+                carry_out = model(
+                    chunk["input_ids"],
+                    attention_mask=chunk.get("attention_mask"),
+                    infer_pad_mask=infer_pad_mask,
+                    return_aux=False,
+                    return_logits=False,
+                    return_state=True,
+                )
+                packet = carry_out.get("state_packet")
+                continue
+
+            stateful_out = model(
+                chunk["input_ids"],
+                attention_mask=chunk.get("attention_mask"),
+                infer_pad_mask=infer_pad_mask,
+                return_aux=False,
+                return_state=True,
+                past_state=packet,
+            )
+            stateful_loss = lm_loss(stateful_out["logits"], chunk["labels"])
+            packet = stateful_out.get("state_packet")
+            if packet is None:
+                return None
+            fresh_value = float(fresh_loss.detach().cpu())
+            stateful_value = float(stateful_loss.detach().cpu())
+            gains.append(fresh_value - stateful_value)
+            fresh_losses.append(fresh_value)
+            stateful_losses.append(stateful_value)
+
+    if not gains:
+        return None
+    slope = 0.0 if len(gains) < 2 else (gains[-1] - gains[0]) / float(len(gains) - 1)
+    return (
+        sum(gains) / len(gains),
+        sum(gains),
+        slope,
+        sum(stateful_losses) / len(stateful_losses),
+        sum(fresh_losses) / len(fresh_losses),
     )
 
 
@@ -372,6 +460,10 @@ def evaluate_model(
     v7_dynamics_gain: bool = False,
     v7_state_swap: bool = False,
     v7_state_erase: bool = False,
+    doc_continuity: bool = False,
+    doc_continuity_docs: int = 32,
+    doc_continuity_chunks: int = 4,
+    stateful_chunk_len: int | None = None,
 ) -> dict[str, float]:
     was_training = model.training
     model.eval()
@@ -556,6 +648,11 @@ def evaluate_model(
             "v7_self_erase_delta_lm",
             "v7_latent_erase_delta_lm",
             "v7_state_erase_full_lm",
+            "doc_carry_gain_mean",
+            "doc_carry_gain_cumulative",
+            "doc_carry_gain_slope",
+            "doc_stateful_loss_mean",
+            "doc_fresh_loss_mean",
         ]
     }
     batches = 0
@@ -564,6 +661,7 @@ def evaluate_model(
     v7_dynamics_gain_batches = 0
     v7_state_swap_batches = 0
     v7_state_erase_batches = 0
+    doc_continuity_batches = 0
     tokens = 0
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
@@ -786,6 +884,7 @@ def evaluate_model(
                     attention_mask,
                     infer_pad_mask,
                     use_amp,
+                    stateful_chunk_len,
                 )
                 if carry is not None:
                     gain, stateful_loss, fresh_loss = carry
@@ -831,6 +930,7 @@ def evaluate_model(
                     attention_mask,
                     infer_pad_mask,
                     use_amp,
+                    stateful_chunk_len,
                 )
                 if swap is not None:
                     delta, correct_loss, wrong_loss = swap
@@ -846,6 +946,7 @@ def evaluate_model(
                     attention_mask,
                     infer_pad_mask,
                     use_amp,
+                    stateful_chunk_len,
                 )
                 if erase is not None:
                     world_delta, self_delta, latent_delta, full_loss = erase
@@ -854,6 +955,25 @@ def evaluate_model(
                     totals["v7_latent_erase_delta_lm"] += latent_delta
                     totals["v7_state_erase_full_lm"] += full_loss
                     v7_state_erase_batches += 1
+            if doc_continuity and doc_continuity_batches < max(1, doc_continuity_docs):
+                continuity = _estimate_doc_continuity(
+                    model,
+                    input_ids,
+                    labels,
+                    attention_mask,
+                    infer_pad_mask,
+                    use_amp,
+                    chunk_len=stateful_chunk_len,
+                    target_chunks=doc_continuity_chunks,
+                )
+                if continuity is not None:
+                    mean_gain, cumulative_gain, slope, stateful_mean, fresh_mean = continuity
+                    totals["doc_carry_gain_mean"] += mean_gain
+                    totals["doc_carry_gain_cumulative"] += cumulative_gain
+                    totals["doc_carry_gain_slope"] += slope
+                    totals["doc_stateful_loss_mean"] += stateful_mean
+                    totals["doc_fresh_loss_mean"] += fresh_mean
+                    doc_continuity_batches += 1
             tokens += int(labels.ne(IGNORE_INDEX).sum().item())
             batches += 1
 
@@ -1079,6 +1199,18 @@ def evaluate_model(
         if state_carry_batches
         else 0.0,
         "val_state_carry_batches": float(state_carry_batches),
+        "val_doc_carry_gain_mean": totals["doc_carry_gain_mean"] / doc_continuity_batches if doc_continuity_batches else 0.0,
+        "val_doc_carry_gain_cumulative": totals["doc_carry_gain_cumulative"] / doc_continuity_batches
+        if doc_continuity_batches
+        else 0.0,
+        "val_doc_carry_gain_slope": totals["doc_carry_gain_slope"] / doc_continuity_batches if doc_continuity_batches else 0.0,
+        "val_doc_stateful_loss_mean": totals["doc_stateful_loss_mean"] / doc_continuity_batches
+        if doc_continuity_batches
+        else 0.0,
+        "val_doc_fresh_loss_mean": totals["doc_fresh_loss_mean"] / doc_continuity_batches
+        if doc_continuity_batches
+        else 0.0,
+        "val_doc_continuity_batches": float(doc_continuity_batches),
         "val_latent_thought_gain_lm": totals["latent_thought_gain_lm"] / latent_thought_gain_batches
         if latent_thought_gain_batches
         else 0.0,

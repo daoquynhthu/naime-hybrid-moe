@@ -43,6 +43,9 @@ class TrainConfig:
     eval_v7_dynamics_gain: bool = False
     eval_v7_state_swap: bool = False
     eval_v7_state_erase: bool = False
+    eval_doc_continuity: bool = False
+    eval_doc_continuity_docs: int = 32
+    eval_doc_continuity_chunks: int = 4
     early_stop_patience: int = 0
     early_stop_min_delta: float = 0.0
     early_stop_min_evals: int = 0
@@ -93,6 +96,13 @@ class TrainConfig:
     lambda_slot_stability: float = 0.0
     lambda_self_pred: float = 0.0
     lambda_self_slot_diversity: float = 0.0
+    stateful_batch_ratio: float = 0.0
+    stateful_chunk_len: int | None = None
+    lambda_stateful_carry: float = 0.0
+    stateful_carry_margin: float = 0.0
+    self_state_hidden_scale_warmup_steps: int = 0
+    self_state_context_score_warmup_steps: int = 0
+    self_state_context_score_start: float = 1.0
 
     model: NAIMEStateMoEConfig = field(default_factory=NAIMEStateMoEConfig)
 

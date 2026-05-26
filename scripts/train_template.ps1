@@ -31,6 +31,9 @@ param(
     [switch]$EvalV7DynamicsGain,
     [switch]$EvalV7StateSwap,
     [switch]$EvalV7StateErase,
+    [switch]$EvalDocContinuity,
+    [int]$EvalDocContinuityDocs = -1,
+    [int]$EvalDocContinuityChunks = -1,
     [int]$SaveEvery = -1,
     [int]$LatestEvery = -1,
     [int]$MetricsFlushEvery = -1,
@@ -54,6 +57,13 @@ param(
     [double]$LatentThoughtHiddenScale = -1.0,
     [int]$StateEvolutionSteps = -1,
     [switch]$NoStateEvolutionMemory,
+    [double]$StatefulBatchRatio = -1.0,
+    [int]$StatefulChunkLen = -1,
+    [double]$LambdaStatefulCarry = -1.0,
+    [double]$StatefulCarryMargin = -1.0,
+    [int]$SelfStateHiddenScaleWarmupSteps = -1,
+    [int]$SelfStateContextScoreWarmupSteps = -1,
+    [double]$SelfStateContextScoreStart = -1.0,
     [switch]$LatentFieldCoupling,
     [double]$LatentFieldTokenScale = -1.0,
     [double]$LatentFieldMaxRatio = -1.0,
@@ -231,6 +241,11 @@ if ($EvalV7StateSwap) {
 if ($EvalV7StateErase) {
     $params["EvalV7StateErase"] = $true
 }
+if ($EvalDocContinuity) {
+    $params["EvalDocContinuity"] = $true
+}
+Add-Override $params "EvalDocContinuityDocs" $EvalDocContinuityDocs { $EvalDocContinuityDocs -gt 0 }
+Add-Override $params "EvalDocContinuityChunks" $EvalDocContinuityChunks { $EvalDocContinuityChunks -gt 1 }
 if ($UseFusedStateAttention) {
     $params["UseFusedStateAttention"] = $true
 }
@@ -254,6 +269,17 @@ Add-Override $params "LatentThoughtSteps" $LatentThoughtSteps { $LatentThoughtSt
 Add-Override $params "LatentThoughtWriteMode" $LatentThoughtWriteMode { -not [string]::IsNullOrWhiteSpace($LatentThoughtWriteMode) }
 Add-Override $params "LatentThoughtHiddenScale" $LatentThoughtHiddenScale { $LatentThoughtHiddenScale -ge 0.0 }
 Add-Override $params "StateEvolutionSteps" $StateEvolutionSteps { $StateEvolutionSteps -ge 0 }
+Add-Override $params "StatefulBatchRatio" $StatefulBatchRatio { $StatefulBatchRatio -ge 0.0 }
+Add-Override $params "StatefulChunkLen" $StatefulChunkLen { $StatefulChunkLen -gt 0 }
+Add-Override $params "LambdaStatefulCarry" $LambdaStatefulCarry { $LambdaStatefulCarry -ge 0.0 }
+Add-Override $params "StatefulCarryMargin" $StatefulCarryMargin { $StatefulCarryMargin -ge 0.0 }
+Add-Override $params "SelfStateHiddenScaleWarmupSteps" $SelfStateHiddenScaleWarmupSteps {
+    $SelfStateHiddenScaleWarmupSteps -ge 0
+}
+Add-Override $params "SelfStateContextScoreWarmupSteps" $SelfStateContextScoreWarmupSteps {
+    $SelfStateContextScoreWarmupSteps -ge 0
+}
+Add-Override $params "SelfStateContextScoreStart" $SelfStateContextScoreStart { $SelfStateContextScoreStart -ge 0.0 }
 if ($NoStateEvolutionMemory) {
     $params["NoStateEvolutionMemory"] = $true
 }
@@ -345,6 +371,7 @@ $switchNames = @(
     "EvalV7DynamicsGain",
     "EvalV7StateSwap",
     "EvalV7StateErase",
+    "EvalDocContinuity",
     "UseFusedStateAttention",
     "V7DynamicDepth",
     "V7HomeostaticControl",

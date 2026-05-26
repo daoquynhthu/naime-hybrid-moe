@@ -10,7 +10,7 @@ from naime_hybrid.data import ByteTextDataset, HFDiskCausalDataset, RandomTokenD
 from naime_hybrid.models import build_model
 
 from .config import TrainConfig
-from .losses import collect_aux_losses, lm_loss
+from .losses import IGNORE_INDEX, collect_aux_losses, lm_loss
 
 
 def set_seed(seed: int, *, seed_cuda: bool = True) -> None:
@@ -49,6 +49,56 @@ def build_dataset(config: TrainConfig, split: str | None = None):
             max_samples=config.max_samples,
         )
     return ByteTextDataset.from_file(data_path, seq_len=config.model.max_seq_len, max_samples=config.max_samples)
+
+
+def split_stateful_chunks(
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    *,
+    chunk_len: int | None = None,
+    target_chunks: int = 2,
+) -> list[dict[str, torch.Tensor]]:
+    """Split a collated causal-LM batch into sequential continuation chunks.
+
+    This operates on the already shifted training tensors:
+    ``input_ids[t] -> labels[t]``. The returned chunks therefore stay causally
+    contiguous without needing raw unshifted document tokens.
+    """
+    if input_ids.ndim != 2 or labels.ndim != 2:
+        raise ValueError("split_stateful_chunks expects [batch, seq] input_ids and labels")
+    if input_ids.shape != labels.shape:
+        raise ValueError("input_ids and labels must have the same shape")
+    if attention_mask is not None and attention_mask.shape != input_ids.shape:
+        raise ValueError("attention_mask must match input_ids shape")
+
+    seq_len = int(input_ids.size(1))
+    target_chunks = max(1, int(target_chunks))
+    max_chunk_len = seq_len // target_chunks
+    if max_chunk_len <= 0:
+        return []
+    if chunk_len is None:
+        resolved_chunk_len = max_chunk_len
+    else:
+        resolved_chunk_len = min(int(chunk_len), max_chunk_len)
+    if resolved_chunk_len <= 0:
+        return []
+
+    available_chunks = min(target_chunks, seq_len // resolved_chunk_len)
+    chunks: list[dict[str, torch.Tensor]] = []
+    for chunk_idx in range(available_chunks):
+        start = chunk_idx * resolved_chunk_len
+        end = start + resolved_chunk_len
+        chunk = {
+            "input_ids": input_ids[:, start:end],
+            "labels": labels[:, start:end],
+        }
+        if attention_mask is not None:
+            chunk["attention_mask"] = attention_mask[:, start:end]
+        valid_labels = chunk["labels"].ne(IGNORE_INDEX)
+        if bool(valid_labels.any().item()):
+            chunks.append(chunk)
+    return chunks
 
 
 def cycle_loader(loader: DataLoader):

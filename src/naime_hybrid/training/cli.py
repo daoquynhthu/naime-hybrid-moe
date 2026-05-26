@@ -161,6 +161,23 @@ def parse_args() -> argparse.Namespace:
         help="During validation, erase world/self/latent packet fields and measure next chunk sensitivity.",
     )
     parser.add_argument(
+        "--eval-doc-continuity",
+        action="store_true",
+        help="During validation, run multi-chunk continuity probes over sequential chunks from the same sample.",
+    )
+    parser.add_argument(
+        "--eval-doc-continuity-docs",
+        type=int,
+        default=32,
+        help="How many sequential-sample continuity traces to evaluate when --eval-doc-continuity is enabled.",
+    )
+    parser.add_argument(
+        "--eval-doc-continuity-chunks",
+        type=int,
+        default=4,
+        help="How many consecutive chunks to follow inside each continuity trace.",
+    )
+    parser.add_argument(
         "--early-stop-patience",
         type=int,
         default=0,
@@ -360,6 +377,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-state-diversity-margin", type=float, default=0.85)
     parser.add_argument("--self-state-identity-scale", type=float, default=0.02)
     parser.add_argument("--self-state-context-score-scale", type=float, default=4.0)
+    parser.add_argument("--self-state-hidden-scale-warmup-steps", type=int, default=0)
+    parser.add_argument("--self-state-context-score-warmup-steps", type=int, default=0)
+    parser.add_argument("--self-state-context-score-start", type=float, default=1.0)
     parser.add_argument("--no-self-state-world-gate", action="store_true")
     parser.add_argument("--self-state-world-gate-min", type=float, default=0.10)
     parser.add_argument("--self-state-world-gate-scale", type=float, default=1.0)
@@ -469,6 +489,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-slot-stability", type=float, default=0.0)
     parser.add_argument("--lambda-self-pred", type=float, default=0.0)
     parser.add_argument("--lambda-self-slot-diversity", type=float, default=0.0)
+    parser.add_argument(
+        "--stateful-batch-ratio",
+        type=float,
+        default=0.0,
+        help="Fraction of training micro-batches that should run continuation carry training.",
+    )
+    parser.add_argument(
+        "--stateful-chunk-len",
+        type=int,
+        default=None,
+        help="Chunk length for continuation training/eval. Defaults to seq_len // 2 when unset.",
+    )
+    parser.add_argument(
+        "--lambda-stateful-carry",
+        type=float,
+        default=0.0,
+        help="Weight for the continuation carry hinge loss that penalizes stateful chunk-2 loss being worse than fresh.",
+    )
+    parser.add_argument(
+        "--stateful-carry-margin",
+        type=float,
+        default=0.0,
+        help="Optional positive margin inside the continuation carry hinge loss.",
+    )
     return parser.parse_args()
 
 
@@ -635,6 +679,9 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         eval_v7_dynamics_gain=args.eval_v7_dynamics_gain,
         eval_v7_state_swap=args.eval_v7_state_swap,
         eval_v7_state_erase=args.eval_v7_state_erase,
+        eval_doc_continuity=args.eval_doc_continuity,
+        eval_doc_continuity_docs=args.eval_doc_continuity_docs,
+        eval_doc_continuity_chunks=args.eval_doc_continuity_chunks,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
         early_stop_min_evals=args.early_stop_min_evals,
@@ -679,5 +726,12 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         lambda_slot_stability=args.lambda_slot_stability,
         lambda_self_pred=args.lambda_self_pred,
         lambda_self_slot_diversity=args.lambda_self_slot_diversity,
+        stateful_batch_ratio=args.stateful_batch_ratio,
+        stateful_chunk_len=args.stateful_chunk_len,
+        lambda_stateful_carry=args.lambda_stateful_carry,
+        stateful_carry_margin=args.stateful_carry_margin,
+        self_state_hidden_scale_warmup_steps=args.self_state_hidden_scale_warmup_steps,
+        self_state_context_score_warmup_steps=args.self_state_context_score_warmup_steps,
+        self_state_context_score_start=args.self_state_context_score_start,
         model=model_config,
     )

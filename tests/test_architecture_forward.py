@@ -29,9 +29,12 @@ from naime_hybrid.training.checkpoint import (
     save_payloads_in_subprocess,
 )
 from naime_hybrid.training.cli import build_train_config, parse_args
+from naime_hybrid.training.config import TrainConfig
 from naime_hybrid.training.control import reference_value_at_step, update_sparse_lambda
 from naime_hybrid.training.losses import lm_loss
 from naime_hybrid.training.masks import prepare_attention_mask_for_device
+from naime_hybrid.training.runtime import split_stateful_chunks
+from naime_hybrid.training.train import _apply_self_state_warmup
 from naime_hybrid.training.validation import evaluate_model
 
 
@@ -208,6 +211,144 @@ def test_hf_collate_keeps_token_zero_visible():
     assert collated["input_ids"][1, 1].item() == 0
     assert collated["attention_mask"].all()
     assert (collated["labels"] == -100).sum().item() == 0
+
+
+def test_split_stateful_chunks_preserves_contiguous_causal_alignment():
+    input_ids = torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]])
+    labels = torch.tensor([[11, 12, 13, 14, 15, 16, 17, 18]])
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    chunks = split_stateful_chunks(input_ids, labels, attention_mask, chunk_len=3, target_chunks=2)
+
+    assert len(chunks) == 2
+    assert torch.equal(chunks[0]["input_ids"], torch.tensor([[10, 11, 12]]))
+    assert torch.equal(chunks[0]["labels"], torch.tensor([[11, 12, 13]]))
+    assert torch.equal(chunks[1]["input_ids"], torch.tensor([[13, 14, 15]]))
+    assert torch.equal(chunks[1]["labels"], torch.tensor([[14, 15, 16]]))
+    assert chunks[0]["attention_mask"].all()
+    assert chunks[1]["attention_mask"].all()
+
+
+def test_cli_maps_stateful_carry_and_doc_continuity_flags(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train",
+            "--architecture",
+            "naime_v7_typed_dynamics",
+            "--eval-doc-continuity",
+            "--eval-doc-continuity-docs",
+            "7",
+            "--eval-doc-continuity-chunks",
+            "3",
+            "--stateful-batch-ratio",
+            "0.1",
+            "--stateful-chunk-len",
+            "256",
+            "--lambda-stateful-carry",
+            "0.0005",
+            "--stateful-carry-margin",
+            "0.001",
+            "--self-state-hidden-scale-warmup-steps",
+            "2000",
+            "--self-state-context-score-warmup-steps",
+            "1500",
+            "--self-state-context-score-start",
+            "0.5",
+        ],
+    )
+
+    config = build_train_config(parse_args())
+
+    assert config.eval_doc_continuity is True
+    assert config.eval_doc_continuity_docs == 7
+    assert config.eval_doc_continuity_chunks == 3
+    assert config.stateful_batch_ratio == pytest.approx(0.1)
+    assert config.stateful_chunk_len == 256
+    assert config.lambda_stateful_carry == pytest.approx(5e-4)
+    assert config.stateful_carry_margin == pytest.approx(1e-3)
+    assert config.self_state_hidden_scale_warmup_steps == 2000
+    assert config.self_state_context_score_warmup_steps == 1500
+    assert config.self_state_context_score_start == pytest.approx(0.5)
+
+
+def test_apply_self_state_warmup_updates_effective_scales():
+    model_config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        max_seq_len=32,
+        d_model=32,
+        n_layers=2,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        world_state_slots=2,
+        self_state_slots=2,
+        self_state_hidden_scale=0.02,
+        self_state_context_score_scale=4.0,
+    )
+    model = build_model("naime_v6_recursive_self_moe", model_config)
+    train_config = TrainConfig(
+        architecture="naime_v6_recursive_self_moe",
+        self_state_hidden_scale_warmup_steps=2000,
+        self_state_context_score_warmup_steps=2000,
+        self_state_context_score_start=1.0,
+        model=model_config,
+    )
+
+    hidden_scale, context_scale = _apply_self_state_warmup(model, train_config, step=1000)
+
+    assert hidden_scale == pytest.approx(0.01)
+    assert context_scale == pytest.approx(2.5)
+    assert model.self_state_slots.hidden_scale == pytest.approx(0.01)
+    assert model.self_state_slots.context_score_scale == pytest.approx(2.5)
+
+
+def test_evaluate_model_reports_doc_continuity_metrics_for_v7():
+    torch.manual_seed(1234)
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        max_seq_len=32,
+        d_model=32,
+        n_layers=3,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        world_state_slots=2,
+        self_state_slots=2,
+        v7_dynamics_steps=1,
+        v7_latent_slots=2,
+        n_experts=2,
+        top_k=1,
+        expert_hidden_dim=48,
+        stride=4,
+        window=8,
+        z_dim=8,
+    )
+    model = build_model("naime_v7_typed_dynamics", config)
+    input_ids = torch.randint(1, config.vocab_size, (2, 12))
+    labels = torch.randint(1, config.vocab_size, (2, 12))
+    loader = [{"input_ids": input_ids, "labels": labels, "attention_mask": torch.ones_like(input_ids, dtype=torch.bool)}]
+
+    metrics = evaluate_model(
+        model,
+        loader,
+        config,
+        device=torch.device("cpu"),
+        use_amp=False,
+        max_batches=1,
+        doc_continuity=True,
+        doc_continuity_docs=1,
+        doc_continuity_chunks=3,
+        stateful_chunk_len=4,
+    )
+
+    assert "val_doc_carry_gain_mean" in metrics
+    assert "val_doc_carry_gain_cumulative" in metrics
+    assert "val_doc_carry_gain_slope" in metrics
+    assert metrics["val_doc_continuity_batches"] == 1.0
+    assert math.isfinite(metrics["val_doc_carry_gain_mean"])
 
 
 def test_tiny_decoder_forward_and_backward():

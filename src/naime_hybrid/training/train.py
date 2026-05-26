@@ -34,7 +34,7 @@ from .losses import collect_aux_losses, fused_lm_loss, lm_loss
 from .masks import prepare_attention_mask_for_device
 from .prefetch import AsyncPrefetcher
 from .progress import TrainingProgress
-from .runtime import build_dataset, cycle_loader, probe_auto_batch_size, resolve_device, set_seed
+from .runtime import build_dataset, cycle_loader, probe_auto_batch_size, resolve_device, set_seed, split_stateful_chunks
 from .scheduler import cosine_with_restarts, cosine_with_warmup
 from .signals import StopSignalMonitor
 from .validation import evaluate_model
@@ -149,6 +149,98 @@ def _shutdown_loader_iterator(iterator, logger: logging.Logger) -> None:
         shutdown()
     except Exception:
         logger.debug("DataLoader worker shutdown failed", exc_info=True)
+
+
+def _stateful_carry_objective(
+    model,
+    *,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    infer_pad_mask: bool | None,
+    config,
+    use_amp: bool,
+    device: torch.device,
+):
+    if config.stateful_batch_ratio <= 0.0 or config.lambda_stateful_carry <= 0.0:
+        return None
+    if torch.rand((), device=device).item() >= float(config.stateful_batch_ratio):
+        return None
+
+    chunks = split_stateful_chunks(
+        input_ids,
+        labels,
+        attention_mask,
+        chunk_len=config.stateful_chunk_len,
+        target_chunks=2,
+    )
+    if len(chunks) < 2:
+        return None
+
+    first = chunks[0]
+    second = chunks[1]
+    device_type = device.type
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
+        first_out = model(
+            first["input_ids"],
+            attention_mask=first.get("attention_mask"),
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            return_logits=False,
+            return_state=True,
+        )
+        packet = first_out.get("state_packet")
+        if packet is None:
+            return None
+        stateful_out = model(
+            second["input_ids"],
+            attention_mask=second.get("attention_mask"),
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            past_state=packet,
+            detach_past_state=False,
+        )
+        stateful_loss = lm_loss(stateful_out["logits"], second["labels"], backend=config.lm_loss_backend)
+        with torch.no_grad():
+            fresh_out = model(
+                second["input_ids"],
+                attention_mask=second.get("attention_mask"),
+                infer_pad_mask=infer_pad_mask,
+                return_aux=False,
+            )
+            fresh_loss = lm_loss(fresh_out["logits"], second["labels"], backend=config.lm_loss_backend)
+        carry_loss = torch.relu(stateful_loss - fresh_loss.detach() + float(config.stateful_carry_margin))
+
+    return {
+        "carry_loss": carry_loss,
+        "stateful_loss": stateful_loss.detach(),
+        "fresh_loss": fresh_loss.detach(),
+        "batch_active": input_ids.new_tensor(1.0),
+    }
+
+
+def _apply_self_state_warmup(model: torch.nn.Module, config, step: int) -> tuple[float, float]:
+    native_model = getattr(model, "_orig_mod", model)
+    self_state_slots = getattr(native_model, "self_state_slots", None)
+    target_hidden = float(config.model.self_state_hidden_scale)
+    target_context = float(config.model.self_state_context_score_scale)
+    if self_state_slots is None:
+        return target_hidden, target_context
+
+    hidden_scale = target_hidden
+    if config.self_state_hidden_scale_warmup_steps > 0:
+        hidden_ratio = min(1.0, float(step) / max(1.0, float(config.self_state_hidden_scale_warmup_steps)))
+        hidden_scale = target_hidden * hidden_ratio
+
+    context_scale = target_context
+    if config.self_state_context_score_warmup_steps > 0:
+        context_ratio = min(1.0, float(step) / max(1.0, float(config.self_state_context_score_warmup_steps)))
+        context_start = float(config.self_state_context_score_start)
+        context_scale = context_start + context_ratio * (target_context - context_start)
+
+    self_state_slots.hidden_scale = float(hidden_scale)
+    self_state_slots.context_score_scale = float(context_scale)
+    return float(hidden_scale), float(context_scale)
 
 
 def _extract_max_steps(path: Path) -> int:
@@ -814,6 +906,11 @@ def main() -> None:
     stop_signals.install(stop_file=stop_path)
     try:
         for step in range(start_step + 1, config.max_steps + 1):
+            effective_self_hidden_scale, effective_self_context_score_scale = _apply_self_state_warmup(
+                model_eval,
+                config,
+                step,
+            )
             if stop_signals.requested:
                 save_step = max(start_step, step - 1)
                 logger.warning(
@@ -892,6 +989,28 @@ def main() -> None:
                     slot_stability_contrib = config.lambda_slot_stability * aux["v5_slot_stability"]
                     self_pred_contrib = w_self_pred * aux["v6_self_pred"]
                     self_slot_diversity_contrib = w_self_slot_div * aux["v6_slot_diversity"]
+                    stateful_carry = _stateful_carry_objective(
+                        model,
+                        input_ids=input_ids,
+                        labels=labels,
+                        attention_mask=attention_mask,
+                        infer_pad_mask=infer_pad_mask,
+                        config=config,
+                        use_amp=use_amp,
+                        device=device,
+                    )
+                    if stateful_carry is not None:
+                        stateful_carry_contrib = config.lambda_stateful_carry * stateful_carry["carry_loss"]
+                        stateful_carry_loss = stateful_carry["carry_loss"]
+                        stateful_loss_chunk2 = stateful_carry["stateful_loss"]
+                        fresh_loss_chunk2 = stateful_carry["fresh_loss"]
+                        stateful_batch_active = stateful_carry["batch_active"]
+                    else:
+                        stateful_carry_contrib = main_loss.new_tensor(0.0)
+                        stateful_carry_loss = main_loss.new_tensor(0.0)
+                        stateful_loss_chunk2 = main_loss.new_tensor(0.0)
+                        fresh_loss_chunk2 = main_loss.new_tensor(0.0)
+                        stateful_batch_active = main_loss.new_tensor(0.0)
                     total_loss = (
                         main_loss
                         + load_contrib
@@ -903,6 +1022,7 @@ def main() -> None:
                         + slot_stability_contrib
                         + self_pred_contrib
                         + self_slot_diversity_contrib
+                        + stateful_carry_contrib
                     )
                     total_loss = total_loss / config.grad_accum_steps
 
@@ -922,6 +1042,7 @@ def main() -> None:
                     "loss_v5_slot_stability": aux["v5_slot_stability"].detach(),
                     "loss_v6_self_pred": aux["v6_self_pred"].detach(),
                     "loss_v6_slot_diversity": aux["v6_slot_diversity"].detach(),
+                    "loss_stateful_carry": stateful_carry_loss.detach(),
                     "loss_load_contrib": load_contrib.detach(),
                     "loss_sparse_contrib": sparse_contrib.detach(),
                     "loss_kl_contrib": kl_contrib.detach(),
@@ -931,6 +1052,10 @@ def main() -> None:
                     "loss_v5_slot_stability_contrib": slot_stability_contrib.detach(),
                     "loss_v6_self_pred_contrib": self_pred_contrib.detach(),
                     "loss_v6_slot_diversity_contrib": self_slot_diversity_contrib.detach(),
+                    "loss_stateful_carry_contrib": stateful_carry_contrib.detach(),
+                    "stateful_loss_chunk2": stateful_loss_chunk2.detach(),
+                    "fresh_loss_chunk2": fresh_loss_chunk2.detach(),
+                    "stateful_batch_fraction": stateful_batch_active.detach(),
                 }
                 for k, v in aux.items():
                     if isinstance(v, torch.Tensor):
@@ -980,6 +1105,10 @@ def main() -> None:
                     "lambda_slot_diversity_effective": float(config.lambda_slot_diversity),
                     "lambda_self_pred_effective": float(config.lambda_self_pred),
                     "lambda_self_slot_diversity_effective": float(config.lambda_self_slot_diversity),
+                    "lambda_stateful_carry_effective": float(config.lambda_stateful_carry),
+                    "stateful_carry_margin": float(config.stateful_carry_margin),
+                    "self_state_hidden_scale_effective": float(effective_self_hidden_scale),
+                    "self_state_context_score_scale_effective": float(effective_self_context_score_scale),
                     "lr_safety_factor": float(lr_safety_factor),
                     "bad_grad_window_count": float(len(bad_grad_window)),
                     "balancer_conf": 0.0,
@@ -1150,6 +1279,10 @@ def main() -> None:
                     config.eval_v7_dynamics_gain,
                     config.eval_v7_state_swap,
                     config.eval_v7_state_erase,
+                    config.eval_doc_continuity,
+                    config.eval_doc_continuity_docs,
+                    config.eval_doc_continuity_chunks,
+                    config.stateful_chunk_len,
                 )
                 log_payload.update(eval_metrics)
                 log_payload["record_type"] = "train_eval"

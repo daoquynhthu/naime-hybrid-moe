@@ -70,6 +70,9 @@ param(
     [switch]$EvalV7DynamicsGain,
     [switch]$EvalV7StateSwap,
     [switch]$EvalV7StateErase,
+    [switch]$EvalDocContinuity,
+    [int]$EvalDocContinuityDocs = 32,
+    [int]$EvalDocContinuityChunks = 4,
     [int]$EarlyStopPatience = 0,
     [int]$EarlyStopMinEvals = 0,
     [double]$EarlyStopMinDelta = 0.0,
@@ -94,6 +97,9 @@ param(
     [double]$SelfStateBoundaryTemperature = 1.0,
     [double]$SelfStateIdentityScale = 0.02,
     [double]$SelfStateContextScoreScale = 4.0,
+    [int]$SelfStateHiddenScaleWarmupSteps = 0,
+    [int]$SelfStateContextScoreWarmupSteps = 0,
+    [double]$SelfStateContextScoreStart = 1.0,
     [switch]$NoSelfStateWorldGate,
     [double]$SelfStateWorldGateMin = 0.10,
     [double]$SelfStateWorldGateScale = 1.0,
@@ -103,6 +109,10 @@ param(
     [double]$LatentThoughtHiddenScale = 0.0,
     [int]$StateEvolutionSteps = 0,
     [switch]$NoStateEvolutionMemory,
+    [double]$StatefulBatchRatio = 0.0,
+    [int]$StatefulChunkLen = 0,
+    [double]$LambdaStatefulCarry = 0.0,
+    [double]$StatefulCarryMargin = 0.0,
     [switch]$LatentFieldCoupling,
     [double]$LatentFieldTokenScale = 0.02,
     [double]$LatentFieldMaxRatio = 0.05,
@@ -304,6 +314,13 @@ if ($EvalV7StateSwap) {
 if ($EvalV7StateErase) {
     $common += "--eval-v7-state-erase"
 }
+if ($EvalDocContinuity) {
+    $common += @(
+        "--eval-doc-continuity",
+        "--eval-doc-continuity-docs", "$EvalDocContinuityDocs",
+        "--eval-doc-continuity-chunks", "$EvalDocContinuityChunks"
+    )
+}
 if ($UseFusedStateAttention) {
     $common += "--use-fused-state-attention"
 }
@@ -490,11 +507,20 @@ if ($isStateModel) {
             "--latent-thought-write-mode", "$LatentThoughtWriteMode",
             "--latent-thought-hidden-scale", "$LatentThoughtHiddenScale",
             "--state-evolution-steps", "$StateEvolutionSteps",
+            "--stateful-batch-ratio", "$StatefulBatchRatio",
+            "--lambda-stateful-carry", "$LambdaStatefulCarry",
+            "--stateful-carry-margin", "$StatefulCarryMargin",
             "--latent-field-token-scale", "$LatentFieldTokenScale",
             "--latent-field-max-ratio", "$LatentFieldMaxRatio",
             "--lambda-self-pred", $(if ($LambdaSelfPred -gt 0.0) { "$LambdaSelfPred" } else { "0.01" }),
-            "--lambda-self-slot-diversity", $(if ($LambdaSelfSlotDiversity -gt 0.0) { "$LambdaSelfSlotDiversity" } else { "0.02" })
+            "--lambda-self-slot-diversity", $(if ($LambdaSelfSlotDiversity -gt 0.0) { "$LambdaSelfSlotDiversity" } else { "0.02" }),
+            "--self-state-hidden-scale-warmup-steps", "$SelfStateHiddenScaleWarmupSteps",
+            "--self-state-context-score-warmup-steps", "$SelfStateContextScoreWarmupSteps",
+            "--self-state-context-score-start", "$SelfStateContextScoreStart"
         )
+        if ($StatefulChunkLen -gt 0) {
+            $common += @("--stateful-chunk-len", "$StatefulChunkLen")
+        }
         if ($LatentFieldCoupling) {
             $common += "--latent-field-coupling"
         }
