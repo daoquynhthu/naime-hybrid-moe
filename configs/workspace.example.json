@@ -18,5 +18,14 @@
     "venv": "<REMOTE_ROOT>/envs/.venv312",
     "python": "<REMOTE_ROOT>/envs/.venv312/Scripts/python.exe",
     "python_home": "<REMOTE_PYTHON_HOME>"
+  },
+  "storage": {
+    "contabo": {
+      "endpoint": "https://<region>.contabostorage.com",
+      "access_key": "<ACCESS_KEY>",
+      "secret_key": "<SECRET_KEY>",
+      "bucket": "<BUCKET_NAME>",
+      "region": "default"
+    }
   }
 }

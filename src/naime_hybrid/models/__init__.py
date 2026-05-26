@@ -10,7 +10,7 @@ from .decoder import (
     TokenMoEDecoder,
 )
 from .factory import build_model
-from .state_packet import NAIMEStatePacket
+from .state_packet import NAIMEStatePacket, ObservationPacket
 
 __all__ = [
     "DenseDecoder",
@@ -20,6 +20,7 @@ __all__ = [
     "NAIMEV5WorldStateMoEDecoder",
     "NAIMEV6RecursiveSelfMoEDecoder",
     "NAIMEV7TypedDynamicsDecoder",
+    "ObservationPacket",
     "TokenMoEDecoder",
     "build_model",
 ]

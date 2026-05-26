@@ -105,11 +105,39 @@ class NAIMEStateMoEConfig:
     v7_hidden_write_scale: float = 0.01
     v7_max_hidden_write_ratio: float = 0.05
     v7_state_write_scale: float = 0.02
+    v7_world_state_write_scale: float = -1.0
+    v7_self_state_write_scale: float = -1.0
+    v7_latent_timescale: float = 1.0
+    v7_world_timescale: float = 1.0
+    v7_self_timescale: float = 1.0
+    v7_controller_slots: int = 1
+    v7_controller_write_scale: float = 0.02
+    v7_controller_mode: str = "fixed"
     v7_past_latent_adapt_steps: int = 1
+    v7_state_chunk_size: int = 0
+    v7_internal_latent_adapt_steps: int = 0
     v7_dynamic_depth: bool = False
     v7_min_dynamics_steps: int = 1
     v7_max_dynamics_steps: int = 0
     v7_dynamic_convergence_threshold: float = 0.0
+    v7_homeostatic_control: bool = False
+    v7_homeostatic_strength: float = 0.25
+    v7_homeostatic_min_scale: float = 0.5
+    v7_homeostatic_max_scale: float = 1.5
+    v7_state_compatibility_gate: bool = False
+    v7_state_compatibility_strength: float = 1.0
+    v7_state_compatibility_min: float = 0.0
+    v7_adaptive_tau: bool = False
+    v7_adaptive_tau_min: float = 0.5
+    v7_adaptive_tau_max: float = 1.5
+    v7_hyperspherical_state: bool = True
+    v7_causal_summary: bool = True
+    v7_causal_summary_decay: float = 0.98
+
+    # Router-state coupling. "add" preserves the older low-frequency bias path;
+    # "modulate" makes world state scale token router coordinates.
+    world_router_mode: str = "add"
+    world_router_modulation_scale: float = 0.35
 
     # Stability / architecture toggles.
     qk_norm: bool = True

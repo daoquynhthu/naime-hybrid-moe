@@ -26,12 +26,14 @@ def _packet_like(
     self_state: torch.Tensor | None,
     latent_field: torch.Tensor | None,
     memory: torch.Tensor | None,
+    controller_state: torch.Tensor | None,
 ) -> NAIMEStatePacket:
     return NAIMEStatePacket(
         world_state=world_state,
         self_state=self_state,
         latent_field=latent_field,
         memory=memory,
+        controller_state=controller_state,
         state_version=packet.state_version,
         protocol_version=packet.protocol_version,
         architecture_id=packet.architecture_id,
@@ -53,6 +55,7 @@ def _swap_packet_batch(packet: NAIMEStatePacket) -> NAIMEStatePacket:
         self_state=_roll_optional_batch(packet.self_state),
         latent_field=_roll_optional_batch(packet.latent_field),
         memory=_roll_optional_batch(packet.memory),
+        controller_state=_roll_optional_batch(packet.controller_state),
     )
 
 
@@ -304,6 +307,7 @@ def _estimate_v7_state_erase_sensitivity(
                 self_state=packet.self_state,
                 latent_field=packet.latent_field,
                 memory=packet.memory,
+                controller_state=packet.controller_state,
             ),
         )
         self_erased_out = model(
@@ -317,6 +321,7 @@ def _estimate_v7_state_erase_sensitivity(
                 self_state=None,
                 latent_field=packet.latent_field,
                 memory=packet.memory,
+                controller_state=packet.controller_state,
             ),
         )
         latent_erased_out = model(
@@ -330,6 +335,7 @@ def _estimate_v7_state_erase_sensitivity(
                 self_state=packet.self_state,
                 latent_field=None,
                 memory=packet.memory,
+                controller_state=packet.controller_state,
             ),
         )
         full_loss = lm_loss(full_out["logits"], second_labels)
@@ -421,6 +427,7 @@ def evaluate_model(
             "v5_router_world_ratio",
             "v5_router_world_cosine",
             "v5_router_world_gate",
+            "v5_router_world_modulation",
             "v5_router_world_cap",
             "v5_router_memory_norm",
             "v5_router_memory_ratio",
@@ -474,17 +481,65 @@ def evaluate_model(
             "v7_latent_state_norm",
             "v7_world_state_norm",
             "v7_self_state_norm",
+            "v7_controller_state_norm",
             "v7_world_delta",
             "v7_self_delta",
+            "v7_controller_delta",
             "v7_world_write_gate",
             "v7_self_write_gate",
+            "v7_controller_write_gate",
             "v7_dynamic_depth_enabled",
             "v7_dynamic_depth_mean",
             "v7_dynamic_halt_fraction",
             "v7_dynamic_continue_score",
             "v7_dynamic_convergence_threshold",
+            "v7_causal_segments",
             "v7_past_latent_adapt_steps",
             "v7_past_latent_read_suppressed",
+            "v7_latent_timescale",
+            "v7_world_timescale",
+            "v7_self_timescale",
+            "v7_controller_fixed",
+            "v7_homeostatic_control_enabled",
+            "v7_homeostatic_dhi",
+            "v7_homeostatic_balance_pressure",
+            "v7_homeostatic_accel_pressure",
+            "v7_latent_rate_scale",
+            "v7_world_rate_scale",
+            "v7_self_rate_scale",
+            "v7_hidden_read_rate_scale",
+            "v7_state_compatibility_enabled",
+            "v7_carry_compatibility",
+            "v7_carry_latent_gate",
+            "v7_carry_world_gate",
+            "v7_carry_self_gate",
+            "v7_carry_controller_gate",
+            "v7_carry_memory_gate",
+            "v7_carry_blend_delta",
+            "v7_hyperspherical_state_enabled",
+            "v7_causal_summary_enabled",
+            "v7_causal_summary_decay",
+            "v7_adaptive_tau_enabled",
+            "v7_latent_tau",
+            "v7_world_tau",
+            "v7_self_tau",
+            "v7_controller_tau",
+            "v7_ingress_compatibility_enabled",
+            "v7_ingress_compatibility",
+            "v7_ingress_latent_gate",
+            "v7_ingress_world_gate",
+            "v7_ingress_self_gate",
+            "v7_ingress_controller_gate",
+            "v7_ingress_memory_gate",
+            "v7_ingress_latent_blend_delta",
+            "v7_ingress_world_blend_delta",
+            "v7_ingress_self_blend_delta",
+            "v7_ingress_controller_blend_delta",
+            "v7_ingress_memory_blend_delta",
+            "v7_effective_latent_write_scale",
+            "v7_effective_world_write_scale",
+            "v7_effective_self_write_scale",
+            "v7_effective_controller_write_scale",
             "state_carry_gain_lm",
             "state_carry_stateful_lm",
             "state_carry_fresh_lm",
@@ -578,6 +633,7 @@ def evaluate_model(
             totals["v5_router_world_ratio"] += float(aux["v5_router_world_ratio"].detach().cpu())
             totals["v5_router_world_cosine"] += float(aux["v5_router_world_cosine"].detach().cpu())
             totals["v5_router_world_gate"] += float(aux["v5_router_world_gate"].detach().cpu())
+            totals["v5_router_world_modulation"] += float(aux["v5_router_world_modulation"].detach().cpu())
             totals["v5_router_world_cap"] += float(aux["v5_router_world_cap"].detach().cpu())
             totals["v5_router_memory_norm"] += float(aux["v5_router_memory_norm"].detach().cpu())
             totals["v5_router_memory_ratio"] += float(aux["v5_router_memory_ratio"].detach().cpu())
@@ -635,10 +691,13 @@ def evaluate_model(
             totals["v7_latent_state_norm"] += float(aux["v7_latent_state_norm"].detach().cpu())
             totals["v7_world_state_norm"] += float(aux["v7_world_state_norm"].detach().cpu())
             totals["v7_self_state_norm"] += float(aux["v7_self_state_norm"].detach().cpu())
+            totals["v7_controller_state_norm"] += float(aux["v7_controller_state_norm"].detach().cpu())
             totals["v7_world_delta"] += float(aux["v7_world_delta"].detach().cpu())
             totals["v7_self_delta"] += float(aux["v7_self_delta"].detach().cpu())
+            totals["v7_controller_delta"] += float(aux["v7_controller_delta"].detach().cpu())
             totals["v7_world_write_gate"] += float(aux["v7_world_write_gate"].detach().cpu())
             totals["v7_self_write_gate"] += float(aux["v7_self_write_gate"].detach().cpu())
+            totals["v7_controller_write_gate"] += float(aux["v7_controller_write_gate"].detach().cpu())
             totals["v7_dynamic_depth_enabled"] += float(aux["v7_dynamic_depth_enabled"].detach().cpu())
             totals["v7_dynamic_depth_mean"] += float(aux["v7_dynamic_depth_mean"].detach().cpu())
             totals["v7_dynamic_halt_fraction"] += float(aux["v7_dynamic_halt_fraction"].detach().cpu())
@@ -646,9 +705,78 @@ def evaluate_model(
             totals["v7_dynamic_convergence_threshold"] += float(
                 aux["v7_dynamic_convergence_threshold"].detach().cpu()
             )
+            totals["v7_causal_segments"] += float(aux["v7_causal_segments"].detach().cpu())
             totals["v7_past_latent_adapt_steps"] += float(aux["v7_past_latent_adapt_steps"].detach().cpu())
             totals["v7_past_latent_read_suppressed"] += float(
                 aux["v7_past_latent_read_suppressed"].detach().cpu()
+            )
+            totals["v7_latent_timescale"] += float(aux["v7_latent_timescale"].detach().cpu())
+            totals["v7_world_timescale"] += float(aux["v7_world_timescale"].detach().cpu())
+            totals["v7_self_timescale"] += float(aux["v7_self_timescale"].detach().cpu())
+            totals["v7_controller_fixed"] += float(aux["v7_controller_fixed"].detach().cpu())
+            totals["v7_homeostatic_control_enabled"] += float(
+                aux["v7_homeostatic_control_enabled"].detach().cpu()
+            )
+            totals["v7_homeostatic_dhi"] += float(aux["v7_homeostatic_dhi"].detach().cpu())
+            totals["v7_homeostatic_balance_pressure"] += float(
+                aux["v7_homeostatic_balance_pressure"].detach().cpu()
+            )
+            totals["v7_homeostatic_accel_pressure"] += float(
+                aux["v7_homeostatic_accel_pressure"].detach().cpu()
+            )
+            totals["v7_latent_rate_scale"] += float(aux["v7_latent_rate_scale"].detach().cpu())
+            totals["v7_world_rate_scale"] += float(aux["v7_world_rate_scale"].detach().cpu())
+            totals["v7_self_rate_scale"] += float(aux["v7_self_rate_scale"].detach().cpu())
+            totals["v7_hidden_read_rate_scale"] += float(aux["v7_hidden_read_rate_scale"].detach().cpu())
+            totals["v7_state_compatibility_enabled"] += float(
+                aux["v7_state_compatibility_enabled"].detach().cpu()
+            )
+            totals["v7_carry_compatibility"] += float(aux["v7_carry_compatibility"].detach().cpu())
+            totals["v7_carry_latent_gate"] += float(aux["v7_carry_latent_gate"].detach().cpu())
+            totals["v7_carry_world_gate"] += float(aux["v7_carry_world_gate"].detach().cpu())
+            totals["v7_carry_self_gate"] += float(aux["v7_carry_self_gate"].detach().cpu())
+            totals["v7_carry_controller_gate"] += float(aux["v7_carry_controller_gate"].detach().cpu())
+            totals["v7_carry_memory_gate"] += float(aux["v7_carry_memory_gate"].detach().cpu())
+            totals["v7_carry_blend_delta"] += float(aux["v7_carry_blend_delta"].detach().cpu())
+            totals["v7_hyperspherical_state_enabled"] += float(
+                aux["v7_hyperspherical_state_enabled"].detach().cpu()
+            )
+            totals["v7_causal_summary_enabled"] += float(aux["v7_causal_summary_enabled"].detach().cpu())
+            totals["v7_causal_summary_decay"] += float(aux["v7_causal_summary_decay"].detach().cpu())
+            totals["v7_adaptive_tau_enabled"] += float(aux["v7_adaptive_tau_enabled"].detach().cpu())
+            totals["v7_latent_tau"] += float(aux["v7_latent_tau"].detach().cpu())
+            totals["v7_world_tau"] += float(aux["v7_world_tau"].detach().cpu())
+            totals["v7_self_tau"] += float(aux["v7_self_tau"].detach().cpu())
+            totals["v7_controller_tau"] += float(aux["v7_controller_tau"].detach().cpu())
+            totals["v7_ingress_compatibility_enabled"] += float(
+                aux["v7_ingress_compatibility_enabled"].detach().cpu()
+            )
+            totals["v7_ingress_compatibility"] += float(aux["v7_ingress_compatibility"].detach().cpu())
+            totals["v7_ingress_latent_gate"] += float(aux["v7_ingress_latent_gate"].detach().cpu())
+            totals["v7_ingress_world_gate"] += float(aux["v7_ingress_world_gate"].detach().cpu())
+            totals["v7_ingress_self_gate"] += float(aux["v7_ingress_self_gate"].detach().cpu())
+            totals["v7_ingress_controller_gate"] += float(aux["v7_ingress_controller_gate"].detach().cpu())
+            totals["v7_ingress_memory_gate"] += float(aux["v7_ingress_memory_gate"].detach().cpu())
+            totals["v7_ingress_latent_blend_delta"] += float(
+                aux["v7_ingress_latent_blend_delta"].detach().cpu()
+            )
+            totals["v7_ingress_world_blend_delta"] += float(aux["v7_ingress_world_blend_delta"].detach().cpu())
+            totals["v7_ingress_self_blend_delta"] += float(aux["v7_ingress_self_blend_delta"].detach().cpu())
+            totals["v7_ingress_controller_blend_delta"] += float(
+                aux["v7_ingress_controller_blend_delta"].detach().cpu()
+            )
+            totals["v7_ingress_memory_blend_delta"] += float(aux["v7_ingress_memory_blend_delta"].detach().cpu())
+            totals["v7_effective_latent_write_scale"] += float(
+                aux["v7_effective_latent_write_scale"].detach().cpu()
+            )
+            totals["v7_effective_world_write_scale"] += float(
+                aux["v7_effective_world_write_scale"].detach().cpu()
+            )
+            totals["v7_effective_self_write_scale"] += float(
+                aux["v7_effective_self_write_scale"].detach().cpu()
+            )
+            totals["v7_effective_controller_write_scale"] += float(
+                aux["v7_effective_controller_write_scale"].detach().cpu()
             )
             if state_carry:
                 carry = _estimate_state_carry_gain(
@@ -830,6 +958,7 @@ def evaluate_model(
         "val_v5_router_world_ratio": totals["v5_router_world_ratio"] / batches,
         "val_v5_router_world_cosine": totals["v5_router_world_cosine"] / batches,
         "val_v5_router_world_gate": totals["v5_router_world_gate"] / batches,
+        "val_v5_router_world_modulation": totals["v5_router_world_modulation"] / batches,
         "val_v5_router_world_cap": totals["v5_router_world_cap"] / batches,
         "val_v5_router_memory_norm": totals["v5_router_memory_norm"] / batches,
         "val_v5_router_memory_ratio": totals["v5_router_memory_ratio"] / batches,
@@ -881,17 +1010,65 @@ def evaluate_model(
         "val_v7_latent_state_norm": totals["v7_latent_state_norm"] / batches,
         "val_v7_world_state_norm": totals["v7_world_state_norm"] / batches,
         "val_v7_self_state_norm": totals["v7_self_state_norm"] / batches,
+        "val_v7_controller_state_norm": totals["v7_controller_state_norm"] / batches,
         "val_v7_world_delta": totals["v7_world_delta"] / batches,
         "val_v7_self_delta": totals["v7_self_delta"] / batches,
+        "val_v7_controller_delta": totals["v7_controller_delta"] / batches,
         "val_v7_world_write_gate": totals["v7_world_write_gate"] / batches,
         "val_v7_self_write_gate": totals["v7_self_write_gate"] / batches,
+        "val_v7_controller_write_gate": totals["v7_controller_write_gate"] / batches,
         "val_v7_dynamic_depth_enabled": totals["v7_dynamic_depth_enabled"] / batches,
         "val_v7_dynamic_depth_mean": totals["v7_dynamic_depth_mean"] / batches,
         "val_v7_dynamic_halt_fraction": totals["v7_dynamic_halt_fraction"] / batches,
         "val_v7_dynamic_continue_score": totals["v7_dynamic_continue_score"] / batches,
         "val_v7_dynamic_convergence_threshold": totals["v7_dynamic_convergence_threshold"] / batches,
+        "val_v7_causal_segments": totals["v7_causal_segments"] / batches,
         "val_v7_past_latent_adapt_steps": totals["v7_past_latent_adapt_steps"] / batches,
         "val_v7_past_latent_read_suppressed": totals["v7_past_latent_read_suppressed"] / batches,
+        "val_v7_latent_timescale": totals["v7_latent_timescale"] / batches,
+        "val_v7_world_timescale": totals["v7_world_timescale"] / batches,
+        "val_v7_self_timescale": totals["v7_self_timescale"] / batches,
+        "val_v7_controller_fixed": totals["v7_controller_fixed"] / batches,
+        "val_v7_homeostatic_control_enabled": totals["v7_homeostatic_control_enabled"] / batches,
+        "val_v7_homeostatic_dhi": totals["v7_homeostatic_dhi"] / batches,
+        "val_v7_homeostatic_balance_pressure": totals["v7_homeostatic_balance_pressure"] / batches,
+        "val_v7_homeostatic_accel_pressure": totals["v7_homeostatic_accel_pressure"] / batches,
+        "val_v7_latent_rate_scale": totals["v7_latent_rate_scale"] / batches,
+        "val_v7_world_rate_scale": totals["v7_world_rate_scale"] / batches,
+        "val_v7_self_rate_scale": totals["v7_self_rate_scale"] / batches,
+        "val_v7_hidden_read_rate_scale": totals["v7_hidden_read_rate_scale"] / batches,
+        "val_v7_state_compatibility_enabled": totals["v7_state_compatibility_enabled"] / batches,
+        "val_v7_carry_compatibility": totals["v7_carry_compatibility"] / batches,
+        "val_v7_carry_latent_gate": totals["v7_carry_latent_gate"] / batches,
+        "val_v7_carry_world_gate": totals["v7_carry_world_gate"] / batches,
+        "val_v7_carry_self_gate": totals["v7_carry_self_gate"] / batches,
+        "val_v7_carry_controller_gate": totals["v7_carry_controller_gate"] / batches,
+        "val_v7_carry_memory_gate": totals["v7_carry_memory_gate"] / batches,
+        "val_v7_carry_blend_delta": totals["v7_carry_blend_delta"] / batches,
+        "val_v7_hyperspherical_state_enabled": totals["v7_hyperspherical_state_enabled"] / batches,
+        "val_v7_causal_summary_enabled": totals["v7_causal_summary_enabled"] / batches,
+        "val_v7_causal_summary_decay": totals["v7_causal_summary_decay"] / batches,
+        "val_v7_adaptive_tau_enabled": totals["v7_adaptive_tau_enabled"] / batches,
+        "val_v7_latent_tau": totals["v7_latent_tau"] / batches,
+        "val_v7_world_tau": totals["v7_world_tau"] / batches,
+        "val_v7_self_tau": totals["v7_self_tau"] / batches,
+        "val_v7_controller_tau": totals["v7_controller_tau"] / batches,
+        "val_v7_ingress_compatibility_enabled": totals["v7_ingress_compatibility_enabled"] / batches,
+        "val_v7_ingress_compatibility": totals["v7_ingress_compatibility"] / batches,
+        "val_v7_ingress_latent_gate": totals["v7_ingress_latent_gate"] / batches,
+        "val_v7_ingress_world_gate": totals["v7_ingress_world_gate"] / batches,
+        "val_v7_ingress_self_gate": totals["v7_ingress_self_gate"] / batches,
+        "val_v7_ingress_controller_gate": totals["v7_ingress_controller_gate"] / batches,
+        "val_v7_ingress_memory_gate": totals["v7_ingress_memory_gate"] / batches,
+        "val_v7_ingress_latent_blend_delta": totals["v7_ingress_latent_blend_delta"] / batches,
+        "val_v7_ingress_world_blend_delta": totals["v7_ingress_world_blend_delta"] / batches,
+        "val_v7_ingress_self_blend_delta": totals["v7_ingress_self_blend_delta"] / batches,
+        "val_v7_ingress_controller_blend_delta": totals["v7_ingress_controller_blend_delta"] / batches,
+        "val_v7_ingress_memory_blend_delta": totals["v7_ingress_memory_blend_delta"] / batches,
+        "val_v7_effective_latent_write_scale": totals["v7_effective_latent_write_scale"] / batches,
+        "val_v7_effective_world_write_scale": totals["v7_effective_world_write_scale"] / batches,
+        "val_v7_effective_self_write_scale": totals["v7_effective_self_write_scale"] / batches,
+        "val_v7_effective_controller_write_scale": totals["v7_effective_controller_write_scale"] / batches,
         "val_state_carry_gain_lm": totals["state_carry_gain_lm"] / state_carry_batches
         if state_carry_batches
         else 0.0,

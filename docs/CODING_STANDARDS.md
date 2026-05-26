@@ -11,7 +11,7 @@ This project is moving quickly, so consistency matters more than perfect abstrac
 
 ## Architecture Names
 
-- Daily architecture IDs use lowercase snake case: `dense`, `token_moe`, `naime_state_moe`, `naime_v4_state_moe`, `naime_v5_world_state_moe`, `naime_v6_recursive_self_moe`.
+- Daily architecture IDs use lowercase snake case: `dense`, `token_moe`, `naime_state_moe`, `naime_v4_state_moe`, `naime_v5_world_state_moe`, `naime_v6_recursive_self_moe`, `naime_v7_typed_dynamics`.
 - Older IDs and aliases such as `naime_v1`, `naime_v2`, `naime_v3_*`, `naime_v41_state_moe`, and `naime_v42_state_moe` are legacy/forensic only. Do not add them to template or daily launcher paths.
 - Version IDs do not use dots in code or run names. Use `v41`, not `v4.1`.
 - Python classes use PascalCase and may group compatible versions when implementation is shared, but daily launchers must expose only current supported IDs.
@@ -46,7 +46,14 @@ This project is moving quickly, so consistency matters more than perfect abstrac
 ## Stateful Architecture Protocol
 
 - Stateful architecture changes must follow `docs/architecture/STATE_PROTOCOL.md`.
+- V7+ internal dynamics and future multimodal observation work must also stay
+  aligned with `docs/architecture/INTERNAL_DYNAMICS_OUTLOOK.md`.
 - Any signal that writes to `hidden_states`, affects MoE routing, mutates world/self/memory state, or controls another subsystem must declare its permission level in code comments, config naming, or the related architecture document.
+- Do not confuse incoming readable state with outgoing updated state. Current
+  logits may read incoming state; current observations may write outgoing state
+  for future causal segments.
+- Future multimodal encoders should produce typed observations that write
+  through protocol-governed state channels, not independent hidden authorities.
 - Do not add opaque mixed router signals. Router-bus components must be named, scaled, and measurable.
 - Do not use legacy or contaminated checkpoints for clean architecture validation unless an explicit legacy-resume path is requested.
 

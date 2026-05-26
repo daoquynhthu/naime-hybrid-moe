@@ -12,6 +12,7 @@ from naime_hybrid import (
     NAIMEV5WorldStateMoEDecoder,
     NAIMEV6RecursiveSelfMoEDecoder,
     NAIMEV7TypedDynamicsDecoder,
+    ObservationPacket,
     build_model,
 )
 from naime_hybrid.data import HFDiskCausalDataset
@@ -547,6 +548,11 @@ def test_v7_typed_dynamics_forward_state_packet_and_backward():
         v7_latent_slots=5,
         v7_hidden_write_scale=0.01,
         v7_max_hidden_write_ratio=0.05,
+        v7_controller_slots=2,
+        v7_controller_write_scale=0.015,
+        v7_latent_timescale=0.5,
+        v7_world_timescale=0.75,
+        v7_self_timescale=0.25,
     )
     model = build_model("naime_v7_typed_dynamics", config)
     assert isinstance(model, NAIMEV7TypedDynamicsDecoder)
@@ -560,9 +566,11 @@ def test_v7_typed_dynamics_forward_state_packet_and_backward():
     assert packet.world_state is not None
     assert packet.self_state is not None
     assert packet.latent_field is not None
+    assert packet.controller_state is not None
     assert packet.world_state.shape == (2, config.world_state_slots, config.d_model)
     assert packet.self_state.shape == (2, config.self_state_slots, config.d_model)
     assert packet.latent_field.shape == (2, 5, config.d_model)
+    assert packet.controller_state.shape == (2, 2, config.d_model)
     assert packet.architecture_id == "naime_v7_typed_dynamics"
     assert out["logits"].shape == (2, 31, config.vocab_size)
     assert v7_aux["v7_thought_steps"].item() == pytest.approx(1.0)
@@ -570,16 +578,24 @@ def test_v7_typed_dynamics_forward_state_packet_and_backward():
     assert torch.isfinite(v7_aux["v7_hidden_delta"])
     assert torch.isfinite(v7_aux["v7_world_delta"])
     assert torch.isfinite(v7_aux["v7_self_delta"])
+    assert torch.isfinite(v7_aux["v7_controller_delta"])
     assert torch.isfinite(v7_aux["v7_world_write_gate"])
     assert torch.isfinite(v7_aux["v7_self_write_gate"])
-    assert v7_aux["v7_past_latent_read_suppressed"].item() == pytest.approx(0.0)
-    assert v7_aux["v7_hidden_write_ratio"].item() <= config.v7_max_hidden_write_ratio + 1e-4
+    assert torch.isfinite(v7_aux["v7_controller_write_gate"])
+    assert v7_aux["v7_past_latent_read_suppressed"].item() == pytest.approx(1.0)
+    assert v7_aux["v7_hidden_write_ratio"].item() == pytest.approx(0.0)
+    assert v7_aux["v7_latent_timescale"].item() == pytest.approx(0.5)
+    assert v7_aux["v7_world_timescale"].item() == pytest.approx(0.75)
+    assert v7_aux["v7_self_timescale"].item() == pytest.approx(0.25)
+    assert v7_aux["v7_controller_fixed"].item() == pytest.approx(1.0)
+    assert v7_aux["v7_effective_controller_write_scale"].item() == pytest.approx(0.015)
 
     second = model(input_ids[:, :17], past_state=packet, return_state=True)
     second_v7_aux = second["aux"][-1]["v7"]
     assert second["state_packet"].world_state is not None
     assert second["state_packet"].self_state is not None
     assert second["state_packet"].latent_field is not None
+    assert second["state_packet"].controller_state is not None
     assert second["logits"].shape == (2, 17, config.vocab_size)
     assert second_v7_aux["v7_past_latent_adapt_steps"].item() == pytest.approx(1.0)
     assert second_v7_aux["v7_past_latent_read_suppressed"].item() == pytest.approx(1.0)
@@ -587,6 +603,69 @@ def test_v7_typed_dynamics_forward_state_packet_and_backward():
 
     loss = out["logits"].float().mean() + v7_aux["v7_latent_delta"] * 0.0
     loss.backward()
+
+
+def test_v7_typed_dynamics_preserves_causal_prefix_with_multiple_steps():
+    torch.manual_seed(2041)
+    config = NAIMEStateMoEConfig(
+        vocab_size=80,
+        max_seq_len=64,
+        d_model=32,
+        n_layers=3,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=3,
+        top_k=2,
+        expert_hidden_dim=48,
+        semantic_router_mode="hybrid",
+        semantic_scales="local_mid_global",
+        mid_stride=8,
+        mid_window=16,
+        use_global_semantic=True,
+        semantic_fusion="concat",
+        semantic_gate_downstream="clean_prob",
+        semantic_sparse_alpha="downstream",
+        semantic_memory_slots=2,
+        semantic_gate_mixer=True,
+        world_state_slots=4,
+        self_state_slots=3,
+        self_state_recursion_depth=1,
+        v7_dynamics_steps=2,
+        v7_latent_slots=5,
+        v7_hidden_write_scale=0.02,
+        v7_max_hidden_write_ratio=0.08,
+    )
+    model = build_model("naime_v7_typed_dynamics", config).eval()
+    input_ids = torch.randint(1, config.vocab_size, (2, 31))
+    changed = input_ids.clone()
+    cutoff = 13
+    changed[:, cutoff:] = torch.randint(1, config.vocab_size, changed[:, cutoff:].shape)
+
+    with torch.no_grad():
+        original = model(input_ids, return_state=True)
+        changed_out = model(changed, return_state=True)
+
+    assert torch.allclose(original["logits"][:, :cutoff, :], changed_out["logits"][:, :cutoff, :], atol=1e-5, rtol=1e-5)
+    assert original["aux"][-1]["v7"]["v7_hidden_write_ratio"].item() == pytest.approx(0.0)
+    assert original["aux"][-1]["v7"]["v7_past_latent_read_suppressed"].item() == pytest.approx(2.0)
+
+    prefix_state = model(input_ids[:, :cutoff], return_state=True)["state_packet"]
+    with torch.no_grad():
+        original_with_past = model(input_ids, past_state=prefix_state, return_state=True)
+        changed_with_past = model(changed, past_state=prefix_state, return_state=True)
+
+    assert torch.allclose(
+        original_with_past["logits"][:, :cutoff, :],
+        changed_with_past["logits"][:, :cutoff, :],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert original_with_past["aux"][-1]["v7"]["v7_past_latent_read_suppressed"].item() == pytest.approx(1.0)
 
 
 def test_v7_dynamic_depth_halts_after_minimum_step():
@@ -624,6 +703,233 @@ def test_v7_dynamic_depth_halts_after_minimum_step():
     assert v7_aux["v7_thought_steps"].item() == pytest.approx(1.0)
     assert v7_aux["v7_dynamic_halt_fraction"].item() == pytest.approx(1.0)
     assert torch.isfinite(v7_aux["v7_dynamic_continue_score"])
+
+
+def test_v7_homeostatic_controller_reports_bounded_rate_scales():
+    torch.manual_seed(2044)
+    config = NAIMEStateMoEConfig(
+        vocab_size=64,
+        max_seq_len=24,
+        d_model=32,
+        n_layers=2,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=2,
+        top_k=1,
+        expert_hidden_dim=48,
+        semantic_memory_slots=2,
+        world_state_slots=3,
+        self_state_slots=3,
+        v7_dynamics_steps=3,
+        v7_latent_slots=3,
+        v7_homeostatic_control=True,
+        v7_homeostatic_strength=0.4,
+        v7_homeostatic_min_scale=0.6,
+        v7_homeostatic_max_scale=1.4,
+    )
+    model = build_model("naime_v7_typed_dynamics", config)
+    input_ids = torch.randint(1, config.vocab_size, (2, config.max_seq_len))
+
+    out = model(input_ids)
+    v7_aux = out["aux"][-1]["v7"]
+
+    assert v7_aux["v7_homeostatic_control_enabled"].item() == pytest.approx(1.0)
+    assert torch.isfinite(v7_aux["v7_homeostatic_dhi"])
+    assert torch.isfinite(v7_aux["v7_homeostatic_balance_pressure"])
+    assert torch.isfinite(v7_aux["v7_homeostatic_accel_pressure"])
+    for key in (
+        "v7_latent_rate_scale",
+        "v7_world_rate_scale",
+        "v7_self_rate_scale",
+        "v7_hidden_read_rate_scale",
+    ):
+        value = v7_aux[key].item()
+        assert 0.6 <= value <= 1.4
+
+
+def test_v7_refactored_dynamics_reports_geometry_carry_and_tau_metrics():
+    torch.manual_seed(2045)
+    config = NAIMEStateMoEConfig(
+        vocab_size=72,
+        max_seq_len=24,
+        d_model=32,
+        n_layers=2,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=2,
+        top_k=1,
+        expert_hidden_dim=48,
+        semantic_memory_slots=2,
+        world_state_slots=3,
+        self_state_slots=3,
+        v7_dynamics_steps=2,
+        v7_latent_slots=3,
+        v7_state_compatibility_gate=True,
+        v7_state_compatibility_min=0.2,
+        v7_adaptive_tau=True,
+        v7_adaptive_tau_min=0.6,
+        v7_adaptive_tau_max=1.3,
+        v7_hyperspherical_state=True,
+        v7_causal_summary=True,
+        v7_causal_summary_decay=0.97,
+    )
+    model = build_model("naime_v7_typed_dynamics", config)
+    input_ids = torch.randint(1, config.vocab_size, (2, config.max_seq_len))
+
+    first = model(input_ids, return_state=True)
+    second = model(input_ids, past_state=first["state_packet"], return_state=True)
+    v7_aux = second["aux"][-1]["v7"]
+
+    assert v7_aux["v7_hyperspherical_state_enabled"].item() == pytest.approx(1.0)
+    assert v7_aux["v7_causal_summary_enabled"].item() == pytest.approx(1.0)
+    assert v7_aux["v7_state_compatibility_enabled"].item() == pytest.approx(1.0)
+    assert v7_aux["v7_adaptive_tau_enabled"].item() == pytest.approx(1.0)
+    assert 0.2 <= v7_aux["v7_carry_latent_gate"].item() <= 1.0
+    assert torch.isfinite(v7_aux["v7_carry_blend_delta"])
+    assert v7_aux["v7_ingress_compatibility_enabled"].item() == pytest.approx(1.0)
+    for key in (
+        "v7_ingress_latent_gate",
+        "v7_ingress_world_gate",
+        "v7_ingress_self_gate",
+        "v7_ingress_controller_gate",
+        "v7_ingress_memory_gate",
+    ):
+        assert 0.2 <= v7_aux[key].item() <= 1.0
+    assert second["state_packet"].world_state is not None
+    assert second["state_packet"].self_state is not None
+    assert second["state_packet"].world_state.ndim == 3
+    assert second["state_packet"].self_state.ndim == 3
+    for key in ("v7_latent_tau", "v7_world_tau", "v7_self_tau", "v7_controller_tau"):
+        value = v7_aux[key].item()
+        assert 0.6 <= value <= 1.3
+
+
+def test_world_router_modulation_path_is_observable():
+    torch.manual_seed(2046)
+    config = NAIMEStateMoEConfig(
+        vocab_size=72,
+        max_seq_len=24,
+        d_model=32,
+        n_layers=2,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        causal_state_stride=8,
+        window=8,
+        z_dim=8,
+        n_experts=2,
+        top_k=1,
+        expert_hidden_dim=48,
+        world_state_slots=3,
+        world_router_mode="modulate",
+        world_router_modulation_scale=0.25,
+        world_router_max_ratio=0.10,
+    )
+    model = build_model("naime_v5_world_state_moe", config)
+    input_ids = torch.randint(1, config.vocab_size, (2, config.max_seq_len))
+
+    out = model(input_ids)
+    v5_aux = out["aux"][-1]["v5"]
+
+    assert v5_aux["router_world_modulation"].item() == pytest.approx(1.0)
+    assert torch.isfinite(v5_aux["router_world_ratio"])
+
+
+def test_v7_causal_state_chunks_enable_later_hidden_read_without_prefix_leakage():
+    torch.manual_seed(2043)
+    config = NAIMEStateMoEConfig(
+        vocab_size=80,
+        max_seq_len=32,
+        d_model=32,
+        n_layers=2,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=2,
+        top_k=1,
+        expert_hidden_dim=48,
+        semantic_memory_slots=2,
+        world_state_slots=3,
+        self_state_slots=3,
+        v7_dynamics_steps=1,
+        v7_latent_slots=3,
+        v7_hidden_write_scale=0.03,
+        v7_max_hidden_write_ratio=0.08,
+        v7_state_chunk_size=8,
+        v7_internal_latent_adapt_steps=0,
+    )
+    model = build_model("naime_v7_typed_dynamics", config).eval()
+    input_ids = torch.randint(1, config.vocab_size, (2, 32))
+    changed = input_ids.clone()
+    cutoff = 8
+    changed[:, cutoff:] = torch.randint(1, config.vocab_size, changed[:, cutoff:].shape)
+
+    with torch.no_grad():
+        original = model(input_ids, return_state=True)
+        changed_out = model(changed, return_state=True)
+
+    v7_aux = original["aux"][-1]["v7"]
+    assert v7_aux["v7_causal_segments"].item() == pytest.approx(4.0)
+    assert v7_aux["v7_hidden_write_ratio"].item() > 0.0
+    assert v7_aux["v7_past_latent_read_suppressed"].item() == pytest.approx(1.0)
+    assert torch.allclose(
+        original["logits"][:, :cutoff, :],
+        changed_out["logits"][:, :cutoff, :],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_state_and_observation_packets_preserve_batch_and_metadata():
+    world_state = torch.randn(2, 3, 8)
+    controller_state = torch.randn(2, 2, 8, requires_grad=True)
+    packet = NAIMEStatePacket(
+        world_state=world_state,
+        controller_state=controller_state,
+        architecture_id="naime_v7_typed_dynamics",
+        protocol_version="state-protocol-v1",
+    )
+
+    packet.validate_batch(2)
+    detached = packet.detach()
+
+    assert detached.controller_state is not None
+    assert detached.controller_state.requires_grad is False
+    assert detached.architecture_id == "naime_v7_typed_dynamics"
+
+    obs = ObservationPacket(
+        modality="image",
+        embeddings=torch.randn(2, 5, 8, requires_grad=True),
+        attention_mask=torch.ones(2, 5, dtype=torch.bool),
+        time_index=torch.arange(2),
+        spatial_anchors=torch.randn(2, 5, 4),
+        confidence=torch.ones(2, 5),
+        provenance="unit-test",
+        causal_segment_id="frame-0",
+    )
+    obs.validate_batch(2)
+    obs_detached = obs.detach()
+
+    assert obs_detached.embeddings.requires_grad is False
+    assert obs_detached.modality == "image"
+    assert obs_detached.provenance == "unit-test"
+    assert obs_detached.causal_segment_id == "frame-0"
 
 
 def test_semantic_router_prior_mode_forward_and_backward():
@@ -1010,8 +1316,8 @@ def test_v6_state_packet_carries_compact_latent_state_across_chunks():
     assert packet.world_state is not None
     assert packet.self_state is not None
     assert packet.memory is not None
-    assert packet.world_state.ndim == 4
-    assert packet.self_state.ndim == 4
+    assert packet.world_state.ndim == 3
+    assert packet.self_state.ndim == 3
     assert out_first["world_state"].shape == (2, config.world_state_slots, config.d_model)
     assert out_first["self_state"].shape == (2, config.self_state_slots, config.d_model)
 
@@ -1179,10 +1485,10 @@ def test_v6_state_evolution_updates_persistent_packet_without_hidden_write():
     assert isinstance(packet, NAIMEStatePacket)
     assert packet.world_state is not None
     assert packet.self_state is not None
-    assert packet.world_state.ndim == 4
-    assert packet.self_state.ndim == 4
-    assert packet.world_state.size(1) > math.ceil(input_ids.size(1) / config.causal_state_stride)
-    assert packet.self_state.size(1) > math.ceil(input_ids.size(1) / config.causal_state_stride)
+    assert packet.world_state.ndim == 3
+    assert packet.self_state.ndim == 3
+    assert packet.world_state.size(1) == config.world_state_slots
+    assert packet.self_state.size(1) == config.self_state_slots
     assert v6_aux["state_evolution_steps"].item() == pytest.approx(2.0)
     assert torch.isfinite(v6_aux["state_evolution_delta"])
     assert torch.isfinite(v6_aux["state_evolution_world_delta"])

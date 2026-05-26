@@ -46,6 +46,14 @@ METRIC_KEYS = (
     "v7_state_erase_delta_lm",
     "v7_latent_write_norm",
     "v7_hidden_write_norm",
+    "v7_homeostatic_control_enabled",
+    "v7_homeostatic_dhi",
+    "v7_homeostatic_balance_pressure",
+    "v7_homeostatic_accel_pressure",
+    "v7_latent_rate_scale",
+    "v7_world_rate_scale",
+    "v7_self_rate_scale",
+    "v7_hidden_read_rate_scale",
 )
 
 

@@ -344,6 +344,20 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
         component = _cap_token_norm(component, token_semantic, self.config.world_router_max_ratio)
         return component, raw_component, gate
 
+    def _apply_world_router(
+        self,
+        token_semantic: torch.Tensor,
+        world_component: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.config.world_router_mode == "modulate":
+            scale = max(float(self.config.world_router_modulation_scale), 0.0)
+            modulation = scale * torch.tanh(world_component.float()).type_as(world_component)
+            routed = token_semantic * (1.0 + modulation)
+            return routed, routed - token_semantic
+        if self.config.world_router_mode != "add":
+            raise ValueError("world_router_mode must be add or modulate")
+        return token_semantic + world_component, world_component
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -432,14 +446,14 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
                 token_semantic,
                 state_confidence,
             )
-            router_semantic = router_semantic + world_component
+            router_semantic, world_component = self._apply_world_router(token_semantic, world_component)
         elif not self.config.semantic_causal:
             world_component, raw_world_component, world_router_gate = self._world_router_component(
                 state_context,
                 token_semantic,
                 state_confidence,
             )
-            router_semantic = router_semantic + world_component
+            router_semantic, world_component = self._apply_world_router(token_semantic, world_component)
 
         if self.memory is not None and memory is not None and not self.config.semantic_causal:
             memory_context, memory_weights = self.memory.read(hidden_states, memory)
@@ -553,6 +567,11 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
                 "router_world_ratio": world_norm / contribution_denom,
                 "router_world_cosine": _mean_token_cosine(token_semantic, world_component),
                 "router_world_gate": world_gate_metric,
+                "router_world_modulation": torch.tensor(
+                    1.0 if self.config.world_router_mode == "modulate" else 0.0,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                ),
                 "router_world_cap": torch.tensor(
                     self.config.world_router_max_ratio,
                     device=hidden_states.device,

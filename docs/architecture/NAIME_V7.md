@@ -7,17 +7,25 @@ claim of validated superiority. It is a design contract for the next
 architecture step: moving from a Transformer with state modules to a model whose
 prediction is mediated by a typed internal dynamics process.
 
-V7 is governed by `docs/architecture/STATE_PROTOCOL.md`. Any implementation
+V7 is governed by `docs/architecture/STATE_PROTOCOL.md` and by the longer-term
+outlook in `docs/architecture/INTERNAL_DYNAMICS_OUTLOOK.md`. Any implementation
 must preserve causal integrity, named router-bus components, bounded hidden
 writes, and clean checkpoint lineage.
 
 ## 1. Motivation
 
 V6.5 proves that world slots, recursive self slots, latent field coupling, and
-latent thought can be made stable enough to train. Early V7 made hidden and
-latent field co-evolve, but still left `world_state` and `self_state` mostly as
-conditioning context. The final V7 line closes that gap: all four streams
-participate in the same bounded typed dynamics loop.
+latent thought can be made stable enough to train. Early V7 tried to make hidden
+and latent field co-evolve inside one forward call, but that exposed an important
+causal boundary: a state produced from the current segment must not rewrite the
+same segment's token hidden states. The corrected V7 line treats internal state
+as a causal endpoint:
+
+```text
+incoming typed state may be read by the current segment
+current segment may update outgoing typed state
+outgoing typed state is available only to future segments or turns
+```
 
 However, V7 remains unvalidated as a mechanism claim:
 
@@ -30,6 +38,8 @@ However, V7 remains unvalidated as a mechanism claim:
 
 V7 should therefore not add another independent "thinking module". It should
 turn the existing state system into a typed, continuous, causal dynamics core.
+This is the watershed: future multimodal work must extend this internal dynamics
+system rather than bypass it with static modality adapters.
 
 ## 2. North Star
 
@@ -39,14 +49,15 @@ V7 should implement this computation pattern:
 token hidden
   + typed prior internal state
       -> repeated typed dynamics steps
-      -> final hidden/state readout
+      -> bounded read from incoming state
       -> next-token logits
       -> updated typed internal state packet
 ```
 
 The model should not merely attach memory to a Transformer. It should treat
 internal state as the evolving endpoint of prior computation and the starting
-condition for future computation.
+condition for future computation. The outgoing packet is not a same-forward
+hidden patch; it is the next causal condition.
 
 The core claim to test is:
 
@@ -67,6 +78,10 @@ V7 must avoid these failure modes:
   persistent internal state target.
 - Do not let `self_state` absorb all unexplained text heterogeneity.
 - Do not let `latent_field` become an unbounded hidden-state write shortcut.
+- Do not let newly updated same-segment state influence earlier tokens in that
+  segment.
+- Do not treat a learned initial latent prior as evidence of input-induced
+  reasoning.
 - Do not treat lower validation loss alone as proof that the intended mechanism
   works.
 
@@ -117,6 +132,19 @@ control.
 `latent_field` is not a second world model and not a second self model. It is the
 dynamics carrier that evolves between typed world/self interpretations and the
 main hidden stream.
+
+Important causal distinction:
+
+```text
+incoming latent_field:
+  may condition current hidden readout through bounded channels
+
+outgoing latent_field:
+  may be updated from the current segment
+  must be returned in the state packet for future use
+  must not rewrite the current segment's hidden states unless the path is
+  strictly token-causal or block-causal
+```
 
 ## 5. Typed State Packet
 
@@ -171,47 +199,52 @@ The implementation may be fused or optimized, but conceptually each dynamics
 step follows a typed sequence:
 
 ```text
-1. read hidden, world, self, and latent summaries causally
-2. evolve latent_field from hidden + world + self typed summaries
-3. update world_state from hidden + self + latent evidence
-4. update self_state from hidden + world + latent evidence
-5. apply bounded hidden refinement from the evolved latent field
+1. optionally read incoming latent/world/self state through bounded channels
+2. read current hidden summaries causally
+3. evolve outgoing latent_field from hidden + world + self typed summaries
+4. update outgoing world_state from hidden + self + latent evidence
+5. update outgoing self_state from hidden + world + latent evidence
 6. emit metrics for every active typed channel
 ```
 
 The order matters. `latent_field` should evolve from typed evidence, while
-`world_state` and `self_state` must also be updated inside the loop. This is the
-line between true internal dynamics and a hidden-write add-on.
+`world_state` and `self_state` must also be updated inside the loop. However,
+newly evolved state is an outgoing endpoint. It must not become a shortcut that
+lets the current segment use information from itself as if it were prior state.
 
 ## 7. Dynamics Step
 
 The basic V7 thought step is:
 
 ```text
-hidden_t, world_t, self_t, latent_t
-    -> dynamics_step
-hidden_t+1, world_t+1, self_t+1, latent_t+1
+hidden_t, incoming_world_t, incoming_self_t, incoming_latent_t
+    -> bounded read from incoming state
+    -> outgoing_world_t+1, outgoing_self_t+1, outgoing_latent_t+1
 ```
 
 For `thought_steps = k`:
 
 ```text
 for t in range(k):
-    hidden, state = dynamics_step(hidden, state, step_index=t)
+    hidden_readout, outgoing_state = dynamics_step(hidden_readout, incoming_state, step_index=t)
 
-logits = lm_head(final_norm(hidden))
+logits = lm_head(final_norm(hidden_readout))
+state_packet = outgoing_state.detach()
 ```
 
 This differs from V6.5:
 
 ```text
 V6.5: latent thought produces a small final hidden write.
-V7: hidden and typed state co-evolve for one or more internal dynamics steps.
+Early V7: hidden and typed state co-evolved inside the same segment.
+Corrected V7: current hidden may read incoming state; current observations
+produce outgoing state for later segments.
 ```
 
-The hidden stream is not merely patched after thought. It participates in the
-dynamics process. The packet returned by V7 should represent the endpoint of
-the internal dynamics trajectory, so the next call can continue from that state
+The hidden stream is not merely patched after thought. It is the evidence stream
+that drives outgoing internal dynamics, and it may read prior state through
+bounded channels. The packet returned by V7 should represent the endpoint of the
+internal dynamics trajectory, so the next call can continue from that state
 without storing hidden activations or KV cache.
 
 ## 8. Cross-State Communication Contract
@@ -236,8 +269,8 @@ world/self -> latent_field:
   confidence-weighted constraints
 
 latent_field -> hidden:
-  bounded_refinement
-  convergence-conditioned write
+  bounded refinement from incoming latent only
+  convergence-conditioned write only if causal-safe
 
 latent_field -> router_bus:
   optional low-scale typed routing hint
@@ -277,6 +310,14 @@ Required write sources:
 - `self_hidden_write`, if self writes to hidden;
 - `latent_hidden_write`, if latent field writes to hidden.
 
+Additional causal rule:
+
+```text
+latent_hidden_write may read incoming latent state.
+latent_hidden_write must not read outgoing latent state from the same causal
+segment unless the implementation is strictly token-causal or block-causal.
+```
+
 Required metrics:
 
 ```text
@@ -311,7 +352,19 @@ P(next_token | visible_prefix, typed_internal_state)
 
 Training should mostly use normal shuffled causal LM batches. Additional probes
 should test whether the internal state is useful, not force every batch into a
-long session.
+long session. The state packet behaves like a compact latent prefix: it is useful
+only if prior state improves future prediction without requiring the dataset to
+be reshaped into artificial continuous streams.
+
+V7 must therefore test both:
+
+```text
+fresh batch behavior:
+  current input writes useful outgoing state, but does not read a fake prior
+
+stateful continuation behavior:
+  prior state improves or changes future prediction in a measurable way
+```
 
 ## 11. Self-Supervised Mechanism Probes
 
@@ -407,6 +460,7 @@ v7_self_delta
 v7_latent_delta
 v7_world_write_gate
 v7_self_write_gate
+v7_past_latent_read_suppressed
 ```
 
 ### State usefulness
@@ -473,6 +527,9 @@ Acceptance criteria for scale-up:
 - Compute-adjusted gain justifies the additional dynamics cost.
 - Generation quality improves or at least does not regress.
 - Stateful inference can load and continue from a `NAIMEV7StatePacket`.
+- From-scratch runs do not rely on learned initial latent hidden writes as the
+  main source of V7 gain.
+- Prefix-causal tests pass when `thought_steps > 1`.
 - Clean lineage prevents V6 or contaminated checkpoints from being mistaken for
   V7 evidence.
 
@@ -505,7 +562,8 @@ The first implementation may reuse V6.5 submodules internally.
 
 Deliverables:
 
-- hidden participates in each dynamics step;
+- hidden participates as evidence and may read incoming state;
+- outgoing same-segment state does not rewrite current hidden;
 - logits read from final evolved hidden;
 - zero-step path remains available as baseline;
 - `thought_steps=0/1/2/3` can be selected without changing model weights.
@@ -590,8 +648,13 @@ Deliverables:
 
 - `world_state`, `self_state`, `latent_field`, and hidden all evolve inside the
   same V7 dynamics loop;
+- `controller_state` is now carried as a compact observability state, recording
+  the internal dynamics endpoint without controlling compute or write authority;
 - world/self updates use separate typed slot updates rather than a shared
   undifferentiated state bank;
+- optional causal state chunks allow previous sequence chunks to influence
+  later chunks through incoming state reads, while never allowing a chunk's own
+  outgoing state to rewrite that same chunk;
 - state writes have an explicit `v7_state_write_scale` and bounded gates;
 - validation and ablation summaries expose world/self deltas and write gates;
 - zero-step behavior remains available as the clean baseline.
@@ -602,9 +665,121 @@ Current implementation status:
   alongside evolved hidden;
 - state packets carry the final typed state endpoint for continuation;
 - metrics include `v7_world_delta`, `v7_self_delta`,
-  `v7_world_write_gate`, and `v7_self_write_gate`;
+  `v7_controller_delta`, `v7_world_write_gate`, `v7_self_write_gate`, and
+  `v7_controller_write_gate`;
+- the causal read/write protocol now distinguishes incoming readable state from
+  outgoing updated state, so current-segment latent updates do not become
+  same-segment hidden patches;
+- `v7_state_chunk_size` can activate within-forward causal state flow, which is
+  the clean way to train V7 dynamics with ordinary LM batches;
+- dynamic-depth world/self delta metrics are active-sample aware;
 - this makes the architecture match the intended philosophy structurally, but
   it still requires real ablation evidence before it can be called validated.
+
+### V7.8: Typed Multi-Timescale Dynamics
+
+V7.8 is partially scaffolded as measurement infrastructure, not as a validated
+architecture default.
+
+The current fixed-step dynamics are transitional. V7 now exposes typed
+timescale controls for `latent_field`, `world_state`, and `self_state`, but all
+clean templates keep them at `1/1/1`. This is deliberate: we do not yet know the
+correct baseline speed of each internal state family.
+
+The hypothesis space is:
+
+```text
+latent_field  local constraints and immediate internal computation
+world_state   scene, discourse, entities, events, temporal relations
+self_state    task stance, uncertainty, reflection, boundary allocation
+memory_state  durable useful summaries and revisions
+controller    compute budget and halting
+```
+
+Non-uniform timescales are experimental variables, not doctrine. Use
+`scripts/run_v7_timescale_ablation.ps1` to measure whether a rate change improves
+validation loss, dynamics gain, state swap/erase sensitivity, carry gain,
+gradient stability, and throughput. A faster or slower state family is only
+justified by those measurements.
+
+### V7.8.1: Homeostatic Rate Modulation
+
+V7 now includes an optional homeostatic rate modulator. It is disabled by
+default because it changes the dynamics policy and must be validated separately.
+
+The goal is not to hard-code which state type should be fast or slow. The
+controller instead estimates whether the internal dynamics are near a stable
+working regime:
+
+```text
+typed balance pressure:
+  latent/world/self deltas compared with their current ensemble mean
+
+acceleration pressure:
+  current per-type delta compared with the previous dynamics step
+
+dynamic homeostasis index:
+  exp(-(balance_pressure + acceleration_pressure))
+```
+
+The resulting detached rate scales modulate only the next dynamics step:
+
+```text
+latent update scale
+world update scale
+self update scale
+hidden read scale
+```
+
+This keeps the controller bounded and non-invasive. It does not introduce a
+new learned authority path, and it does not backpropagate through the control
+decision itself. The model still learns through the ordinary LM objective and
+existing V7 state paths; the modulator only changes how aggressively each typed
+state is allowed to move when the dynamics become unbalanced or abruptly
+accelerate.
+
+Configuration:
+
+```text
+v7_homeostatic_control=false
+v7_homeostatic_strength=0.25
+v7_homeostatic_min_scale=0.5
+v7_homeostatic_max_scale=1.5
+```
+
+Metrics:
+
+```text
+v7_homeostatic_control_enabled
+v7_homeostatic_dhi
+v7_homeostatic_balance_pressure
+v7_homeostatic_accel_pressure
+v7_latent_rate_scale
+v7_world_rate_scale
+v7_self_rate_scale
+v7_hidden_read_rate_scale
+```
+
+Interpretation:
+
+- `dhi` near `1.0` means the current typed dynamics are comparatively stable.
+- high balance pressure means one typed state is moving far more than the
+  others.
+- high acceleration pressure means the dynamics changed abruptly relative to
+  the previous internal step.
+- rate scales outside `1.0` are control actions, not success metrics. They must
+  be judged by validation loss, V7 mechanism probes, gradient stability, and
+  throughput.
+
+### V7.9: Adaptive Deliberation Controller
+
+V7.9 is a reserved direction, not yet implemented.
+
+The model should eventually decide how much internal evolution to spend from
+signals such as novelty, uncertainty, contradiction, router entropy, state
+delta, and expected gain. Early controllers should be deterministic and
+metric-based. Learned controllers require a protocol-version update because they
+control computation and write authority.
 
 ### V7.7: Kernel and Runtime Optimization
 
@@ -687,7 +862,8 @@ V7 should make internal reasoning a typed dynamics process:
 world_state explains the text-world.
 self_state explains internal processing boundaries.
 latent_field carries continuous internal computation.
-hidden_states co-evolve with all three through bounded, named channels.
+hidden_states read incoming typed state and provide evidence for outgoing typed
+state through bounded, named channels.
 ```
 
 The architecture is successful only if the internal state becomes measurably

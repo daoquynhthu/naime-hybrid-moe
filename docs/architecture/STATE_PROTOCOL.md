@@ -5,8 +5,9 @@ Status: **active engineering protocol**
 This document defines the architectural contract for NAIME V6 and later stateful
 architectures. It is not an ablation plan, experiment matrix, training recipe, or
 claim of validated superiority. Any future architecture work that changes
-semantic routing, world state, self state, memory, or hidden-state modulation
-must either follow this protocol or explicitly introduce a new protocol version.
+semantic routing, world state, self state, memory, internal dynamics,
+multimodal observation flow, or hidden-state modulation must either follow this
+protocol or explicitly introduce a new protocol version.
 
 ## 1. Purpose
 
@@ -61,6 +62,20 @@ world state fails to explain.
 A lower-permission working-memory carrier for temporary summaries or retrieval
 context. Memory must not silently duplicate world state or self state without an
 explicit read/write contract.
+
+`latent_field`
+
+The compact continuous internal computation state introduced by V7. It is the
+endpoint of prior internal dynamics and the starting condition for future
+dynamics. It is not KV cache, not a second world model, and not an unbounded
+hidden-state patch.
+
+`observation`
+
+A causally bounded input event. In text this may be a token span or chunk. In
+future multimodal work this may be an image region, video segment, audio span,
+tool result, or sensor event. Observations may update outgoing state, but they
+must not let the current readout see information beyond its causal boundary.
 
 `reflection`
 
@@ -122,6 +137,30 @@ If memory affects `hidden_states` or `router_bus`, the code must log its
 contribution norm and scaling factor. If memory is dormant in causal mode, logs
 and documentation must state that clearly.
 
+### Latent Field
+
+Latent field is responsible for continuous internal dynamics. It may carry
+unfinished constraints, momentum, and compact state across chunks or turns. It
+may influence hidden states only when it is an incoming state from an earlier
+causal segment, or when the implementation is strictly token-causal or
+block-causal.
+
+Latent field must not become:
+
+- an unbounded learned prefix;
+- a same-segment future-information channel;
+- a replacement for world state or self state;
+- the only evidence that internal reasoning is active.
+
+### Observation Encoders
+
+Observation encoders convert raw inputs into typed evidence. Text tokens, image
+patches, video frames, audio spans, and tool outputs are all observations.
+
+Observation encoders may write typed evidence into outgoing state. They must not
+create modality-specific hidden authorities that bypass the state protocol.
+Future multimodal encoders must write through named, bounded channels.
+
 ## 4. Permission Levels
 
 Every new module or signal must declare the highest permission level it uses.
@@ -155,6 +194,13 @@ Level 5: Architecture controller
 
 The module dynamically controls another module's permission, scale, or write
 strength. Level 5 changes require an architecture ID or protocol-version update.
+
+Level 6: Compute and deliberation controller
+
+The module decides internal dynamics depth, halting, modality re-observation,
+memory read/write, retrieval, tool use, or other compute allocation. Level 6
+controllers must expose the decision reason, expected cost, maximum cost, and
+fallback behavior. Learned Level 6 controllers require a protocol-version update.
 
 ## 5. Router Bus Contract
 
@@ -255,6 +301,29 @@ For block-causal state paths:
 Checkpoints produced before the current causal-integrity version must not be used
 for clean training unless explicitly marked as legacy forensic baselines.
 
+### Incoming/Outgoing State Rule
+
+All stateful and multimodal mechanisms must obey:
+
+```text
+current readout may read incoming_state
+current observation may write outgoing_state
+current readout must not read outgoing_state from the same causal segment
+```
+
+Examples:
+
+- A text chunk may read a state packet produced by previous chunks.
+- The same text chunk may update a new state packet for future chunks.
+- The current chunk's logits must not read state that was computed from future
+  tokens in the same chunk.
+- A video frame may update scene/world state for later frames.
+- A frame-level answer may read state from previous frames, but not state derived
+  from future frames.
+
+If an implementation wants same-segment state feedback, it must prove strict
+token-causal or block-causal ordering and must add tests for prefix invariance.
+
 ## 9. State Boundary Rules
 
 The model may expose `self`, `world`, `other`, and `unknown` boundary metrics, but
@@ -293,6 +362,31 @@ Bad-gradient handling must not be treated as sufficient evidence that the
 architecture is stable. If bad-gradient windows correlate with state deltas,
 reflection norms, router entropy jumps, or boundary drift, the instability should
 be considered structural until disproven.
+
+## 10.1 Multi-Timescale Dynamics
+
+State systems should not assume a single universal update scale. Future
+architectures may use multiple timescales, but each timescale must be named and
+measurable.
+
+Candidate ownership:
+
+- `latent_field` for immediate internal computation;
+- `world_state` for scene, discourse, entities, events, and temporal
+  structure;
+- `self_state` for uncertainty, reflection, task stance, and boundary
+  allocation;
+- `memory` for durable useful summaries;
+- `controller` for compute budget, halting, mode choice, and re-observation
+  policy.
+
+No component currently has a privileged scientific base rate. Default V7
+timescales must stay unbiased unless an ablation demonstrates that a non-uniform
+rate improves state usefulness and stability. Any non-uniform timescale used in
+a serious run must be logged, reproducible, and traceable to an experiment.
+
+If a controller changes update scale, depth, or write authority, that controller
+uses Level 5 or Level 6 permission and must be documented.
 
 ## 11. Loss and Objective Contract
 
@@ -357,6 +451,9 @@ Before merging a stateful architecture change, confirm:
 - Hidden-state writes are gated, scaled, and logged.
 - World-to-self influence is constrained or justified.
 - Causal integrity is preserved for train and eval.
+- Incoming and outgoing state are not confused.
+- Any multimodal observation path writes through typed state channels.
+- Any adaptive-depth or deliberation controller declares Level 5/6 permission.
 - LM loss and total loss remain separately logged.
 - Old contaminated checkpoints cannot be used accidentally.
 - Documentation states which mode-specific paths are active or dormant.

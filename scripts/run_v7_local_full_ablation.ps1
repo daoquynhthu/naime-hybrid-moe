@@ -315,8 +315,10 @@ foreach ($run in $runs) {
         latent_erase = Get-MetricValue $lastEval "val_v7_latent_erase_delta_lm"
         world_delta = Get-MetricValue $lastEval "val_v7_world_delta"
         self_delta = Get-MetricValue $lastEval "val_v7_self_delta"
+        controller_delta = Get-MetricValue $lastEval "val_v7_controller_delta"
         world_gate = Get-MetricValue $lastEval "val_v7_world_write_gate"
         self_gate = Get-MetricValue $lastEval "val_v7_self_write_gate"
+        controller_gate = Get-MetricValue $lastEval "val_v7_controller_write_gate"
         dynamic_depth = Get-MetricValue $lastEval "val_v7_dynamic_depth_mean"
         halt_fraction = Get-MetricValue $lastEval "val_v7_dynamic_halt_fraction"
         carry_gain = Get-MetricValue $lastEval "val_state_carry_gain_lm"
@@ -351,7 +353,7 @@ if ($baseline) {
     foreach ($row in $valid) {
         if ($row.family -eq "v7_zero_steps" -or $row.best_val_lm -eq "") { continue }
         $delta = [double]$baseline.best_val_lm - [double]$row.best_val_lm
-        $lines += "- $($row.family): best_val_delta=$([math]::Round($delta, 6)), v7_gain=$($row.v7_gain), swap=$($row.state_swap), latent_erase=$($row.latent_erase), world_delta=$($row.world_delta), self_delta=$($row.self_delta), world_gate=$($row.world_gate), self_gate=$($row.self_gate), dynamic_depth=$($row.dynamic_depth), halt=$($row.halt_fraction)"
+        $lines += "- $($row.family): best_val_delta=$([math]::Round($delta, 6)), v7_gain=$($row.v7_gain), swap=$($row.state_swap), latent_erase=$($row.latent_erase), world_delta=$($row.world_delta), self_delta=$($row.self_delta), controller_delta=$($row.controller_delta), world_gate=$($row.world_gate), self_gate=$($row.self_gate), controller_gate=$($row.controller_gate), dynamic_depth=$($row.dynamic_depth), halt=$($row.halt_fraction)"
     }
 }
 $lines += ""
@@ -361,8 +363,8 @@ $lines += "Interpretation guide:"
 $lines += "- v7_gain > 0 means configured dynamics improves LM loss versus zero dynamics on the probe batch."
 $lines += "- state_swap > 0 means wrong carried state hurts, so state identity is being used."
 $lines += "- latent_erase > 0 means the latent field contributes useful information."
-$lines += "- world_delta/self_delta show whether V7 is co-evolving typed state, not only rewriting hidden/latent."
-$lines += "- world_gate/self_gate should stay bounded; high gates without validation gain suggest uncontrolled state churn."
+$lines += "- world_delta/self_delta/controller_delta show whether V7 is co-evolving typed state, not only rewriting hidden/latent."
+$lines += "- world_gate/self_gate/controller_gate should stay bounded; high gates without validation gain suggest uncontrolled state churn."
 $lines += "- dynamic_depth < max_steps with stable validation means dynamic halting is saving compute without immediate collapse."
 $lines += ""
 $lines += "Current experimental note:"

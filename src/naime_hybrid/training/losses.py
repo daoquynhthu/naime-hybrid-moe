@@ -118,6 +118,7 @@ def collect_aux_losses(
     v5_router_world_ratios = []
     v5_router_world_cosines = []
     v5_router_world_gates = []
+    v5_router_world_modulations = []
     v5_router_world_caps = []
     v5_router_memory_norms = []
     v5_router_memory_ratios = []
@@ -294,6 +295,8 @@ def collect_aux_losses(
                 v5_router_world_cosines.append(v5["router_world_cosine"].float())
             if "router_world_gate" in v5:
                 v5_router_world_gates.append(v5["router_world_gate"].float())
+            if "router_world_modulation" in v5:
+                v5_router_world_modulations.append(v5["router_world_modulation"].float())
             if "router_world_cap" in v5:
                 v5_router_world_caps.append(v5["router_world_cap"].float())
             if "router_memory_norm" in v5:
@@ -460,6 +463,9 @@ def collect_aux_losses(
         "v5_router_world_ratio": torch.stack(v5_router_world_ratios).mean() if v5_router_world_ratios else zero,
         "v5_router_world_cosine": torch.stack(v5_router_world_cosines).mean() if v5_router_world_cosines else zero,
         "v5_router_world_gate": torch.stack(v5_router_world_gates).mean() if v5_router_world_gates else zero,
+        "v5_router_world_modulation": torch.stack(v5_router_world_modulations).mean()
+        if v5_router_world_modulations
+        else zero,
         "v5_router_world_cap": torch.stack(v5_router_world_caps).mean() if v5_router_world_caps else zero,
         "v5_router_memory_norm": torch.stack(v5_router_memory_norms).mean() if v5_router_memory_norms else zero,
         "v5_router_memory_ratio": torch.stack(v5_router_memory_ratios).mean() if v5_router_memory_ratios else zero,
@@ -552,17 +558,65 @@ def collect_aux_losses(
         "v7_latent_state_norm",
         "v7_world_state_norm",
         "v7_self_state_norm",
+        "v7_controller_state_norm",
         "v7_world_delta",
         "v7_self_delta",
+        "v7_controller_delta",
         "v7_world_write_gate",
         "v7_self_write_gate",
+        "v7_controller_write_gate",
         "v7_dynamic_depth_enabled",
         "v7_dynamic_depth_mean",
         "v7_dynamic_halt_fraction",
         "v7_dynamic_continue_score",
         "v7_dynamic_convergence_threshold",
+        "v7_causal_segments",
         "v7_past_latent_adapt_steps",
         "v7_past_latent_read_suppressed",
+        "v7_latent_timescale",
+        "v7_world_timescale",
+        "v7_self_timescale",
+        "v7_controller_fixed",
+        "v7_homeostatic_control_enabled",
+        "v7_homeostatic_dhi",
+        "v7_homeostatic_balance_pressure",
+        "v7_homeostatic_accel_pressure",
+        "v7_latent_rate_scale",
+        "v7_world_rate_scale",
+        "v7_self_rate_scale",
+        "v7_hidden_read_rate_scale",
+        "v7_state_compatibility_enabled",
+        "v7_carry_compatibility",
+        "v7_carry_latent_gate",
+        "v7_carry_world_gate",
+        "v7_carry_self_gate",
+        "v7_carry_controller_gate",
+        "v7_carry_memory_gate",
+        "v7_carry_blend_delta",
+        "v7_hyperspherical_state_enabled",
+        "v7_causal_summary_enabled",
+        "v7_causal_summary_decay",
+        "v7_adaptive_tau_enabled",
+        "v7_latent_tau",
+        "v7_world_tau",
+        "v7_self_tau",
+        "v7_controller_tau",
+        "v7_ingress_compatibility_enabled",
+        "v7_ingress_compatibility",
+        "v7_ingress_latent_gate",
+        "v7_ingress_world_gate",
+        "v7_ingress_self_gate",
+        "v7_ingress_controller_gate",
+        "v7_ingress_memory_gate",
+        "v7_ingress_latent_blend_delta",
+        "v7_ingress_world_blend_delta",
+        "v7_ingress_self_blend_delta",
+        "v7_ingress_controller_blend_delta",
+        "v7_ingress_memory_blend_delta",
+        "v7_effective_latent_write_scale",
+        "v7_effective_world_write_scale",
+        "v7_effective_self_write_scale",
+        "v7_effective_controller_write_scale",
     ):
         values = v7_metric_values.get(key)
         metrics[key] = torch.stack(values).mean() if values else zero

@@ -1,6 +1,6 @@
 # Training
 
-Date: 2026-05-17
+Date: 2026-05-25
 
 ## Entry Point
 
@@ -10,8 +10,8 @@ of day-to-day work:
 
 ```powershell
 .\scripts\train_template.ps1 -List
-.\scripts\train_template.ps1 -Template v6_local_smoke
-.\scripts\train_template.ps1 -Template v6_local_smoke -PrintArgs
+.\scripts\train_template.ps1 -Template v7_local_smoke
+.\scripts\train_template.ps1 -Template v7_local_smoke -PrintArgs
 ```
 
 See `docs/TRAINING_TEMPLATES.md` for template rules and safe overrides.
@@ -28,6 +28,7 @@ naime_state_moe
 naime_v4_state_moe
 naime_v5_world_state_moe
 naime_v6_recursive_self_moe
+naime_v7_typed_dynamics
 ```
 
 Older V1/V2/V3 and V4.1/V4.2 aliases are legacy/forensic only. Do not launch
@@ -36,14 +37,16 @@ reproducing an old run.
 
 All model and training parameters should pass through CLI/config. Avoid hard-coding experiment-specific values in Python.
 
-## V6 Training (Recommended)
+## V7 Training (Experimental Recommended Path)
 
-V6 is the active path. The current large-run policy is segmented continuation on the prebuilt FineWeb-Edu 1B ctx1024 corpus.
+V7 is the active experimental path. The current large-run policy is segmented
+continuation on the prebuilt FineWeb-Edu 1B ctx1024 corpus, with clean lineage
+and the incoming/outgoing state protocol preserved.
 
 Local quick probe:
 
 ```powershell
-.\scripts\train_template.ps1 -Template v6_local_smoke -RunName v6_local_probe
+.\scripts\train_template.ps1 -Template v7_local_smoke -RunName v7_local_probe
 ```
 
 Remote 4090 runs should be launched through the hidden/background remote workflow documented in `docs/REMOTE_4090_OPERATIONS.md`, not from a visible foreground PowerShell window.
@@ -51,7 +54,7 @@ Remote 4090 runs should be launched through the hidden/background remote workflo
 Current remote continuation baseline:
 
 ```text
-model              naime_v6_recursive_self_moe
+model              naime_v7_typed_dynamics
 dataset            <REMOTE_DATASETS>\fineweb_edu_1b_ctx1024
 resume checkpoint  previous validated models\model_best.pt
 target mode        additional
@@ -68,6 +71,20 @@ save every         10000
 latest every       5000
 best mode          model
 ```
+
+V6 remains the mature stateful baseline and should be kept runnable for fair
+comparison. V7 claims require mechanism probes such as state swap, state erase,
+and dynamics gain; lower loss alone is not enough.
+
+V7 timescales are not yet scientific priors. Clean templates keep
+`latent/world/self = 1/1/1`; use `scripts/run_v7_timescale_ablation.ps1` when we
+need to measure whether one state family should move faster or slower.
+
+V7 typed dynamics should be tested with causal state chunks enabled. Without
+`--v7-state-chunk-size`, a no-past single chunk can only write outgoing state,
+so `v7_dynamics_gain` may correctly remain zero even when state motion exists.
+With causal chunks, earlier chunks may write state that later chunks read,
+preserving causal direction while giving the dynamics path an LM training signal.
 
 Use smaller fixed batches only when another GPU job is active. When the GPU is
 free, prefer auto-batch with conservative prediction/headroom. Serious remote
@@ -180,6 +197,14 @@ V6 recursive self-state:
 - `v6_slot_context_cosine`
 - `v6_boundary_self`, `v6_boundary_world`, `v6_boundary_other`, `v6_boundary_unknown`
 - `v6_reflection_norm`
+
+V7 typed dynamics:
+
+- `v7_latent_delta`, `v7_world_delta`, `v7_self_delta`, `v7_controller_delta`
+- `v7_hidden_write_ratio`, `v7_latent_read_entropy`, `v7_latent_read_max`
+- `v7_*_timescale`, `v7_effective_*_write_scale`
+- `v7_dynamic_depth_mean`, `v7_dynamic_halt_fraction`
+- validation probes: `val_v7_dynamics_gain_lm`, `val_v7_state_swap_delta_lm`, `val_v7_*_erase_delta_lm`
 
 ## Validation Sampling
 

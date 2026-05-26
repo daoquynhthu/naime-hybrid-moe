@@ -43,6 +43,9 @@ param(
     [double]$SemanticMemoryHiddenScale = -1.0,
     [double]$SemanticGateMixerMaxStateWeight = -1.0,
     [double]$WorldRouterMaxRatio = -1.0,
+    [ValidateSet("", "add", "modulate")]
+    [string]$WorldRouterMode = "",
+    [double]$WorldRouterModulationScale = -1.0,
     [double]$SelfStateWorldGateMin = -1.0,
     [double]$SelfStateWorldGateScale = -1.0,
     [int]$LatentThoughtSteps = -1,
@@ -60,11 +63,35 @@ param(
     [double]$V7HiddenWriteScale = -1.0,
     [double]$V7MaxHiddenWriteRatio = -1.0,
     [double]$V7StateWriteScale = -1.0,
+    [double]$V7WorldStateWriteScale = -2.0,
+    [double]$V7SelfStateWriteScale = -2.0,
+    [double]$V7LatentTimescale = -1.0,
+    [double]$V7WorldTimescale = -1.0,
+    [double]$V7SelfTimescale = -1.0,
+    [int]$V7ControllerSlots = -1,
+    [double]$V7ControllerWriteScale = -1.0,
+    [ValidateSet("", "fixed")]
+    [string]$V7ControllerMode = "",
     [int]$V7PastLatentAdaptSteps = -1,
+    [int]$V7StateChunkSize = -1,
+    [int]$V7InternalLatentAdaptSteps = -1,
     [switch]$V7DynamicDepth,
     [int]$V7MinDynamicsSteps = -1,
     [int]$V7MaxDynamicsSteps = -1,
     [double]$V7DynamicConvergenceThreshold = -1.0,
+    [switch]$V7HomeostaticControl,
+    [double]$V7HomeostaticStrength = -1.0,
+    [double]$V7HomeostaticMinScale = -1.0,
+    [double]$V7HomeostaticMaxScale = -1.0,
+    [switch]$V7StateCompatibilityGate,
+    [double]$V7StateCompatibilityStrength = -1.0,
+    [double]$V7StateCompatibilityMin = -1.0,
+    [switch]$V7AdaptiveTau,
+    [double]$V7AdaptiveTauMin = -1.0,
+    [double]$V7AdaptiveTauMax = -1.0,
+    [switch]$NoV7HypersphericalState,
+    [switch]$NoV7CausalSummary,
+    [double]$V7CausalSummaryDecay = -1.0,
     [string]$Device = "",
     [int]$MaxSteps = -1,
     [switch]$NoAutoBatch,
@@ -217,6 +244,10 @@ Add-Override $params "SemanticStateWriteScale" $SemanticStateWriteScale { $Seman
 Add-Override $params "SemanticMemoryHiddenScale" $SemanticMemoryHiddenScale { $SemanticMemoryHiddenScale -gt 0.0 }
 Add-Override $params "SemanticGateMixerMaxStateWeight" $SemanticGateMixerMaxStateWeight { $SemanticGateMixerMaxStateWeight -gt 0.0 }
 Add-Override $params "WorldRouterMaxRatio" $WorldRouterMaxRatio { $WorldRouterMaxRatio -gt 0.0 }
+Add-Override $params "WorldRouterMode" $WorldRouterMode { -not [string]::IsNullOrWhiteSpace($WorldRouterMode) }
+Add-Override $params "WorldRouterModulationScale" $WorldRouterModulationScale {
+    $WorldRouterModulationScale -ge 0.0
+}
 Add-Override $params "SelfStateWorldGateMin" $SelfStateWorldGateMin { $SelfStateWorldGateMin -ge 0.0 }
 Add-Override $params "SelfStateWorldGateScale" $SelfStateWorldGateScale { $SelfStateWorldGateScale -gt 0.0 }
 Add-Override $params "LatentThoughtSteps" $LatentThoughtSteps { $LatentThoughtSteps -ge 0 }
@@ -237,7 +268,17 @@ Add-Override $params "V7LatentWriteScale" $V7LatentWriteScale { $V7LatentWriteSc
 Add-Override $params "V7HiddenWriteScale" $V7HiddenWriteScale { $V7HiddenWriteScale -ge 0.0 }
 Add-Override $params "V7MaxHiddenWriteRatio" $V7MaxHiddenWriteRatio { $V7MaxHiddenWriteRatio -gt 0.0 }
 Add-Override $params "V7StateWriteScale" $V7StateWriteScale { $V7StateWriteScale -ge 0.0 }
+Add-Override $params "V7WorldStateWriteScale" $V7WorldStateWriteScale { $V7WorldStateWriteScale -ge -1.0 }
+Add-Override $params "V7SelfStateWriteScale" $V7SelfStateWriteScale { $V7SelfStateWriteScale -ge -1.0 }
+Add-Override $params "V7LatentTimescale" $V7LatentTimescale { $V7LatentTimescale -ge 0.0 }
+Add-Override $params "V7WorldTimescale" $V7WorldTimescale { $V7WorldTimescale -ge 0.0 }
+Add-Override $params "V7SelfTimescale" $V7SelfTimescale { $V7SelfTimescale -ge 0.0 }
+Add-Override $params "V7ControllerSlots" $V7ControllerSlots { $V7ControllerSlots -ge 0 }
+Add-Override $params "V7ControllerWriteScale" $V7ControllerWriteScale { $V7ControllerWriteScale -ge 0.0 }
+Add-Override $params "V7ControllerMode" $V7ControllerMode { -not [string]::IsNullOrWhiteSpace($V7ControllerMode) }
 Add-Override $params "V7PastLatentAdaptSteps" $V7PastLatentAdaptSteps { $V7PastLatentAdaptSteps -ge 0 }
+Add-Override $params "V7StateChunkSize" $V7StateChunkSize { $V7StateChunkSize -ge 0 }
+Add-Override $params "V7InternalLatentAdaptSteps" $V7InternalLatentAdaptSteps { $V7InternalLatentAdaptSteps -ge 0 }
 if ($V7DynamicDepth) {
     $params["V7DynamicDepth"] = $true
 }
@@ -246,6 +287,33 @@ Add-Override $params "V7MaxDynamicsSteps" $V7MaxDynamicsSteps { $V7MaxDynamicsSt
 Add-Override $params "V7DynamicConvergenceThreshold" $V7DynamicConvergenceThreshold {
     $V7DynamicConvergenceThreshold -ge 0.0
 }
+if ($V7HomeostaticControl) {
+    $params["V7HomeostaticControl"] = $true
+}
+Add-Override $params "V7HomeostaticStrength" $V7HomeostaticStrength { $V7HomeostaticStrength -ge 0.0 }
+Add-Override $params "V7HomeostaticMinScale" $V7HomeostaticMinScale { $V7HomeostaticMinScale -gt 0.0 }
+Add-Override $params "V7HomeostaticMaxScale" $V7HomeostaticMaxScale { $V7HomeostaticMaxScale -gt 0.0 }
+if ($V7StateCompatibilityGate) {
+    $params["V7StateCompatibilityGate"] = $true
+}
+Add-Override $params "V7StateCompatibilityStrength" $V7StateCompatibilityStrength {
+    $V7StateCompatibilityStrength -ge 0.0
+}
+Add-Override $params "V7StateCompatibilityMin" $V7StateCompatibilityMin {
+    $V7StateCompatibilityMin -ge 0.0
+}
+if ($V7AdaptiveTau) {
+    $params["V7AdaptiveTau"] = $true
+}
+Add-Override $params "V7AdaptiveTauMin" $V7AdaptiveTauMin { $V7AdaptiveTauMin -ge 0.0 }
+Add-Override $params "V7AdaptiveTauMax" $V7AdaptiveTauMax { $V7AdaptiveTauMax -ge 0.0 }
+if ($NoV7HypersphericalState) {
+    $params["NoV7HypersphericalState"] = $true
+}
+if ($NoV7CausalSummary) {
+    $params["NoV7CausalSummary"] = $true
+}
+Add-Override $params "V7CausalSummaryDecay" $V7CausalSummaryDecay { $V7CausalSummaryDecay -ge 0.0 }
 Add-Override $params "Device" $Device { -not [string]::IsNullOrWhiteSpace($Device) }
 Add-Override $params "MaxSteps" $MaxSteps { $MaxSteps -gt 0 }
 
@@ -279,6 +347,11 @@ $switchNames = @(
     "EvalV7StateErase",
     "UseFusedStateAttention",
     "V7DynamicDepth",
+    "V7HomeostaticControl",
+    "V7StateCompatibilityGate",
+    "V7AdaptiveTau",
+    "NoV7HypersphericalState",
+    "NoV7CausalSummary",
     "NoStateEvolutionMemory",
     "LatentFieldCoupling",
     "ResumeAllowFailed",

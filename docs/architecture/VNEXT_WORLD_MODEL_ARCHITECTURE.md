@@ -2,7 +2,11 @@
 
 Status: **VNext architecture is unverified.**
 
-This document is a planning blueprint. It is not a claim that the proposed architecture has already surpassed existing frontier systems. The current V4/V4.1/V4.2 code validates parts of the NAIME direction at small scale, but the VNext architecture described here still requires implementation, ablation, scaling, and independent evaluation.
+This document is a planning blueprint. It is not a claim that the proposed
+architecture has already surpassed existing frontier systems. The old V4/V5/V6
+line validated parts of the NAIME direction at small scale; V7 reframes the
+project around typed internal dynamics. The VNext architecture described here
+still requires implementation, ablation, scaling, and independent evaluation.
 
 ## 1. North Star
 
@@ -15,7 +19,13 @@ The final goal is not merely a better MoE and not merely a multimodal demo. The 
 - It can decide when to use fast response, extended reasoning, retrieval, memory write, tool use, or self-checking.
 - It can ground language in perception and action without letting multimodal engineering distract from the core intelligence architecture.
 
-In short: the model should not only predict the next token. It should learn a compact, updateable, self-auditing world state from which token prediction, reasoning, dialogue, perception, and action become different readout modes.
+In short: the model should not only predict the next token. It should learn a
+compact, updateable, self-auditing internal state from which token prediction,
+reasoning, dialogue, perception, and action become different readout modes.
+
+The governing outlook is `docs/architecture/INTERNAL_DYNAMICS_OUTLOOK.md`.
+Multimodality must extend the internal dynamics system; it must not replace that
+system with a stack of modality adapters.
 
 ## 2. Frontier Signals Considered
 
@@ -42,15 +52,16 @@ Current LLMs mostly compress the world into weights and a temporary context wind
 - limited ability to update beliefs during inference;
 - limited introspection into why modules are used.
 
-NAIME VNext should add a structured latent world state between tokens and weights:
+NAIME VNext should develop a structured internal state between observations and
+weights:
 
 ```text
-tokens / modalities
-    -> perception encoders
-    -> semantic state builder
-    -> persistent world state
-    -> simulator / reasoner / router
-    -> language, action, speech, or tool outputs
+tokens / images / video / audio / tools
+    -> typed observation packets
+    -> incoming internal state
+    -> bounded internal dynamics
+    -> outgoing internal state
+    -> language, action, speech, tool, or observation-request outputs
 ```
 
 The model should learn not only `P(next token | context)`, but also:
@@ -79,13 +90,14 @@ Required upgrades:
 
 Design rule: do not replace the Transformer prematurely. Wrap it with persistent state and memory first; only then decide where SSM or MLA gives real benefit.
 
-### 4.2 Semantic State System
+### 4.2 Semantic and Observation State System
 
 V4/V4.2 already introduced semantic compression, cross-layer state, memory, and gate mixing. VNext should turn these into a real state system.
 
 Components:
 
-- **Observation encoder:** converts token spans or modality embeddings into structured semantic events.
+- **Observation encoder:** converts token spans or modality embeddings into
+  structured typed evidence.
 - **State updater:** updates latent world state with gated, confidence-weighted transitions.
 - **State slots:** represent entities, tasks, speaker intent, constraints, uncertainty, and temporal context.
 - **State confidence:** calibrated confidence, not just learned scalar output.
@@ -99,7 +111,10 @@ State must not be a decorative residual. It must be used by router decisions, me
 The architecture needs at least four memory timescales:
 
 - **Working memory:** active context tokens and local attention.
-- **Recurrent semantic state:** per-sequence latent state passed across layers and chunks.
+- **Fast latent field:** compact internal computation endpoint passed across
+  causal segments when enabled.
+- **Recurrent semantic/world state:** per-sequence latent state passed across
+  layers, chunks, frames, or turns.
 - **Episodic memory:** compressed records of interactions, observations, decisions, and outcomes.
 - **Semantic memory:** abstracted stable knowledge distilled from repeated episodes or external corpora.
 
@@ -175,19 +190,39 @@ The controller observes:
 - verifier confidence;
 - expected cost.
 
-This can be implemented first as a small learned policy head with heuristic guardrails.
+This should not begin as an unconstrained learned policy. The first controller
+should be deterministic or metric-conditioned, using novelty, uncertainty,
+contradiction, router entropy, state delta, and expected gain. A learned
+controller is a later protocol-version upgrade because it controls compute and
+write authority.
 
-### 4.7 Multimodal Path
+### 4.7 Multimodal Observation Path
 
-MiniMind-O is not a frontier target, but it offers a useful engineering lesson: multimodal I/O can be staged with frozen encoders and projectors before native end-to-end training.
+MiniMind-O is not a frontier target, but it offers a useful engineering lesson:
+multimodal I/O can be staged with frozen encoders and projectors before native
+end-to-end training.
+
+The architectural principle is stricter than "append image tokens to text":
+
+```text
+modality encoder -> ObservationPacket -> typed state write -> future readout
+```
+
+Image and video understanding should be measured by how observations change
+world/self/latent state, not only by whether the model can caption a frame.
 
 VNext multimodal roadmap:
 
 1. Frozen image/audio encoders + NAIME projectors.
-2. Unified semantic event representation for text, image, and audio.
-3. State-grounded perception: visual/audio features update world state, not just prompt tokens.
-4. Optional Talker branch for speech output if needed.
-5. Native multimodal token training only after text-world-state architecture is stable.
+2. `ObservationPacket` representation for text, image, video, audio, and tool
+   outputs.
+3. State-grounded perception: visual/audio features update world state, not
+   merely prompt tokens.
+4. Video temporal grounding: frame and segment observations update event,
+   motion, and continuity state across time.
+5. Optional Talker branch for speech output if needed.
+6. Native multimodal token training only after text-state and observation-state
+   stability.
 
 Multimodality is important, but it should not hijack the core LM world-model work.
 
@@ -266,6 +301,7 @@ Measure:
 
 - visual/audio grounding;
 - state updates from modalities;
+- video temporal consistency;
 - cross-modal contradiction detection;
 - text-only ability retention.
 
@@ -332,10 +368,21 @@ Persistent memory and long-context system:
 
 ### V7
 
-Grounded multimodal extension:
+Typed internal dynamics:
+
+- incoming/outgoing state packet protocol;
+- typed latent/world/self dynamics;
+- mechanism probes for state usefulness;
+- fixed-depth, then adaptive-depth internal evolution.
+
+### V8
+
+Grounded multimodal observation extension:
 
 - frozen encoders + projectors;
-- modality-to-state events;
+- `ObservationPacket`;
+- modality-to-state evidence;
+- video segment state continuity;
 - optional speech Talker;
 - native multimodal training only after text-state stability.
 

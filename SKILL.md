@@ -4,7 +4,7 @@ Use this skill when onboarding to this repository, continuing architecture work,
 
 ## Project Posture
 
-This is an experimental language-model architecture project, not a static library. The goal is to build a practical, influential architecture that combines Transformer language modeling with semantic compression, state-aware routing, memory, world modeling, recursive self-state, and MoE specialization.
+This is an experimental language-model architecture project, not a static library. The goal is to build a practical, influential architecture that combines Transformer language modeling with semantic compression, state-aware routing, memory, world modeling, recursive self-state, typed internal dynamics, and MoE specialization.
 
 Default behavior:
 
@@ -19,8 +19,8 @@ Default behavior:
 - `src/naime_hybrid/modules/`: reusable neural modules such as MoE, semantic compressor, state, memory, and blocks.
 - `src/naime_hybrid/models/`: decoder assembly and model factory.
 - `src/naime_hybrid/training/`: training loop, CLI config, runtime, validation, losses, checkpoint policy, logging.
-- `scripts/train_model.ps1`: primary local training launcher.
-- `scripts/remote_ctl.py`, `scripts/watch_remote.ps1`, `scripts/sync_to_remote.ps1`: remote 4090 workflow helpers.
+- `scripts/train_template.ps1`: primary template-based local/remote training launcher.
+- `scripts/remote.ps1`, `scripts/sync_to_remote.ps1`, `scripts/inspect_remote_training.ps1`: remote 4090 workflow helpers.
 - `scripts/env.ps1`: environment setup helper.
 - `tests/`: architecture and training smoke tests.
 - `docs/`: architecture, training, environment, and remote-operation docs.
@@ -61,16 +61,21 @@ Important architecture IDs:
 - `naime_v41_state_moe`: V4.1 anti-degeneration refinement.
 - `naime_v42_state_moe`: V4.2 accountable semantic influence refinement.
 - `naime_v5_world_state_moe`: structured world-state model.
-- `naime_v6_recursive_self_moe`: active recursive self-state architecture.
+- `naime_v6_recursive_self_moe`: mature recursive self-state baseline.
+- `naime_v7_typed_dynamics`: active experimental typed internal dynamics architecture.
 
-V6 concepts:
+V7 concepts:
 
-- V5 world-state slots remain present.
-- Recursive self-state slots predict and update an internal state.
-- Boundary metrics split state into self/world/other/unknown.
-- V6 structure metrics must be read together with LM loss; low loss alone is not enough.
+- Incoming readable state and outgoing updated state must not be confused.
+- `latent_field` is the compact internal dynamics endpoint, not KV cache.
+- Current observations may write future state; current readout may only read incoming state.
+- Future multimodal work should produce typed observations that update state, not independent hidden authorities.
+- Read `docs/architecture/STATE_PROTOCOL.md` and `docs/architecture/INTERNAL_DYNAMICS_OUTLOOK.md` before changing stateful paths.
 
-Latest completed V6 validation:
+V6 remains the baseline for comparison. Older low-perplexity continuation runs
+must not be used as clean evidence unless explicitly labeled forensic.
+
+Latest completed historical V6 validation:
 
 ```text
 run      naime_v6_100m_1b_conservative_logfix_add40m_20260517_1645
@@ -79,22 +84,23 @@ val_lm   0.7033
 val_ppl  2.020
 ```
 
-Healthy late V6 behavior so far:
+Healthy stateful behavior to watch:
 
 - `alpha` around `0.64-0.66`, not pinned at 0 or 1.
 - router entropy around `1.2-1.3`.
-- self boundary strongest but not exclusive.
-- world boundary still weak and worth improving.
-- `v6_self_pred` very small without obvious structure collapse.
+- self boundary active but not all-absorbing.
+- world boundary/utilization nonzero.
+- V7 latent/world/self deltas bounded and nonzero.
+- state swap/erase/dynamics-gain probes used for mechanism claims.
 
 ## Training Defaults
 
-Use `scripts/train_model.ps1` locally. Use the remote workflow docs for 4090 runs.
+Use `scripts/train_template.ps1` locally. Use the remote workflow docs for 4090 runs.
 
-Local V6 probe:
+Local V7 probe:
 
 ```powershell
-.\scripts\train_model.ps1 -Model naime_v6_recursive_self_moe -RunName v6_local_probe -DataPath <LOCAL_FINEWEB_50M> -TargetTokens 3000000 -EvalEvery 500 -SaveEvery 5000 -LatestEvery 2500
+.\scripts\train_template.ps1 -Template v7_local_smoke -RunName v7_local_probe
 ```
 
 Current remote continuation baseline:
@@ -102,15 +108,15 @@ Current remote continuation baseline:
 ```text
 resume          previous validated model_best.pt
 target mode     additional
-segment size    100M tokens when GPU is available
-vram fraction   0.80
-learning rate   2.5e-5
-warmup steps    500
-min lr ratio    0.03
-grad clip       0.8
+segment size    500M tokens when GPU is dedicated, smaller when shared
+vram fraction   0.90-0.95 dedicated, 0.70-0.80 shared
+learning rate   template-defined; verify before launch
+warmup steps    template-defined
+min lr ratio    template-defined
+grad clip       template-defined
 eval every      5000
 save every      10000
-latest every    5000
+latest every    template-defined; avoid aggressive latest writes
 ```
 
 Checkpoint policy is intentionally conservative. Saving too often can become the throughput bottleneck and can aggravate Windows/native-extension instability.
@@ -140,7 +146,7 @@ Routing and semantic health:
 - `loss_sparse_contrib`
 - `loss_kl_contrib`
 
-V6 internals:
+State internals:
 
 - `v6_self_pred`
 - `v6_slot_cosine`
@@ -150,6 +156,14 @@ V6 internals:
 - `v6_boundary_other`
 - `v6_boundary_unknown`
 - `v6_reflection_norm`
+- `v7_latent_delta`
+- `v7_world_delta`
+- `v7_self_delta`
+- `v7_hidden_write_ratio`
+- `v7_dynamic_depth_mean`
+- `val_v7_dynamics_gain_lm`
+- `val_v7_state_swap_delta_lm`
+- `val_v7_latent_erase_delta_lm`
 
 ## Remote 4090 Rules
 
@@ -209,10 +223,11 @@ Response:
 
 Near-term priority is not blind scaling. The next valuable upgrades are:
 
-- strengthen world-state utilization relative to self-state;
+- preserve the incoming/outgoing state protocol under V7+ changes;
+- introduce multi-timescale dynamics without losing metric legibility;
 - reduce bad-gradient spike rate without suppressing useful learning;
 - make sparse dispatch materially faster for larger expert counts;
 - add generation quality evaluation beside validation loss;
-- preserve measurable self/world boundary metrics as model scale grows.
+- prepare multimodal observation packets only after text-state dynamics are stable.
 
 Follow `docs/CODING_STANDARDS.md` for naming, style, and experiment hygiene.

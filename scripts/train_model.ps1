@@ -84,6 +84,9 @@ param(
     [switch]$NoWorldRouterNormalize,
     [switch]$NoWorldRouterConfidenceGate,
     [double]$WorldRouterMaxRatio = 0.08,
+    [ValidateSet("add", "modulate")]
+    [string]$WorldRouterMode = "add",
+    [double]$WorldRouterModulationScale = 0.35,
     [int]$SelfStateSlots = 4,
     [int]$SelfStateRecursionDepth = 1,
     [double]$SelfStateWriteScale = 0.03,
@@ -109,11 +112,35 @@ param(
     [double]$V7HiddenWriteScale = 0.01,
     [double]$V7MaxHiddenWriteRatio = 0.05,
     [double]$V7StateWriteScale = 0.02,
+    [double]$V7WorldStateWriteScale = -1.0,
+    [double]$V7SelfStateWriteScale = -1.0,
+    [double]$V7LatentTimescale = 1.0,
+    [double]$V7WorldTimescale = 1.0,
+    [double]$V7SelfTimescale = 1.0,
+    [int]$V7ControllerSlots = 1,
+    [double]$V7ControllerWriteScale = 0.02,
+    [ValidateSet("fixed")]
+    [string]$V7ControllerMode = "fixed",
     [int]$V7PastLatentAdaptSteps = 1,
+    [int]$V7StateChunkSize = 0,
+    [int]$V7InternalLatentAdaptSteps = 0,
     [switch]$V7DynamicDepth,
     [int]$V7MinDynamicsSteps = 1,
     [int]$V7MaxDynamicsSteps = 0,
     [double]$V7DynamicConvergenceThreshold = 0.0,
+    [switch]$V7HomeostaticControl,
+    [double]$V7HomeostaticStrength = 0.25,
+    [double]$V7HomeostaticMinScale = 0.5,
+    [double]$V7HomeostaticMaxScale = 1.5,
+    [switch]$V7StateCompatibilityGate,
+    [double]$V7StateCompatibilityStrength = 1.0,
+    [double]$V7StateCompatibilityMin = 0.0,
+    [switch]$V7AdaptiveTau,
+    [double]$V7AdaptiveTauMin = 0.5,
+    [double]$V7AdaptiveTauMax = 1.5,
+    [switch]$NoV7HypersphericalState,
+    [switch]$NoV7CausalSummary,
+    [double]$V7CausalSummaryDecay = 0.98,
     [double]$LambdaStatePred = 0.0,
     [double]$LambdaSlotDiversity = 0.0,
     [double]$LambdaSlotStability = 0.0,
@@ -432,6 +459,8 @@ if ($isStateModel) {
             "--lambda-slot-stability", "$LambdaSlotStability",
             "--world-state-stability-threshold", "$WorldStateStabilityThreshold",
             "--world-router-max-ratio", "$WorldRouterMaxRatio",
+            "--world-router-mode", "$WorldRouterMode",
+            "--world-router-modulation-scale", "$WorldRouterModulationScale",
             "--attention-type", "$AttentionType",
             "--mla-latent-dim", "$MlaLatentDim",
             "--mla-rope-per-head", "$MlaRopePerHead"
@@ -483,13 +512,46 @@ if ($isStateModel) {
                 "--v7-hidden-write-scale", "$V7HiddenWriteScale",
                 "--v7-max-hidden-write-ratio", "$V7MaxHiddenWriteRatio",
                 "--v7-state-write-scale", "$V7StateWriteScale",
+                "--v7-world-state-write-scale", "$V7WorldStateWriteScale",
+                "--v7-self-state-write-scale", "$V7SelfStateWriteScale",
+                "--v7-latent-timescale", "$V7LatentTimescale",
+                "--v7-world-timescale", "$V7WorldTimescale",
+                "--v7-self-timescale", "$V7SelfTimescale",
+                "--v7-controller-slots", "$V7ControllerSlots",
+                "--v7-controller-write-scale", "$V7ControllerWriteScale",
+                "--v7-controller-mode", "$V7ControllerMode",
                 "--v7-past-latent-adapt-steps", "$V7PastLatentAdaptSteps",
+                "--v7-state-chunk-size", "$V7StateChunkSize",
+                "--v7-internal-latent-adapt-steps", "$V7InternalLatentAdaptSteps",
                 "--v7-min-dynamics-steps", "$V7MinDynamicsSteps",
                 "--v7-max-dynamics-steps", "$V7MaxDynamicsSteps",
-                "--v7-dynamic-convergence-threshold", "$V7DynamicConvergenceThreshold"
+                "--v7-dynamic-convergence-threshold", "$V7DynamicConvergenceThreshold",
+                "--v7-homeostatic-strength", "$V7HomeostaticStrength",
+                "--v7-homeostatic-min-scale", "$V7HomeostaticMinScale",
+                "--v7-homeostatic-max-scale", "$V7HomeostaticMaxScale",
+                "--v7-state-compatibility-strength", "$V7StateCompatibilityStrength",
+                "--v7-state-compatibility-min", "$V7StateCompatibilityMin",
+                "--v7-adaptive-tau-min", "$V7AdaptiveTauMin",
+                "--v7-adaptive-tau-max", "$V7AdaptiveTauMax",
+                "--v7-causal-summary-decay", "$V7CausalSummaryDecay"
             )
             if ($V7DynamicDepth) {
                 $common += "--v7-dynamic-depth"
+            }
+            if ($V7HomeostaticControl) {
+                $common += "--v7-homeostatic-control"
+            }
+            if ($V7StateCompatibilityGate) {
+                $common += "--v7-state-compatibility-gate"
+            }
+            if ($V7AdaptiveTau) {
+                $common += "--v7-adaptive-tau"
+            }
+            if ($NoV7HypersphericalState) {
+                $common += "--no-v7-hyperspherical-state"
+            }
+            if ($NoV7CausalSummary) {
+                $common += "--no-v7-causal-summary"
             }
         }
     }

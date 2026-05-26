@@ -9,6 +9,7 @@ from .models import (
     NAIMEV5WorldStateMoEDecoder,
     NAIMEV6RecursiveSelfMoEDecoder,
     NAIMEV7TypedDynamicsDecoder,
+    ObservationPacket,
     TokenMoEDecoder,
     build_model,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "NAIMEV5WorldStateMoEDecoder",
     "NAIMEV6RecursiveSelfMoEDecoder",
     "NAIMEV7TypedDynamicsDecoder",
+    "ObservationPacket",
     "TokenMoEDecoder",
     "build_model",
 ]

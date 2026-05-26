@@ -350,6 +350,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-world-router-normalize", action="store_true")
     parser.add_argument("--no-world-router-confidence-gate", action="store_true")
     parser.add_argument("--world-router-max-ratio", type=float, default=0.08)
+    parser.add_argument("--world-router-mode", default="add", choices=["add", "modulate"])
+    parser.add_argument("--world-router-modulation-scale", type=float, default=0.35)
     parser.add_argument("--self-state-slots", type=int, default=0)
     parser.add_argument("--self-state-recursion-depth", type=int, default=1)
     parser.add_argument("--self-state-write-scale", type=float, default=0.03)
@@ -387,11 +389,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v7-hidden-write-scale", type=float, default=0.01)
     parser.add_argument("--v7-max-hidden-write-ratio", type=float, default=0.05)
     parser.add_argument("--v7-state-write-scale", type=float, default=0.02)
+    parser.add_argument("--v7-world-state-write-scale", type=float, default=-1.0)
+    parser.add_argument("--v7-self-state-write-scale", type=float, default=-1.0)
+    parser.add_argument("--v7-latent-timescale", type=float, default=1.0)
+    parser.add_argument("--v7-world-timescale", type=float, default=1.0)
+    parser.add_argument("--v7-self-timescale", type=float, default=1.0)
+    parser.add_argument("--v7-controller-slots", type=int, default=1)
+    parser.add_argument("--v7-controller-write-scale", type=float, default=0.02)
+    parser.add_argument(
+        "--v7-controller-mode",
+        default="fixed",
+        choices=["fixed"],
+        help="Internal dynamics controller mode. fixed is the only implemented protocol-safe mode.",
+    )
     parser.add_argument(
         "--v7-past-latent-adapt-steps",
         type=int,
         default=1,
         help="Suppress hidden reads from a carried V7 latent field for this many dynamics steps.",
+    )
+    parser.add_argument(
+        "--v7-state-chunk-size",
+        type=int,
+        default=0,
+        help="If >0, run V7 typed dynamics causally over sequence chunks so prior chunks can affect later chunks.",
+    )
+    parser.add_argument(
+        "--v7-internal-latent-adapt-steps",
+        type=int,
+        default=0,
+        help="Suppression steps for latent reads carried from an earlier chunk in the same forward pass.",
     )
     parser.add_argument("--v7-dynamic-depth", action="store_true")
     parser.add_argument("--v7-min-dynamics-steps", type=int, default=1)
@@ -402,6 +429,31 @@ def parse_args() -> argparse.Namespace:
         help="Maximum V7 dynamics steps when dynamic depth is enabled. 0 reuses --v7-dynamics-steps.",
     )
     parser.add_argument("--v7-dynamic-convergence-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--v7-homeostatic-control",
+        action="store_true",
+        help="Enable protocol-safe relative homeostatic rate modulation inside V7 typed dynamics.",
+    )
+    parser.add_argument("--v7-homeostatic-strength", type=float, default=0.25)
+    parser.add_argument("--v7-homeostatic-min-scale", type=float, default=0.5)
+    parser.add_argument("--v7-homeostatic-max-scale", type=float, default=1.5)
+    parser.add_argument(
+        "--v7-state-compatibility-gate",
+        action="store_true",
+        help="Gate carried V7 latent/controller state against the current segment before hidden reads.",
+    )
+    parser.add_argument("--v7-state-compatibility-strength", type=float, default=1.0)
+    parser.add_argument("--v7-state-compatibility-min", type=float, default=0.0)
+    parser.add_argument(
+        "--v7-adaptive-tau",
+        action="store_true",
+        help="Enable learned bounded per-update tau modulation for V7 typed state updates.",
+    )
+    parser.add_argument("--v7-adaptive-tau-min", type=float, default=0.5)
+    parser.add_argument("--v7-adaptive-tau-max", type=float, default=1.5)
+    parser.add_argument("--no-v7-hyperspherical-state", action="store_true")
+    parser.add_argument("--no-v7-causal-summary", action="store_true")
+    parser.add_argument("--v7-causal-summary-decay", type=float, default=0.98)
     parser.add_argument("--n-experts", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=2)
     parser.add_argument("--expert-hidden-dim", type=int, default=512)
@@ -485,6 +537,8 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         world_router_normalize=not args.no_world_router_normalize,
         world_router_confidence_gate=not args.no_world_router_confidence_gate,
         world_router_max_ratio=args.world_router_max_ratio,
+        world_router_mode=args.world_router_mode,
+        world_router_modulation_scale=args.world_router_modulation_scale,
         self_state_slots=args.self_state_slots,
         self_state_recursion_depth=args.self_state_recursion_depth,
         self_state_write_scale=args.self_state_write_scale,
@@ -510,11 +564,34 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         v7_hidden_write_scale=args.v7_hidden_write_scale,
         v7_max_hidden_write_ratio=args.v7_max_hidden_write_ratio,
         v7_state_write_scale=args.v7_state_write_scale,
+        v7_world_state_write_scale=args.v7_world_state_write_scale,
+        v7_self_state_write_scale=args.v7_self_state_write_scale,
+        v7_latent_timescale=args.v7_latent_timescale,
+        v7_world_timescale=args.v7_world_timescale,
+        v7_self_timescale=args.v7_self_timescale,
+        v7_controller_slots=args.v7_controller_slots,
+        v7_controller_write_scale=args.v7_controller_write_scale,
+        v7_controller_mode=args.v7_controller_mode,
         v7_past_latent_adapt_steps=args.v7_past_latent_adapt_steps,
+        v7_state_chunk_size=args.v7_state_chunk_size,
+        v7_internal_latent_adapt_steps=args.v7_internal_latent_adapt_steps,
         v7_dynamic_depth=args.v7_dynamic_depth,
         v7_min_dynamics_steps=args.v7_min_dynamics_steps,
         v7_max_dynamics_steps=args.v7_max_dynamics_steps,
         v7_dynamic_convergence_threshold=args.v7_dynamic_convergence_threshold,
+        v7_homeostatic_control=args.v7_homeostatic_control,
+        v7_homeostatic_strength=args.v7_homeostatic_strength,
+        v7_homeostatic_min_scale=args.v7_homeostatic_min_scale,
+        v7_homeostatic_max_scale=args.v7_homeostatic_max_scale,
+        v7_state_compatibility_gate=args.v7_state_compatibility_gate,
+        v7_state_compatibility_strength=args.v7_state_compatibility_strength,
+        v7_state_compatibility_min=args.v7_state_compatibility_min,
+        v7_adaptive_tau=args.v7_adaptive_tau,
+        v7_adaptive_tau_min=args.v7_adaptive_tau_min,
+        v7_adaptive_tau_max=args.v7_adaptive_tau_max,
+        v7_hyperspherical_state=not args.no_v7_hyperspherical_state,
+        v7_causal_summary=not args.no_v7_causal_summary,
+        v7_causal_summary_decay=args.v7_causal_summary_decay,
         n_experts=args.n_experts,
         top_k=args.top_k,
         expert_hidden_dim=args.expert_hidden_dim,
