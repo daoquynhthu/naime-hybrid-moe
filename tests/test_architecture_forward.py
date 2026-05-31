@@ -1,3 +1,4 @@
+import json
 import math
 import warnings
 
@@ -279,6 +280,9 @@ def test_cli_maps_stateful_carry_doc_continuity_and_diagnostics_flags(monkeypatc
             "--diagnostics-max-batch",
             "3",
             "--diagnostics-no-tensor-stats",
+            "--diagnostics-window-size",
+            "5",
+            "--diagnostics-no-grad-components",
             "--stateful-batch-ratio",
             "0.1",
             "--stateful-chunk-len",
@@ -317,6 +321,8 @@ def test_cli_maps_stateful_carry_doc_continuity_and_diagnostics_flags(monkeypatc
     assert config.diagnostics_boundary_tokens == 32
     assert config.diagnostics_max_batch == 3
     assert config.diagnostics_record_tensor_stats is False
+    assert config.diagnostics_window_size == 5
+    assert config.diagnostics_grad_components is False
     assert config.stateful_batch_ratio == pytest.approx(0.1)
     assert config.stateful_chunk_len == 256
     assert config.lambda_stateful_carry == pytest.approx(5e-4)
@@ -2291,6 +2297,9 @@ def test_training_diagnostics_helper_writes_step_artifacts_and_scalar_metrics(tm
             "loss_aux": 0.1,
             "lr": 1e-4,
             "grad_norm": 0.5,
+            "grad_component_total_norm": {"typed_dynamics": 0.25},
+            "grad_component_max_abs": {"typed_dynamics": 0.1},
+            "grad_component_param_count": {"typed_dynamics": 128.0},
             "router_entropy": 1.2,
             "v7_latent_delta": 0.03,
             **metrics,
@@ -2300,8 +2309,10 @@ def test_training_diagnostics_helper_writes_step_artifacts_and_scalar_metrics(tm
     assert dynamics_path is not None
     assert dynamics_path.exists()
     line = dynamics_path.read_text(encoding="utf-8").strip()
+    event = json.loads(line)
     assert '"phase": "post_optimizer"' in line
     assert '"v7_latent_delta": 0.03' in line
+    assert event["gradients"]["grad_component_total_norm"]["typed_dynamics"] == pytest.approx(0.25)
 
 
 def test_topk_moe_sparse_dispatch_matches_dense_dispatch():

@@ -99,6 +99,20 @@ Training dynamics trace update on 2026-05-31:
 - Local 2-step CPU smoke verified that `dynamics_events.jsonl` is produced and
   contains packet-linked dynamics events; the smoke run was removed.
 
+Gradient/component diagnostics update on 2026-05-31:
+
+- Added diagnostics-only per-module gradient component grouping. Events now
+  include grouped total norm, max absolute gradient, and parameter count for
+  broad components such as attention, router/gate, MoE experts, world state,
+  self state, typed dynamics, embeddings, norms, and LM head.
+- Gradient component stats are collected after AMP unscale and before clipping,
+  so the values describe the actual step gradient pressure rather than clipped
+  artifacts.
+- Added recent-event bad-gradient window snapshots:
+  `training_diagnostics/window_bad_grad_step_*.json`.
+- Local 2-step CPU smoke verified that `dynamics_events.jsonl` includes
+  gradient component diagnostics; the smoke run was removed.
+
 Important command:
 
 ```powershell
@@ -121,6 +135,8 @@ Important command:
   must remain outside the loss/objective path.
 - `metrics.jsonl` is the normal training metric stream; diagnostic event
   causality should be read from `training_diagnostics/dynamics_events.jsonl`.
+- Gradient component diagnostics are for attribution and anomaly localization;
+  they must not become optimization targets.
 - Do not create one-off monitoring scripts when a unified probe already exists.
 - Keep remote commands windowless and use the established `remote.ps1` path.
 - Keep `pony_remote/`, `analysis/`, `bin/`, checkpoints, datasets, and local
@@ -133,6 +149,8 @@ Important command:
   only by offline checkpoint diagnostics.
 - A diagnostic smoke must prove both per-step packet artifacts and
   `dynamics_events.jsonl` are written.
+- A diagnostic smoke must prove gradient component diagnostics are present when
+  not disabled.
 - A real remote diagnostics run must produce `manifest.json`, `summary.json`,
   and `trace_events.jsonl`.
 - The remote report must include packet field interventions with finite

@@ -217,6 +217,17 @@ def parse_args() -> argparse.Namespace:
         help="Record event topology only; skip tensor statistics in training-time diagnostics.",
     )
     parser.add_argument(
+        "--diagnostics-no-grad-components",
+        action="store_true",
+        help="Skip per-module gradient norm grouping in diagnostics mode.",
+    )
+    parser.add_argument(
+        "--diagnostics-window-size",
+        type=int,
+        default=16,
+        help="Recent dynamics events retained in bad-gradient window snapshots.",
+    )
+    parser.add_argument(
         "--early-stop-patience",
         type=int,
         default=0,
@@ -733,6 +744,8 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         diagnostics_boundary_tokens=args.diagnostics_boundary_tokens,
         diagnostics_max_batch=args.diagnostics_max_batch,
         diagnostics_record_tensor_stats=not args.diagnostics_no_tensor_stats,
+        diagnostics_grad_components=not args.diagnostics_no_grad_components,
+        diagnostics_window_size=args.diagnostics_window_size,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
         early_stop_min_evals=args.early_stop_min_evals,

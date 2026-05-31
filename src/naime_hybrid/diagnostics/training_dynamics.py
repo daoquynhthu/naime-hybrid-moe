@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import torch
 
 CORE_KEYS = (
     "loss",
@@ -18,6 +19,12 @@ CORE_KEYS = (
     "grad_norm",
     "bad_grad_window_count",
     "lr_safety_factor",
+)
+
+GRADIENT_KEYS = (
+    "grad_component_total_norm",
+    "grad_component_max_abs",
+    "grad_component_param_count",
 )
 
 ROUTER_KEYS = (
@@ -88,6 +95,10 @@ def _clean_value(value: Any) -> Any:
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else str(value)
+    if isinstance(value, dict):
+        return {str(key): _clean_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clean_value(item) for item in value]
     try:
         item = value.item()
     except AttributeError:
@@ -101,6 +112,61 @@ def _select(payload: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
         if key in payload:
             selected[key] = _clean_value(payload[key])
     return selected
+
+
+def _gradient_group(name: str) -> str:
+    lowered = name.lower()
+    if "embed" in lowered or "tok_embeddings" in lowered:
+        return "embedding"
+    if "lm_head" in lowered or "output" in lowered:
+        return "lm_head"
+    if "router" in lowered or "gate" in lowered:
+        return "router_gate"
+    if "expert" in lowered or ".moe" in lowered:
+        return "moe_expert"
+    if "attention" in lowered or ".attn" in lowered or "q_proj" in lowered or "k_proj" in lowered or "v_proj" in lowered:
+        return "attention"
+    if "world" in lowered:
+        return "world_state"
+    if "self_state" in lowered or "recursive_self" in lowered:
+        return "self_state"
+    if "typed_dynamics" in lowered or "latent" in lowered or "controller" in lowered:
+        return "typed_dynamics"
+    if "norm" in lowered:
+        return "norm"
+    return "other"
+
+
+def collect_gradient_component_stats(model: torch.nn.Module) -> dict[str, dict[str, float]]:
+    groups: dict[str, dict[str, float]] = {}
+    for name, parameter in model.named_parameters():
+        grad = parameter.grad
+        if grad is None:
+            continue
+        group = _gradient_group(name)
+        stats = groups.setdefault(group, {"sum_sq": 0.0, "max_abs": 0.0, "param_count": 0.0})
+        detached = grad.detach().float()
+        finite = torch.isfinite(detached)
+        safe = detached.masked_fill(~finite, 0.0)
+        stats["sum_sq"] += float(torch.sum(safe * safe).cpu().item())
+        stats["max_abs"] = max(stats["max_abs"], float(safe.abs().max().cpu().item()) if safe.numel() else 0.0)
+        stats["param_count"] += float(parameter.numel())
+    return {
+        group: {
+            "total_norm": math.sqrt(max(values["sum_sq"], 0.0)),
+            "max_abs": values["max_abs"],
+            "param_count": values["param_count"],
+        }
+        for group, values in sorted(groups.items())
+    }
+
+
+def flatten_gradient_component_stats(stats: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+    return {
+        "grad_component_total_norm": {group: values["total_norm"] for group, values in stats.items()},
+        "grad_component_max_abs": {group: values["max_abs"] for group, values in stats.items()},
+        "grad_component_param_count": {group: values["param_count"] for group, values in stats.items()},
+    }
 
 
 def build_training_dynamics_event(
@@ -118,6 +184,7 @@ def build_training_dynamics_event(
         "router": _select(payload, ROUTER_KEYS),
         "state": _select(payload, STATE_KEYS),
         "packet": _select(payload, PACKET_KEYS),
+        "gradients": _select(payload, GRADIENT_KEYS),
     }
     if tags:
         event["tags"] = {str(key): _clean_value(value) for key, value in tags.items()}

@@ -19,7 +19,9 @@ from naime_hybrid.diagnostics import (
     TraceContext,
     append_training_dynamics_event,
     build_training_dynamics_event,
+    collect_gradient_component_stats,
     diagnostics_root,
+    flatten_gradient_component_stats,
     run_state_packet_diagnostics,
 )
 from naime_hybrid.models import build_model
@@ -371,13 +373,39 @@ def _write_training_dynamics_event(
     step: int,
     phase: str,
     payload: dict,
+    recent_events: deque | None = None,
     tags: dict | None = None,
 ) -> Path | None:
     if not _training_diagnostics_enabled(config):
         return None
     root = diagnostics_root(run_dir, config.diagnostics_output_dir)
     event = build_training_dynamics_event(step=step, phase=phase, payload=payload, tags=tags)
+    if recent_events is not None:
+        recent_events.append(event)
     return append_training_dynamics_event(root, event)
+
+
+def _write_diagnostics_window_snapshot(
+    *,
+    config,
+    run_dir: Path,
+    step: int,
+    reason: str,
+    recent_events: deque,
+) -> Path | None:
+    if not _training_diagnostics_enabled(config):
+        return None
+    root = diagnostics_root(run_dir, config.diagnostics_output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"window_{reason}_step_{int(step):08d}.json"
+    payload = {
+        "reason": reason,
+        "step": int(step),
+        "event_count": len(recent_events),
+        "events": list(recent_events),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    return path
 
 
 def _apply_self_state_warmup(model: torch.nn.Module, config, step: int) -> tuple[float, float]:
@@ -1072,6 +1100,7 @@ def main() -> None:
     progress = TrainingProgress(config.max_steps, config.architecture)
     stop_signals = StopSignalMonitor()
     stop_signals.install(stop_file=stop_path)
+    recent_diagnostics_events: deque = deque(maxlen=max(1, int(config.diagnostics_window_size)))
     try:
         for step in range(start_step + 1, config.max_steps + 1):
             diagnostics_due = _training_diagnostics_enabled(config) and step % int(config.diagnostics_every) == 0
@@ -1339,8 +1368,14 @@ def main() -> None:
 
             if config.grad_clip > 0:
                 scaler.unscale_(optimizer)
+                grad_component_payload = {}
+                if diagnostics_due and bool(config.diagnostics_grad_components):
+                    grad_component_payload = flatten_gradient_component_stats(collect_gradient_component_stats(model))
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             else:
+                grad_component_payload = {}
+                if diagnostics_due and bool(config.diagnostics_grad_components):
+                    grad_component_payload = flatten_gradient_component_stats(collect_gradient_component_stats(model))
                 grad_norm = torch.tensor(0.0)
 
             if not torch.isfinite(grad_norm) or float(grad_norm) > 20.0:
@@ -1366,6 +1401,11 @@ def main() -> None:
                         "lr": scheduler.get_last_lr()[0],
                         "grad_norm": float(grad_norm) if torch.isfinite(grad_norm) else float("nan"),
                         **metrics,
+                        **(
+                            flatten_gradient_component_stats(collect_gradient_component_stats(model))
+                            if bool(config.diagnostics_grad_components)
+                            else {}
+                        ),
                     }
                     _write_training_dynamics_event(
                         config=config,
@@ -1373,11 +1413,19 @@ def main() -> None:
                         step=step,
                         phase="bad_grad_skip",
                         payload=bad_grad_payload,
+                        recent_events=recent_diagnostics_events,
                         tags={
                             "bad_grad_type": bad_grad_type,
                             "nan_streak": nan_streak,
                             "grad_explosion_streak": grad_explosion_streak,
                         },
+                    )
+                    _write_diagnostics_window_snapshot(
+                        config=config,
+                        run_dir=run_dir,
+                        step=step,
+                        reason="bad_grad",
+                        recent_events=recent_diagnostics_events,
                     )
                 logger.warning("bad grad at step %d %s; skipping step", step, tag)
                 if (
@@ -1481,6 +1529,7 @@ def main() -> None:
                 "tokens": tokens,
                 "grad_norm": float(grad_norm),
                 **metrics,
+                **grad_component_payload,
             }
 
             if stop_signals.requested:
@@ -1526,6 +1575,7 @@ def main() -> None:
                     step=step,
                     phase="post_optimizer",
                     payload=log_payload,
+                    recent_events=recent_diagnostics_events,
                     tags={
                         "grad_accum_steps": config.grad_accum_steps,
                         "diagnostics_max_batch": config.diagnostics_max_batch,

@@ -53,6 +53,8 @@ class TrainConfig:
     diagnostics_boundary_tokens: int = 64
     diagnostics_max_batch: int = 2
     diagnostics_record_tensor_stats: bool = True
+    diagnostics_grad_components: bool = True
+    diagnostics_window_size: int = 16
     early_stop_patience: int = 0
     early_stop_min_delta: float = 0.0
     early_stop_min_evals: int = 0
