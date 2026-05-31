@@ -46,6 +46,11 @@ Implemented / in progress:
   controller/memory;
 - boundary/full/tail loss views;
 - CLI module and PowerShell wrapper for reproducible diagnostics runs.
+- explicit training-time diagnostics mode, disabled by default;
+- `--diagnostics-mode` + `--diagnostics-every N` training loop integration;
+- per-step training diagnostics artifacts under `training_diagnostics/step_*`;
+- scalar training diagnostics summary fields in `metrics.jsonl` without
+  dumping full token curves into the main metric stream.
 
 Phase result on 2026-05-31:
 
@@ -67,6 +72,20 @@ checkpoint shows slightly negative packet carry on the sampled validation
 batch. This is not yet an architecture verdict; it proves the tool can expose
 field-level packet effects.
 
+Training-time diagnostics update on 2026-05-31:
+
+- Added `TrainConfig` and CLI controls for dedicated diagnostics mode:
+  `--diagnostics-mode`, `--diagnostics-every`, `--diagnostics-output-dir`,
+  `--diagnostics-chunk-len`, `--diagnostics-boundary-tokens`,
+  `--diagnostics-max-batch`, and `--diagnostics-no-tensor-stats`.
+- Normal training remains unchanged unless both `--diagnostics-mode` and a
+  positive `--diagnostics-every` are supplied.
+- Diagnostics run on the current micro-batch after the optimizer step, under
+  `no_grad`/eval mode, using the uncompiled model when `torch.compile` wraps
+  training.
+- Local 2-step CPU smoke verified that step artifacts are written and
+  diagnostics scalars appear in `metrics.jsonl`; the smoke run was removed.
+
 Important command:
 
 ```powershell
@@ -85,6 +104,8 @@ Important command:
 - Do not resume polluted checkpoints across causal-integrity or state-protocol
   changes.
 - Do not let diagnostics become part of normal training behavior.
+- Training-time diagnostics are allowed only in explicit diagnostics mode; they
+  must remain outside the loss/objective path.
 - Do not create one-off monitoring scripts when a unified probe already exists.
 - Keep remote commands windowless and use the established `remote.ps1` path.
 - Keep `pony_remote/`, `analysis/`, `bin/`, checkpoints, datasets, and local
@@ -93,6 +114,8 @@ Important command:
 ## Next Required Gates
 
 - Local tests must pass after diagnostics changes.
+- Training-time diagnostics must be verified by a real training-loop smoke, not
+  only by offline checkpoint diagnostics.
 - A real remote diagnostics run must produce `manifest.json`, `summary.json`,
   and `trace_events.jsonl`.
 - The remote report must include packet field interventions with finite

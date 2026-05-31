@@ -46,6 +46,13 @@ class TrainConfig:
     eval_doc_continuity: bool = False
     eval_doc_continuity_docs: int = 32
     eval_doc_continuity_chunks: int = 4
+    diagnostics_mode: bool = False
+    diagnostics_every: int = 0
+    diagnostics_output_dir: str | None = None
+    diagnostics_chunk_len: int | None = None
+    diagnostics_boundary_tokens: int = 64
+    diagnostics_max_batch: int = 2
+    diagnostics_record_tensor_stats: bool = True
     early_stop_patience: int = 0
     early_stop_min_delta: float = 0.0
     early_stop_min_evals: int = 0

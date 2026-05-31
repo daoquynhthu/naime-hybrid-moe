@@ -178,6 +178,45 @@ def parse_args() -> argparse.Namespace:
         help="How many consecutive chunks to follow inside each continuity trace.",
     )
     parser.add_argument(
+        "--diagnostics-mode",
+        action="store_true",
+        help="Enable training-time data-flow diagnostics. Disabled by default for real training.",
+    )
+    parser.add_argument(
+        "--diagnostics-every",
+        type=int,
+        default=0,
+        help="Run training-time packet diagnostics every N optimizer steps when --diagnostics-mode is set.",
+    )
+    parser.add_argument(
+        "--diagnostics-output-dir",
+        default=None,
+        help="Optional diagnostics artifact root. Defaults to <run_dir>/training_diagnostics.",
+    )
+    parser.add_argument(
+        "--diagnostics-chunk-len",
+        type=int,
+        default=None,
+        help="Chunk length for training-time packet diagnostics. Defaults to --stateful-chunk-len or half sequence.",
+    )
+    parser.add_argument(
+        "--diagnostics-boundary-tokens",
+        type=int,
+        default=64,
+        help="Boundary window used by training-time state carry diagnostics.",
+    )
+    parser.add_argument(
+        "--diagnostics-max-batch",
+        type=int,
+        default=2,
+        help="Maximum current-batch samples used by diagnostics to keep explicit mode bounded.",
+    )
+    parser.add_argument(
+        "--diagnostics-no-tensor-stats",
+        action="store_true",
+        help="Record event topology only; skip tensor statistics in training-time diagnostics.",
+    )
+    parser.add_argument(
         "--early-stop-patience",
         type=int,
         default=0,
@@ -687,6 +726,13 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         eval_doc_continuity=args.eval_doc_continuity,
         eval_doc_continuity_docs=args.eval_doc_continuity_docs,
         eval_doc_continuity_chunks=args.eval_doc_continuity_chunks,
+        diagnostics_mode=args.diagnostics_mode,
+        diagnostics_every=args.diagnostics_every,
+        diagnostics_output_dir=args.diagnostics_output_dir,
+        diagnostics_chunk_len=args.diagnostics_chunk_len,
+        diagnostics_boundary_tokens=args.diagnostics_boundary_tokens,
+        diagnostics_max_batch=args.diagnostics_max_batch,
+        diagnostics_record_tensor_stats=not args.diagnostics_no_tensor_stats,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
         early_stop_min_evals=args.early_stop_min_evals,

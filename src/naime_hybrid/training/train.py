@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import DataLoader, RandomSampler, Sampler
 
 from naime_hybrid.data import HFDiskCausalDataset
+from naime_hybrid.diagnostics import TraceConfig, TraceContext, run_state_packet_diagnostics
 from naime_hybrid.models import build_model
 from naime_hybrid.modules.blocks import DenseTransformerBlock
 
@@ -265,6 +266,94 @@ def _stateful_carry_objective(
         "full_lambda": metric_tensor.new_tensor(full_lambda),
         "target_margin": metric_tensor.new_tensor(target_margin),
         "batch_active": metric_tensor.new_tensor(1.0),
+    }
+
+
+def _training_diagnostics_enabled(config) -> bool:
+    return bool(config.diagnostics_mode) and int(config.diagnostics_every) > 0
+
+
+def _diagnostics_sample_from_batch(
+    *,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    infer_pad_mask: bool | None,
+    max_batch: int,
+) -> dict[str, torch.Tensor | bool | None]:
+    limit = max(1, min(int(max_batch), int(input_ids.size(0))))
+    sample = {
+        "input_ids": input_ids[:limit].detach(),
+        "labels": labels[:limit].detach(),
+        "attention_mask": attention_mask[:limit].detach() if attention_mask is not None else None,
+        "infer_pad_mask": infer_pad_mask,
+    }
+    return sample
+
+
+def _run_training_diagnostics(
+    model,
+    *,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    infer_pad_mask: bool | None,
+    config,
+    run_dir: Path,
+    step: int,
+    use_amp: bool,
+    device: torch.device,
+) -> dict[str, float | str]:
+    """Run explicit training-time diagnostics without affecting the objective."""
+
+    native_model = getattr(model, "_orig_mod", model)
+    was_training = native_model.training
+    artifact_root = Path(config.diagnostics_output_dir) if config.diagnostics_output_dir else run_dir / "training_diagnostics"
+    output_dir = artifact_root / f"step_{int(step):08d}"
+    trace_context = TraceContext(
+        config=TraceConfig(
+            enabled=True,
+            record_tensor_stats=bool(config.diagnostics_record_tensor_stats),
+            record_metric_values=True,
+            record_packet_fields=True,
+            record_full_tensors=False,
+            output_dir=str(output_dir),
+            tags={"mode": "training_time", "step": str(int(step)), "run": str(run_dir.name)},
+        )
+    )
+
+    chunk_len = config.diagnostics_chunk_len or config.stateful_chunk_len
+    if chunk_len is None:
+        chunk_len = max(1, int(input_ids.size(1)) // 2)
+
+    try:
+        native_model.eval()
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+            report = run_state_packet_diagnostics(
+                native_model,
+                input_ids=input_ids,
+                labels=labels,
+                attention_mask=attention_mask,
+                infer_pad_mask=infer_pad_mask,
+                chunk_len=chunk_len,
+                boundary_tokens=int(config.diagnostics_boundary_tokens),
+                trace_context=trace_context,
+                output_dir=str(output_dir),
+            )
+    finally:
+        if was_training:
+            native_model.train()
+
+    metrics = report["metrics"]
+    summary = report["summary"]
+    return {
+        "diagnostics_enabled": 1.0,
+        "diagnostics_step": float(step),
+        "diagnostics_event_count": float(summary.get("event_count", 0)),
+        "diagnostics_full_gain": float(metrics.get("full_gain", 0.0)),
+        "diagnostics_boundary_gain": float(metrics.get("boundary_gain", 0.0)),
+        "diagnostics_tail_gain": float(metrics.get("tail_gain", 0.0)),
+        "diagnostics_output_dir": str(output_dir),
     }
 
 
@@ -772,6 +861,13 @@ def main() -> None:
     model_eval = model
     if config.compile_model:
         model = _compile_model(model, config, logger)
+    if _training_diagnostics_enabled(config):
+        logger.info(
+            "training diagnostics enabled every=%d max_batch=%d output=%s",
+            config.diagnostics_every,
+            config.diagnostics_max_batch,
+            config.diagnostics_output_dir or "<run_dir>/training_diagnostics",
+        )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -955,6 +1051,8 @@ def main() -> None:
     stop_signals.install(stop_file=stop_path)
     try:
         for step in range(start_step + 1, config.max_steps + 1):
+            diagnostics_due = _training_diagnostics_enabled(config) and step % int(config.diagnostics_every) == 0
+            diagnostics_sample = None
             effective_self_hidden_scale, effective_self_context_score_scale = _apply_self_state_warmup(
                 model_eval,
                 config,
@@ -993,6 +1091,14 @@ def main() -> None:
                     batch.get("attention_mask"),
                     device,
                 )
+                if diagnostics_due:
+                    diagnostics_sample = _diagnostics_sample_from_batch(
+                        input_ids=input_ids,
+                        labels=labels,
+                        attention_mask=attention_mask,
+                        infer_pad_mask=infer_pad_mask,
+                        max_batch=config.diagnostics_max_batch,
+                    )
 
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                     use_fused_lm = config.lm_loss_backend == "cuda_ext_fused_ce"
@@ -1349,6 +1455,22 @@ def main() -> None:
                 )
                 logger.info("signal checkpoint saved by subprocess; exiting cleanly")
                 break
+
+            if diagnostics_due and diagnostics_sample is not None:
+                log_payload.update(
+                    _run_training_diagnostics(
+                        model_eval,
+                        input_ids=diagnostics_sample["input_ids"],
+                        labels=diagnostics_sample["labels"],
+                        attention_mask=diagnostics_sample["attention_mask"],
+                        infer_pad_mask=diagnostics_sample["infer_pad_mask"],
+                        config=config,
+                        run_dir=run_dir,
+                        step=step,
+                        use_amp=use_amp,
+                        device=device,
+                    )
+                )
 
             if eval_loader is not None and (step % config.eval_every == 0 or step == config.max_steps):
                 eval_metrics = evaluate_model(

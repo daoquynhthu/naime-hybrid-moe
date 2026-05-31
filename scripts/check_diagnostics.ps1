@@ -33,7 +33,10 @@ try {
         "src\naime_hybrid\diagnostics\run_packet_diagnostics.py",
         "src\naime_hybrid\diagnostics\report_builder.py",
         "src\naime_hybrid\diagnostics\trace_context.py",
-        "src\naime_hybrid\diagnostics\emitter.py"
+        "src\naime_hybrid\diagnostics\emitter.py",
+        "src\naime_hybrid\training\train.py",
+        "src\naime_hybrid\training\config.py",
+        "src\naime_hybrid\training\cli.py"
     )
     Invoke-Quiet "architecture tests" @($python, "-m", "pytest", "tests\test_architecture_forward.py", "-q")
     $errs = $null

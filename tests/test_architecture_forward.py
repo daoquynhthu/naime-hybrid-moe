@@ -35,7 +35,7 @@ from naime_hybrid.training.control import reference_value_at_step, update_sparse
 from naime_hybrid.training.losses import boundary_token_weights, lm_loss, masked_token_average, token_lm_loss
 from naime_hybrid.training.masks import prepare_attention_mask_for_device
 from naime_hybrid.training.runtime import split_stateful_chunks
-from naime_hybrid.training.train import _apply_self_state_warmup, _stateful_carry_objective
+from naime_hybrid.training.train import _apply_self_state_warmup, _run_training_diagnostics, _stateful_carry_objective
 from naime_hybrid.training.validation import evaluate_model
 
 
@@ -252,7 +252,7 @@ def test_split_stateful_chunks_preserves_contiguous_causal_alignment():
     assert chunks[1]["attention_mask"].all()
 
 
-def test_cli_maps_stateful_carry_and_doc_continuity_flags(monkeypatch):
+def test_cli_maps_stateful_carry_doc_continuity_and_diagnostics_flags(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -264,6 +264,16 @@ def test_cli_maps_stateful_carry_and_doc_continuity_flags(monkeypatch):
             "7",
             "--eval-doc-continuity-chunks",
             "3",
+            "--diagnostics-mode",
+            "--diagnostics-every",
+            "25",
+            "--diagnostics-chunk-len",
+            "128",
+            "--diagnostics-boundary-tokens",
+            "32",
+            "--diagnostics-max-batch",
+            "3",
+            "--diagnostics-no-tensor-stats",
             "--stateful-batch-ratio",
             "0.1",
             "--stateful-chunk-len",
@@ -296,6 +306,12 @@ def test_cli_maps_stateful_carry_and_doc_continuity_flags(monkeypatch):
     assert config.eval_doc_continuity is True
     assert config.eval_doc_continuity_docs == 7
     assert config.eval_doc_continuity_chunks == 3
+    assert config.diagnostics_mode is True
+    assert config.diagnostics_every == 25
+    assert config.diagnostics_chunk_len == 128
+    assert config.diagnostics_boundary_tokens == 32
+    assert config.diagnostics_max_batch == 3
+    assert config.diagnostics_record_tensor_stats is False
     assert config.stateful_batch_ratio == pytest.approx(0.1)
     assert config.stateful_chunk_len == 256
     assert config.lambda_stateful_carry == pytest.approx(5e-4)
@@ -2199,6 +2215,65 @@ def test_state_packet_diagnostics_emits_report_and_writes_artifacts(tmp_path):
     assert report["summary"]["event_count"] >= 3
     assert (tmp_path / "trace_events.jsonl").exists()
     assert (tmp_path / "summary.json").exists()
+
+
+def test_training_diagnostics_helper_writes_step_artifacts_and_scalar_metrics(tmp_path):
+    torch.manual_seed(655)
+    model_config = NAIMEStateMoEConfig(
+        vocab_size=32,
+        max_seq_len=16,
+        d_model=16,
+        n_layers=2,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=32,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=2,
+        top_k=1,
+        expert_hidden_dim=24,
+        world_state_slots=2,
+        self_state_slots=2,
+        v7_dynamics_steps=1,
+        v7_latent_slots=2,
+    )
+    model = build_model("naime_v7_typed_dynamics", model_config)
+    train_config = TrainConfig(
+        architecture="naime_v7_typed_dynamics",
+        diagnostics_mode=True,
+        diagnostics_every=1,
+        diagnostics_chunk_len=8,
+        diagnostics_boundary_tokens=4,
+        diagnostics_output_dir=str(tmp_path / "diag_root"),
+        model=model_config,
+    )
+    input_ids = torch.randint(1, model_config.vocab_size, (2, model_config.max_seq_len))
+    labels = input_ids.clone()
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    metrics = _run_training_diagnostics(
+        model,
+        input_ids=input_ids,
+        labels=labels,
+        attention_mask=attention_mask,
+        infer_pad_mask=False,
+        config=train_config,
+        run_dir=tmp_path / "run",
+        step=5,
+        use_amp=False,
+        device=torch.device("cpu"),
+    )
+
+    assert metrics["diagnostics_enabled"] == pytest.approx(1.0)
+    assert metrics["diagnostics_event_count"] >= 3.0
+    assert math.isfinite(metrics["diagnostics_full_gain"])
+    assert math.isfinite(metrics["diagnostics_boundary_gain"])
+    artifact_dir = tmp_path / "diag_root" / "step_00000005"
+    assert metrics["diagnostics_output_dir"] == str(artifact_dir)
+    assert (artifact_dir / "trace_events.jsonl").exists()
+    assert (artifact_dir / "summary.json").exists()
 
 
 def test_topk_moe_sparse_dispatch_matches_dense_dispatch():
