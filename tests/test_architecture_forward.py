@@ -17,7 +17,12 @@ from naime_hybrid import (
     build_model,
 )
 from naime_hybrid.data import HFDiskCausalDataset
-from naime_hybrid.diagnostics import TraceConfig, TraceContext, run_state_packet_diagnostics
+from naime_hybrid.diagnostics import (
+    TraceConfig,
+    TraceContext,
+    run_state_packet_diagnostics,
+    write_training_diagnostics_report,
+)
 from naime_hybrid.modules.gate import GumbelBlockGate
 from naime_hybrid.modules.moe import TopKMoE
 from naime_hybrid.modules.self_state import RecursiveSelfState
@@ -2321,6 +2326,56 @@ def test_training_diagnostics_helper_writes_step_artifacts_and_scalar_metrics(tm
     assert '"v7_latent_delta": 0.03' in line
     assert event["gradients"]["grad_component_total_norm"]["typed_dynamics"] == pytest.approx(0.25)
     assert event["gradients"]["loss_grad_component_norm"]["lm"]["typed_dynamics"] == pytest.approx(0.12)
+
+
+def test_training_diagnostics_report_summarizes_warnings_and_gradient_alignment(tmp_path):
+    diag_dir = tmp_path / "training_diagnostics"
+    diag_dir.mkdir()
+    events = [
+        {
+            "event": "training_dynamics",
+            "phase": "post_optimizer",
+            "step": 1,
+            "core": {"loss_lm": 2.0, "grad_norm": 0.5},
+            "router": {"router_entropy": 1.1},
+            "state": {"v7_latent_delta": 0.01},
+            "packet": {"diagnostics_boundary_gain": 0.02},
+            "gradients": {
+                "grad_component_total_norm": {"typed_dynamics": 0.7},
+                "loss_grad_component_norm": {"lm": {"typed_dynamics": 0.2}},
+                "loss_grad_component_cosine": {"lm": {"typed_dynamics": 0.8}},
+            },
+        },
+        {
+            "event": "training_dynamics",
+            "phase": "post_optimizer",
+            "step": 2,
+            "core": {"loss_lm": 1.8, "grad_norm": 0.8},
+            "router": {"router_entropy": 1.0},
+            "state": {"v7_latent_delta": 0.03},
+            "packet": {"diagnostics_boundary_gain": -0.01},
+            "gradients": {
+                "grad_component_total_norm": {"typed_dynamics": 1.2},
+                "loss_grad_component_norm": {"router": {"typed_dynamics": 0.4}},
+                "loss_grad_component_cosine": {"router": {"typed_dynamics": -0.2}},
+            },
+        },
+    ]
+    (diag_dir / "dynamics_events.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+
+    outputs = write_training_diagnostics_report(diag_dir)
+    report = json.loads(outputs["json"].read_text(encoding="utf-8"))
+    markdown = outputs["markdown"].read_text(encoding="utf-8")
+
+    assert report["event_count"] == 2
+    assert report["series"]["core.loss_lm"]["delta"] == pytest.approx(-0.2)
+    assert report["gradients"]["component_peak_total_norm"]["typed_dynamics"] == pytest.approx(1.2)
+    assert report["gradients"]["low_alignment"][0]["cosine"] == pytest.approx(-0.2)
+    assert any("boundary packet carry gain is negative" in item for item in report["warnings"])
+    assert "Low Alignment" in markdown
 
 
 def test_topk_moe_sparse_dispatch_matches_dense_dispatch():

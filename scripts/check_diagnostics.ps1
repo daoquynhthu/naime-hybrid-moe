@@ -35,6 +35,7 @@ try {
         "src\naime_hybrid\diagnostics\trace_context.py",
         "src\naime_hybrid\diagnostics\emitter.py",
         "src\naime_hybrid\diagnostics\training_dynamics.py",
+        "src\naime_hybrid\diagnostics\summarize_training_diagnostics.py",
         "src\naime_hybrid\training\train.py",
         "src\naime_hybrid\training\config.py",
         "src\naime_hybrid\training\cli.py"
@@ -47,6 +48,15 @@ try {
     )
     if ($errs) {
         Write-Error "FAILED: run_packet_diagnostics.ps1 parse`n$errs"
+        exit 1
+    }
+    $summaryErrs = $null
+    $null = [System.Management.Automation.PSParser]::Tokenize(
+        (Get-Content "scripts\summarize_training_diagnostics.ps1" -Raw),
+        [ref]$summaryErrs
+    )
+    if ($summaryErrs) {
+        Write-Error "FAILED: summarize_training_diagnostics.ps1 parse`n$summaryErrs"
         exit 1
     }
     $diffOutput = git diff --check 2>&1

@@ -131,6 +131,21 @@ Loss-component gradient attribution update on 2026-05-31:
   present in `training_diagnostics/dynamics_events.jsonl`; the smoke run was
   removed.
 
+Training diagnostics report update on 2026-05-31:
+
+- Added an automatic report builder for `training_diagnostics/dynamics_events.jsonl`.
+- New outputs:
+  `training_diagnostics/diagnostics_report.json` and
+  `training_diagnostics/diagnostics_report.md`.
+- The report summarizes phase counts, key metric series, packet carry trend,
+  gradient component peaks, loss-component gradient peaks, low cosine alignment,
+  and warning conditions such as bad-gradient skips or negative boundary carry
+  gain.
+- New script:
+  `scripts/summarize_training_diagnostics.ps1 -Path <training_diagnostics_dir>`.
+- Local 2-step CPU smoke verified end-to-end training diagnostics plus report
+  generation; the smoke run was removed.
+
 Important command:
 
 ```powershell
@@ -153,6 +168,8 @@ Important command:
   must remain outside the loss/objective path.
 - `metrics.jsonl` is the normal training metric stream; diagnostic event
   causality should be read from `training_diagnostics/dynamics_events.jsonl`.
+- Use `diagnostics_report.md` for quick human triage and
+  `diagnostics_report.json` for automated comparison.
 - Gradient component diagnostics are for attribution and anomaly localization;
   they must not become optimization targets.
 - Loss-component gradient probes are diagnostic replays only. They must not
@@ -174,6 +191,8 @@ Important command:
   not disabled.
 - A diagnostic smoke must prove loss-component gradient attribution is present
   when enabled and AMP scaler is disabled.
+- A diagnostic smoke must prove `diagnostics_report.json` and
+  `diagnostics_report.md` can be generated from the training-time event stream.
 - A real remote diagnostics run must produce `manifest.json`, `summary.json`,
   and `trace_events.jsonl`.
 - The remote report must include packet field interventions with finite

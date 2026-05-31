@@ -10,6 +10,11 @@ from .training_dynamics import (
     diagnostics_root,
     flatten_gradient_component_stats,
 )
+from .summarize_training_diagnostics import (
+    build_training_diagnostics_report,
+    render_training_diagnostics_markdown,
+    write_training_diagnostics_report,
+)
 
 
 def run_state_packet_diagnostics(*args, **kwargs):
@@ -25,10 +30,13 @@ __all__ = [
     "append_training_dynamics_event",
     "build_trace_summary",
     "build_training_dynamics_event",
+    "build_training_diagnostics_report",
     "collect_gradient_component_stats",
     "collect_loss_gradient_probe",
     "diagnostics_root",
     "flatten_gradient_component_stats",
+    "render_training_diagnostics_markdown",
     "run_state_packet_diagnostics",
+    "write_training_diagnostics_report",
     "write_trace_artifacts",
 ]
