@@ -35,7 +35,12 @@ from naime_hybrid.training.control import reference_value_at_step, update_sparse
 from naime_hybrid.training.losses import boundary_token_weights, lm_loss, masked_token_average, token_lm_loss
 from naime_hybrid.training.masks import prepare_attention_mask_for_device
 from naime_hybrid.training.runtime import split_stateful_chunks
-from naime_hybrid.training.train import _apply_self_state_warmup, _run_training_diagnostics, _stateful_carry_objective
+from naime_hybrid.training.train import (
+    _apply_self_state_warmup,
+    _run_training_diagnostics,
+    _stateful_carry_objective,
+    _write_training_dynamics_event,
+)
 from naime_hybrid.training.validation import evaluate_model
 
 
@@ -2274,6 +2279,29 @@ def test_training_diagnostics_helper_writes_step_artifacts_and_scalar_metrics(tm
     assert metrics["diagnostics_output_dir"] == str(artifact_dir)
     assert (artifact_dir / "trace_events.jsonl").exists()
     assert (artifact_dir / "summary.json").exists()
+
+    dynamics_path = _write_training_dynamics_event(
+        config=train_config,
+        run_dir=tmp_path / "run",
+        step=5,
+        phase="post_optimizer",
+        payload={
+            "loss": 1.0,
+            "loss_lm": 0.9,
+            "loss_aux": 0.1,
+            "lr": 1e-4,
+            "grad_norm": 0.5,
+            "router_entropy": 1.2,
+            "v7_latent_delta": 0.03,
+            **metrics,
+        },
+        tags={"test": True},
+    )
+    assert dynamics_path is not None
+    assert dynamics_path.exists()
+    line = dynamics_path.read_text(encoding="utf-8").strip()
+    assert '"phase": "post_optimizer"' in line
+    assert '"v7_latent_delta": 0.03' in line
 
 
 def test_topk_moe_sparse_dispatch_matches_dense_dispatch():

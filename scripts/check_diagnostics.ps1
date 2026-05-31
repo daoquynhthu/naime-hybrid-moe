@@ -34,6 +34,7 @@ try {
         "src\naime_hybrid\diagnostics\report_builder.py",
         "src\naime_hybrid\diagnostics\trace_context.py",
         "src\naime_hybrid\diagnostics\emitter.py",
+        "src\naime_hybrid\diagnostics\training_dynamics.py",
         "src\naime_hybrid\training\train.py",
         "src\naime_hybrid\training\config.py",
         "src\naime_hybrid\training\cli.py"

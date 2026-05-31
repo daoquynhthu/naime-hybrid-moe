@@ -14,7 +14,14 @@ import torch
 from torch.utils.data import DataLoader, RandomSampler, Sampler
 
 from naime_hybrid.data import HFDiskCausalDataset
-from naime_hybrid.diagnostics import TraceConfig, TraceContext, run_state_packet_diagnostics
+from naime_hybrid.diagnostics import (
+    TraceConfig,
+    TraceContext,
+    append_training_dynamics_event,
+    build_training_dynamics_event,
+    diagnostics_root,
+    run_state_packet_diagnostics,
+)
 from naime_hybrid.models import build_model
 from naime_hybrid.modules.blocks import DenseTransformerBlock
 
@@ -308,7 +315,7 @@ def _run_training_diagnostics(
 
     native_model = getattr(model, "_orig_mod", model)
     was_training = native_model.training
-    artifact_root = Path(config.diagnostics_output_dir) if config.diagnostics_output_dir else run_dir / "training_diagnostics"
+    artifact_root = diagnostics_root(run_dir, config.diagnostics_output_dir)
     output_dir = artifact_root / f"step_{int(step):08d}"
     trace_context = TraceContext(
         config=TraceConfig(
@@ -355,6 +362,22 @@ def _run_training_diagnostics(
         "diagnostics_tail_gain": float(metrics.get("tail_gain", 0.0)),
         "diagnostics_output_dir": str(output_dir),
     }
+
+
+def _write_training_dynamics_event(
+    *,
+    config,
+    run_dir: Path,
+    step: int,
+    phase: str,
+    payload: dict,
+    tags: dict | None = None,
+) -> Path | None:
+    if not _training_diagnostics_enabled(config):
+        return None
+    root = diagnostics_root(run_dir, config.diagnostics_output_dir)
+    event = build_training_dynamics_event(step=step, phase=phase, payload=payload, tags=tags)
+    return append_training_dynamics_event(root, event)
 
 
 def _apply_self_state_warmup(model: torch.nn.Module, config, step: int) -> tuple[float, float]:
@@ -1327,9 +1350,35 @@ def main() -> None:
                 if not torch.isfinite(grad_norm):
                     nan_streak += 1
                     tag = f"NaN streak={nan_streak}"
+                    bad_grad_type = "non_finite"
                 else:
                     grad_explosion_streak += 1
                     tag = f"explosion streak={grad_explosion_streak} grad={float(grad_norm):.1f}"
+                    bad_grad_type = "explosion"
+                if _training_diagnostics_enabled(config):
+                    bad_grad_payload = {
+                        "record_type": "diagnostics_bad_grad",
+                        "step": step,
+                        "loss": batch_loss / max(1, config.grad_accum_steps),
+                        "loss_lm": batch_lm_loss / max(1, config.grad_accum_steps),
+                        "loss_total": batch_loss / max(1, config.grad_accum_steps),
+                        "loss_aux": (batch_loss - batch_lm_loss) / max(1, config.grad_accum_steps),
+                        "lr": scheduler.get_last_lr()[0],
+                        "grad_norm": float(grad_norm) if torch.isfinite(grad_norm) else float("nan"),
+                        **metrics,
+                    }
+                    _write_training_dynamics_event(
+                        config=config,
+                        run_dir=run_dir,
+                        step=step,
+                        phase="bad_grad_skip",
+                        payload=bad_grad_payload,
+                        tags={
+                            "bad_grad_type": bad_grad_type,
+                            "nan_streak": nan_streak,
+                            "grad_explosion_streak": grad_explosion_streak,
+                        },
+                    )
                 logger.warning("bad grad at step %d %s; skipping step", step, tag)
                 if (
                     len(bad_grad_window) >= bad_grad_window_threshold
@@ -1470,6 +1519,17 @@ def main() -> None:
                         use_amp=use_amp,
                         device=device,
                     )
+                )
+                _write_training_dynamics_event(
+                    config=config,
+                    run_dir=run_dir,
+                    step=step,
+                    phase="post_optimizer",
+                    payload=log_payload,
+                    tags={
+                        "grad_accum_steps": config.grad_accum_steps,
+                        "diagnostics_max_batch": config.diagnostics_max_batch,
+                    },
                 )
 
             if eval_loader is not None and (step % config.eval_every == 0 or step == config.max_steps):

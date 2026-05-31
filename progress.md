@@ -86,6 +86,19 @@ Training-time diagnostics update on 2026-05-31:
 - Local 2-step CPU smoke verified that step artifacts are written and
   diagnostics scalars appear in `metrics.jsonl`; the smoke run was removed.
 
+Training dynamics trace update on 2026-05-31:
+
+- Added `training_diagnostics/dynamics_events.jsonl` as a dedicated
+  training-time event stream, separate from normal `metrics.jsonl`.
+- Each diagnostics step now binds core loss/LR/grad fields, router fields,
+  V5/V6/V7 state fields, and packet carry diagnostics into one
+  `post_optimizer` event.
+- Bad-gradient skips in diagnostics mode now emit `bad_grad_skip` events before
+  the optimizer step is skipped, preserving the state/route/grad context that
+  would otherwise be lost.
+- Local 2-step CPU smoke verified that `dynamics_events.jsonl` is produced and
+  contains packet-linked dynamics events; the smoke run was removed.
+
 Important command:
 
 ```powershell
@@ -106,6 +119,8 @@ Important command:
 - Do not let diagnostics become part of normal training behavior.
 - Training-time diagnostics are allowed only in explicit diagnostics mode; they
   must remain outside the loss/objective path.
+- `metrics.jsonl` is the normal training metric stream; diagnostic event
+  causality should be read from `training_diagnostics/dynamics_events.jsonl`.
 - Do not create one-off monitoring scripts when a unified probe already exists.
 - Keep remote commands windowless and use the established `remote.ps1` path.
 - Keep `pony_remote/`, `analysis/`, `bin/`, checkpoints, datasets, and local
@@ -116,6 +131,8 @@ Important command:
 - Local tests must pass after diagnostics changes.
 - Training-time diagnostics must be verified by a real training-loop smoke, not
   only by offline checkpoint diagnostics.
+- A diagnostic smoke must prove both per-step packet artifacts and
+  `dynamics_events.jsonl` are written.
 - A real remote diagnostics run must produce `manifest.json`, `summary.json`,
   and `trace_events.jsonl`.
 - The remote report must include packet field interventions with finite

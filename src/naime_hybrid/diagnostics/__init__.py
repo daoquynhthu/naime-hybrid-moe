@@ -2,6 +2,7 @@ from .interventions import InterventionSpec
 from .report_builder import build_trace_summary, write_trace_artifacts
 from .trace_config import TraceConfig
 from .trace_context import TraceContext
+from .training_dynamics import append_training_dynamics_event, build_training_dynamics_event, diagnostics_root
 
 
 def run_state_packet_diagnostics(*args, **kwargs):
@@ -14,7 +15,10 @@ __all__ = [
     "InterventionSpec",
     "TraceConfig",
     "TraceContext",
+    "append_training_dynamics_event",
     "build_trace_summary",
+    "build_training_dynamics_event",
+    "diagnostics_root",
     "run_state_packet_diagnostics",
     "write_trace_artifacts",
 ]
