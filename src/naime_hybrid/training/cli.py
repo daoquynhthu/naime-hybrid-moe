@@ -380,6 +380,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-state-hidden-scale-warmup-steps", type=int, default=0)
     parser.add_argument("--self-state-context-score-warmup-steps", type=int, default=0)
     parser.add_argument("--self-state-context-score-start", type=float, default=1.0)
+    parser.add_argument("--stateful-boundary-tokens", type=int, default=64)
+    parser.add_argument("--stateful-boundary-decay", type=float, default=0.97)
+    parser.add_argument("--lambda-stateful-boundary", type=float, default=0.0)
+    parser.add_argument("--lambda-stateful-full", type=float, default=0.0)
+    parser.add_argument("--stateful-target-margin", type=float, default=0.0)
     parser.add_argument("--no-self-state-world-gate", action="store_true")
     parser.add_argument("--self-state-world-gate-min", type=float, default=0.10)
     parser.add_argument("--self-state-world-gate-scale", type=float, default=1.0)
@@ -730,6 +735,11 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         stateful_chunk_len=args.stateful_chunk_len,
         lambda_stateful_carry=args.lambda_stateful_carry,
         stateful_carry_margin=args.stateful_carry_margin,
+        stateful_boundary_tokens=args.stateful_boundary_tokens,
+        stateful_boundary_decay=args.stateful_boundary_decay,
+        lambda_stateful_boundary=args.lambda_stateful_boundary,
+        lambda_stateful_full=args.lambda_stateful_full,
+        stateful_target_margin=args.stateful_target_margin,
         self_state_hidden_scale_warmup_steps=args.self_state_hidden_scale_warmup_steps,
         self_state_context_score_warmup_steps=args.self_state_context_score_warmup_steps,
         self_state_context_score_start=args.self_state_context_score_start,

@@ -46,3 +46,4 @@ configs/workspace.local.json
 
 analysis/
 bin/
+pony_remote/

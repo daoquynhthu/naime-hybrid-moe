@@ -2,6 +2,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from naime_hybrid.diagnostics.emitter import emit_trace_event
+from naime_hybrid.diagnostics.trace_context import TraceContext
+
 from .norm import RMSNorm
 from .state_ops import state_softmax, state_softmax_matmul
 
@@ -97,6 +100,7 @@ class WorldStateSlots(nn.Module):
         token_semantic: torch.Tensor,
         slots: torch.Tensor,
         stride: int,
+        trace_context: TraceContext | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Read previous world-state per block, then write the current block.
 
@@ -217,12 +221,29 @@ class WorldStateSlots(nn.Module):
         else:
             traced_state = current.unsqueeze(1)
 
+        emit_trace_event(
+            trace_context,
+            name="v5.world_state.read_update_sequence",
+            kind="module",
+            stats=averaged,
+            tensors={
+                "hidden_states": hidden_states,
+                "token_semantic": token_semantic,
+                "state_context": context,
+                "weights": weights,
+                "confidence": confidence,
+                "traced_state": traced_state,
+            },
+            tags={"module": "world_state", "mode": "causal_sequence"},
+        )
+
         return context, weights, confidence, traced_state, averaged
 
     def update_slots(
         self,
         slots: torch.Tensor,
         semantic_summary: torch.Tensor,
+        trace_context: TraceContext | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         summary = semantic_summary.detach() if self.pred_detach_target else semantic_summary
         if slots.ndim == 4:
@@ -286,6 +307,20 @@ class WorldStateSlots(nn.Module):
             "slot_stability": stability_loss,
             "state_pred": state_pred_loss,
         }
+        emit_trace_event(
+            trace_context,
+            name="v5.world_state.update_slots",
+            kind="module",
+            stats=metrics,
+            tensors={
+                "slots_before": slots,
+                "semantic_summary": semantic_summary,
+                "slots_after": normalized_next,
+                "slot_write_weights": slot_write_weights,
+                "confidence": confidence,
+            },
+            tags={"module": "world_state", "mode": "slot_update"},
+        )
         return normalized_next, metrics
 
     def _mean_pairwise_cosine(self, slots: torch.Tensor) -> torch.Tensor:

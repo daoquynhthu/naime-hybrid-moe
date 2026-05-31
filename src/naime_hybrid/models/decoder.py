@@ -2,6 +2,8 @@ import torch
 from torch import nn
 
 from naime_hybrid.config import NAIMEStateMoEConfig
+from naime_hybrid.diagnostics.emitter import emit_trace_event
+from naime_hybrid.diagnostics.trace_context import TraceContext
 from naime_hybrid.models.state_packet import NAIMEStatePacket
 from naime_hybrid.modules.blocks import (
     DenseTransformerBlock,
@@ -879,6 +881,7 @@ class NAIMEV7TypedDynamicsDecoder(NAIMEV6RecursiveSelfMoEDecoder):
         attention_mask: torch.Tensor | None,
         latent_field_is_past: bool,
         v7_steps: int,
+        trace_context: TraceContext | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor | None, dict[str, torch.Tensor]]:
         chunk_size = int(self.config.v7_state_chunk_size)
         if chunk_size <= 0 or hidden_states.size(1) <= chunk_size:
@@ -896,6 +899,7 @@ class NAIMEV7TypedDynamicsDecoder(NAIMEV6RecursiveSelfMoEDecoder):
                 past_latent_field=latent_field_is_past,
                 past_latent_adapt_steps=int(self.config.v7_past_latent_adapt_steps),
                 apply_state_compatibility=False,
+                trace_context=trace_context,
             )
             metrics["v7_causal_segments"] = hidden_states.new_tensor(1.0)
             return hidden_states, world_state, self_state, latent_field, controller_state, metrics
@@ -926,6 +930,7 @@ class NAIMEV7TypedDynamicsDecoder(NAIMEV6RecursiveSelfMoEDecoder):
                 past_latent_field=readable_state_available,
                 past_latent_adapt_steps=adapt_steps,
                 apply_state_compatibility=False,
+                trace_context=trace_context,
             )
             segments.append(segment)
             metrics_by_segment.append(segment_metrics)
@@ -954,6 +959,7 @@ class NAIMEV7TypedDynamicsDecoder(NAIMEV6RecursiveSelfMoEDecoder):
         past_memory: torch.Tensor | None = None,
         detach_past_state: bool = True,
         return_state: bool = False,
+        trace_context: TraceContext | None = None,
     ) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
         attention_mask = _resolve_attention_mask(input_ids, attention_mask, self.config, infer_pad_mask)
 
@@ -992,6 +998,27 @@ class NAIMEV7TypedDynamicsDecoder(NAIMEV6RecursiveSelfMoEDecoder):
             or past_memory is not None
         )
         latent_field_is_past = latent_field is not None
+        emit_trace_event(
+            trace_context,
+            name="v7.decoder.ingress",
+            kind="protocol_boundary",
+            stats={
+                "detach_past_state": detach_past_state,
+                "ingress_state_is_past": ingress_state_is_past,
+                "latent_field_is_past": latent_field_is_past,
+                "seq_len": int(hidden_states.size(1)),
+            },
+            packet=past_state,
+            tensors={
+                "hidden_states": hidden_states,
+                "world_state": world_state,
+                "self_state": self_state,
+                "latent_field": latent_field,
+                "controller_state": controller_state,
+                "memory": memory,
+            },
+            tags={"architecture": "naime_v7"},
+        )
         world_state = _public_state(world_state)
         self_state = _public_state(self_state)
         world_prior = self._initial_world_state(batch_size, hidden_states.device, hidden_states.dtype)
@@ -1027,6 +1054,20 @@ class NAIMEV7TypedDynamicsDecoder(NAIMEV6RecursiveSelfMoEDecoder):
                 enabled=ingress_state_is_past,
             )
         )
+        emit_trace_event(
+            trace_context,
+            name="v7.decoder.ingress_compatibility",
+            kind="state_edge",
+            stats=ingress_metrics,
+            tensors={
+                "world_state": world_state,
+                "self_state": self_state,
+                "latent_field": latent_field,
+                "controller_state": controller_state,
+                "memory": memory,
+            },
+            tags={"architecture": "naime_v7"},
+        )
 
         aux_by_layer = []
         field_trace_is_past = (
@@ -1057,6 +1098,7 @@ class NAIMEV7TypedDynamicsDecoder(NAIMEV6RecursiveSelfMoEDecoder):
                     tau=tau,
                     world_state=world_state,
                     memory=memory,
+                    trace_context=trace_context,
                 )
                 hidden_states, self_state, v6_aux = self.self_state_slots(
                     hidden_states,
@@ -1065,6 +1107,7 @@ class NAIMEV7TypedDynamicsDecoder(NAIMEV6RecursiveSelfMoEDecoder):
                     self_state=self_state,
                     causal_safe=self.config.semantic_causal,
                     block_size=max(self.config.stride, self.config.causal_state_stride),
+                    trace_context=trace_context,
                 )
                 aux["v6"] = v6_aux
                 if field_aux is not None:
@@ -1094,6 +1137,7 @@ class NAIMEV7TypedDynamicsDecoder(NAIMEV6RecursiveSelfMoEDecoder):
             attention_mask=attention_mask,
             latent_field_is_past=latent_field_is_past,
             v7_steps=v7_steps,
+            trace_context=trace_context,
         )
         if return_aux and aux_by_layer:
             aux_by_layer[-1].setdefault("v6", {}).update(evolution_metrics)
@@ -1121,6 +1165,22 @@ class NAIMEV7TypedDynamicsDecoder(NAIMEV6RecursiveSelfMoEDecoder):
                 memory=memory,
                 controller_state=controller_state,
                 architecture_id="naime_v7_typed_dynamics",
+            )
+            emit_trace_event(
+                trace_context,
+                name="v7.decoder.egress",
+                kind="protocol_boundary",
+                stats={"return_state": True},
+                packet=output["state_packet"],
+                tensors={
+                    "hidden_states": hidden_states,
+                    "world_state": public_world_state,
+                    "self_state": public_self_state,
+                    "latent_field": latent_field,
+                    "controller_state": controller_state,
+                    "memory": memory,
+                },
+                tags={"architecture": "naime_v7"},
             )
         if return_logits:
             output["logits"] = self.lm_head(hidden_states)

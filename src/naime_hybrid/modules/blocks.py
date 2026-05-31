@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from naime_hybrid.config import NAIMEStateMoEConfig
+from naime_hybrid.diagnostics.emitter import emit_trace_event
 
 from .attention import GQAAttention, MLAAttention
 from .moe import SwiGLUExpert, TopKMoE
@@ -365,6 +366,7 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
         tau: float | None = None,
         world_state: torch.Tensor | None = None,
         memory: torch.Tensor | None = None,
+        trace_context=None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor | None, torch.Tensor | None]:
         hidden_states = hidden_states + self.attn(self.attn_norm(hidden_states), attention_mask)
 
@@ -439,6 +441,7 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
                     token_semantic,
                     world_state,
                     stride=max(self.config.stride, self.config.causal_state_stride),
+                    trace_context=trace_context,
                 )
             )
             world_component, raw_world_component, world_router_gate = self._world_router_component(
@@ -478,7 +481,11 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
         denom = mask_f.sum(dim=1).clamp_min(1.0)
         semantic_summary = (router_semantic * mask_f).sum(dim=1) / denom
         if self.world_state_slots is not None and world_state is not None and not self.config.semantic_causal:
-            world_state, v5_metrics = self.world_state_slots.update_slots(world_state, semantic_summary)
+            world_state, v5_metrics = self.world_state_slots.update_slots(
+                world_state,
+                semantic_summary,
+                trace_context=trace_context,
+            )
         elif self.world_state_slots is None or world_state is None:
             v5_metrics = {
                 "slot_update_gate": torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype),
@@ -596,6 +603,19 @@ class NAIMEV5WorldStateMoEBlock(NAIMEV4StateMoEBlock):
                 ),
             },
         }
+        emit_trace_event(
+            trace_context,
+            name="v5.block.router",
+            kind="module",
+            stats=aux["v5"],
+            tensors={
+                "router_semantic": router_semantic,
+                "world_component": world_component,
+                "state_context": state_context,
+                "world_state": world_state,
+            },
+            tags={"module": "v5_block", "world_router_mode": self.config.world_router_mode},
+        )
         return hidden_states, aux, world_state, memory
 
 

@@ -61,6 +61,11 @@ param(
     [int]$StatefulChunkLen = -1,
     [double]$LambdaStatefulCarry = -1.0,
     [double]$StatefulCarryMargin = -1.0,
+    [int]$StatefulBoundaryTokens = -1,
+    [double]$StatefulBoundaryDecay = -1.0,
+    [double]$LambdaStatefulBoundary = -1.0,
+    [double]$LambdaStatefulFull = -1.0,
+    [double]$StatefulTargetMargin = -1.0,
     [int]$SelfStateHiddenScaleWarmupSteps = -1,
     [int]$SelfStateContextScoreWarmupSteps = -1,
     [double]$SelfStateContextScoreStart = -1.0,
@@ -273,6 +278,11 @@ Add-Override $params "StatefulBatchRatio" $StatefulBatchRatio { $StatefulBatchRa
 Add-Override $params "StatefulChunkLen" $StatefulChunkLen { $StatefulChunkLen -gt 0 }
 Add-Override $params "LambdaStatefulCarry" $LambdaStatefulCarry { $LambdaStatefulCarry -ge 0.0 }
 Add-Override $params "StatefulCarryMargin" $StatefulCarryMargin { $StatefulCarryMargin -ge 0.0 }
+Add-Override $params "StatefulBoundaryTokens" $StatefulBoundaryTokens { $StatefulBoundaryTokens -gt 0 }
+Add-Override $params "StatefulBoundaryDecay" $StatefulBoundaryDecay { $StatefulBoundaryDecay -gt 0.0 }
+Add-Override $params "LambdaStatefulBoundary" $LambdaStatefulBoundary { $LambdaStatefulBoundary -ge 0.0 }
+Add-Override $params "LambdaStatefulFull" $LambdaStatefulFull { $LambdaStatefulFull -ge 0.0 }
+Add-Override $params "StatefulTargetMargin" $StatefulTargetMargin { $StatefulTargetMargin -ge 0.0 }
 Add-Override $params "SelfStateHiddenScaleWarmupSteps" $SelfStateHiddenScaleWarmupSteps {
     $SelfStateHiddenScaleWarmupSteps -ge 0
 }

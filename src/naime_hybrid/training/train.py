@@ -30,7 +30,14 @@ from .checkpoint_policy import save_checkpoint_pair
 from .cli import build_train_config, parse_args
 from .control import effective_kl_lambda, load_reference_curve, reference_value_at_step
 from .logging_utils import JsonlMetricLogger, metrics_jsonl_to_csv, setup_logger
-from .losses import collect_aux_losses, fused_lm_loss, lm_loss
+from .losses import (
+    boundary_token_weights,
+    collect_aux_losses,
+    fused_lm_loss,
+    lm_loss,
+    masked_token_average,
+    token_lm_loss,
+)
 from .masks import prepare_attention_mask_for_device
 from .prefetch import AsyncPrefetcher
 from .progress import TrainingProgress
@@ -162,7 +169,13 @@ def _stateful_carry_objective(
     use_amp: bool,
     device: torch.device,
 ):
-    if config.stateful_batch_ratio <= 0.0 or config.lambda_stateful_carry <= 0.0:
+    boundary_lambda = (
+        float(config.lambda_stateful_boundary)
+        if float(config.lambda_stateful_boundary) > 0.0
+        else float(config.lambda_stateful_carry)
+    )
+    full_lambda = float(config.lambda_stateful_full)
+    if config.stateful_batch_ratio <= 0.0 or (boundary_lambda <= 0.0 and full_lambda <= 0.0):
         return None
     if torch.rand((), device=device).item() >= float(config.stateful_batch_ratio):
         return None
@@ -200,7 +213,7 @@ def _stateful_carry_objective(
             past_state=packet,
             detach_past_state=False,
         )
-        stateful_loss = lm_loss(stateful_out["logits"], second["labels"], backend=config.lm_loss_backend)
+        stateful_token_loss = token_lm_loss(stateful_out["logits"], second["labels"])
         with torch.no_grad():
             fresh_out = model(
                 second["input_ids"],
@@ -208,14 +221,50 @@ def _stateful_carry_objective(
                 infer_pad_mask=infer_pad_mask,
                 return_aux=False,
             )
-            fresh_loss = lm_loss(fresh_out["logits"], second["labels"], backend=config.lm_loss_backend)
-        carry_loss = torch.relu(stateful_loss - fresh_loss.detach() + float(config.stateful_carry_margin))
+            fresh_token_loss = token_lm_loss(fresh_out["logits"], second["labels"])
 
+        boundary_weights = boundary_token_weights(
+            second["labels"],
+            boundary_tokens=int(config.stateful_boundary_tokens),
+            decay=float(config.stateful_boundary_decay),
+        )
+        stateful_boundary_loss = masked_token_average(
+            stateful_token_loss,
+            second["labels"],
+            weights=boundary_weights,
+        )
+        fresh_boundary_loss = masked_token_average(
+            fresh_token_loss,
+            second["labels"],
+            weights=boundary_weights,
+        )
+        stateful_full_loss = masked_token_average(stateful_token_loss, second["labels"])
+        fresh_full_loss = masked_token_average(fresh_token_loss, second["labels"])
+
+        target_margin = (
+            float(config.stateful_target_margin)
+            if (float(config.lambda_stateful_boundary) > 0.0 or float(config.lambda_stateful_full) > 0.0)
+            else float(config.stateful_carry_margin)
+        )
+        boundary_carry_loss = torch.relu(stateful_boundary_loss - fresh_boundary_loss.detach() + target_margin)
+        full_carry_loss = torch.relu(stateful_full_loss - fresh_full_loss.detach() + target_margin)
+        total_carry_loss = boundary_lambda * boundary_carry_loss + full_lambda * full_carry_loss
+
+    metric_tensor = stateful_boundary_loss.detach()
     return {
-        "carry_loss": carry_loss,
-        "stateful_loss": stateful_loss.detach(),
-        "fresh_loss": fresh_loss.detach(),
-        "batch_active": input_ids.new_tensor(1.0),
+        "carry_loss": total_carry_loss,
+        "boundary_carry_loss": boundary_carry_loss,
+        "full_carry_loss": full_carry_loss,
+        "stateful_boundary_loss": stateful_boundary_loss.detach(),
+        "fresh_boundary_loss": fresh_boundary_loss.detach(),
+        "stateful_full_loss": stateful_full_loss.detach(),
+        "fresh_full_loss": fresh_full_loss.detach(),
+        "boundary_gap": (fresh_boundary_loss - stateful_boundary_loss).detach(),
+        "full_gap": (fresh_full_loss - stateful_full_loss).detach(),
+        "boundary_lambda": metric_tensor.new_tensor(boundary_lambda),
+        "full_lambda": metric_tensor.new_tensor(full_lambda),
+        "target_margin": metric_tensor.new_tensor(target_margin),
+        "batch_active": metric_tensor.new_tensor(1.0),
     }
 
 
@@ -1000,16 +1049,45 @@ def main() -> None:
                         device=device,
                     )
                     if stateful_carry is not None:
-                        stateful_carry_contrib = config.lambda_stateful_carry * stateful_carry["carry_loss"]
+                        stateful_carry_contrib = stateful_carry["carry_loss"]
                         stateful_carry_loss = stateful_carry["carry_loss"]
-                        stateful_loss_chunk2 = stateful_carry["stateful_loss"]
-                        fresh_loss_chunk2 = stateful_carry["fresh_loss"]
+                        stateful_boundary_loss = stateful_carry["stateful_boundary_loss"]
+                        fresh_boundary_loss = stateful_carry["fresh_boundary_loss"]
+                        stateful_boundary_gap = stateful_carry["boundary_gap"]
+                        stateful_boundary_hinge = stateful_carry["boundary_carry_loss"]
+                        stateful_full_loss = stateful_carry["stateful_full_loss"]
+                        fresh_full_loss = stateful_carry["fresh_full_loss"]
+                        stateful_full_gap = stateful_carry["full_gap"]
+                        stateful_full_hinge = stateful_carry["full_carry_loss"]
+                        stateful_boundary_lambda = stateful_carry["boundary_lambda"]
+                        stateful_full_lambda = stateful_carry["full_lambda"]
+                        stateful_target_margin = stateful_carry["target_margin"]
                         stateful_batch_active = stateful_carry["batch_active"]
                     else:
                         stateful_carry_contrib = main_loss.new_tensor(0.0)
                         stateful_carry_loss = main_loss.new_tensor(0.0)
-                        stateful_loss_chunk2 = main_loss.new_tensor(0.0)
-                        fresh_loss_chunk2 = main_loss.new_tensor(0.0)
+                        stateful_boundary_loss = main_loss.new_tensor(0.0)
+                        fresh_boundary_loss = main_loss.new_tensor(0.0)
+                        stateful_boundary_gap = main_loss.new_tensor(0.0)
+                        stateful_boundary_hinge = main_loss.new_tensor(0.0)
+                        stateful_full_loss = main_loss.new_tensor(0.0)
+                        fresh_full_loss = main_loss.new_tensor(0.0)
+                        stateful_full_gap = main_loss.new_tensor(0.0)
+                        stateful_full_hinge = main_loss.new_tensor(0.0)
+                        stateful_boundary_lambda = main_loss.new_tensor(
+                            float(config.lambda_stateful_boundary)
+                            if float(config.lambda_stateful_boundary) > 0.0
+                            else float(config.lambda_stateful_carry)
+                        )
+                        stateful_full_lambda = main_loss.new_tensor(float(config.lambda_stateful_full))
+                        stateful_target_margin = main_loss.new_tensor(
+                            float(config.stateful_target_margin)
+                            if (
+                                float(config.lambda_stateful_boundary) > 0.0
+                                or float(config.lambda_stateful_full) > 0.0
+                            )
+                            else float(config.stateful_carry_margin)
+                        )
                         stateful_batch_active = main_loss.new_tensor(0.0)
                     total_loss = (
                         main_loss
@@ -1043,6 +1121,8 @@ def main() -> None:
                     "loss_v6_self_pred": aux["v6_self_pred"].detach(),
                     "loss_v6_slot_diversity": aux["v6_slot_diversity"].detach(),
                     "loss_stateful_carry": stateful_carry_loss.detach(),
+                    "loss_stateful_boundary": stateful_boundary_hinge.detach(),
+                    "loss_stateful_full": stateful_full_hinge.detach(),
                     "loss_load_contrib": load_contrib.detach(),
                     "loss_sparse_contrib": sparse_contrib.detach(),
                     "loss_kl_contrib": kl_contrib.detach(),
@@ -1053,8 +1133,16 @@ def main() -> None:
                     "loss_v6_self_pred_contrib": self_pred_contrib.detach(),
                     "loss_v6_slot_diversity_contrib": self_slot_diversity_contrib.detach(),
                     "loss_stateful_carry_contrib": stateful_carry_contrib.detach(),
-                    "stateful_loss_chunk2": stateful_loss_chunk2.detach(),
-                    "fresh_loss_chunk2": fresh_loss_chunk2.detach(),
+                    "loss_stateful_boundary_contrib": (stateful_boundary_lambda * stateful_boundary_hinge).detach(),
+                    "loss_stateful_full_contrib": (stateful_full_lambda * stateful_full_hinge).detach(),
+                    "stateful_boundary_loss": stateful_boundary_loss.detach(),
+                    "fresh_boundary_loss": fresh_boundary_loss.detach(),
+                    "stateful_boundary_gap": stateful_boundary_gap.detach(),
+                    "stateful_full_loss": stateful_full_loss.detach(),
+                    "fresh_full_loss": fresh_full_loss.detach(),
+                    "stateful_full_gap": stateful_full_gap.detach(),
+                    "stateful_loss_chunk2": stateful_full_loss.detach(),
+                    "fresh_loss_chunk2": fresh_full_loss.detach(),
                     "stateful_batch_fraction": stateful_batch_active.detach(),
                 }
                 for k, v in aux.items():
@@ -1106,7 +1194,12 @@ def main() -> None:
                     "lambda_self_pred_effective": float(config.lambda_self_pred),
                     "lambda_self_slot_diversity_effective": float(config.lambda_self_slot_diversity),
                     "lambda_stateful_carry_effective": float(config.lambda_stateful_carry),
+                    "lambda_stateful_boundary_effective": float(metrics.get("boundary_lambda", 0.0)),
+                    "lambda_stateful_full_effective": float(metrics.get("full_lambda", 0.0)),
                     "stateful_carry_margin": float(config.stateful_carry_margin),
+                    "stateful_target_margin": float(metrics.get("target_margin", 0.0)),
+                    "stateful_boundary_tokens": float(config.stateful_boundary_tokens),
+                    "stateful_boundary_decay": float(config.stateful_boundary_decay),
                     "self_state_hidden_scale_effective": float(effective_self_hidden_scale),
                     "self_state_context_score_scale_effective": float(effective_self_context_score_scale),
                     "lr_safety_factor": float(lr_safety_factor),
@@ -1283,6 +1376,8 @@ def main() -> None:
                     config.eval_doc_continuity_docs,
                     config.eval_doc_continuity_chunks,
                     config.stateful_chunk_len,
+                    config.stateful_boundary_tokens,
+                    config.stateful_boundary_decay,
                 )
                 log_payload.update(eval_metrics)
                 log_payload["record_type"] = "train_eval"

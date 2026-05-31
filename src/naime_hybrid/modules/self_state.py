@@ -2,6 +2,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from naime_hybrid.diagnostics.emitter import emit_trace_event
+from naime_hybrid.diagnostics.trace_context import TraceContext
+
 from .norm import RMSNorm
 from .state_ops import state_softmax, state_softmax_matmul
 
@@ -200,6 +203,7 @@ class RecursiveSelfState(nn.Module):
         self_state: torch.Tensor | None,
         causal_safe: bool = True,
         block_size: int | None = None,
+        trace_context: TraceContext | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         batch_size = hidden_states.size(0)
         if attention_mask is None:
@@ -207,13 +211,26 @@ class RecursiveSelfState(nn.Module):
         if self_state is None:
             self_state = self.initial_state(batch_size, hidden_states.device, hidden_states.dtype)
         if causal_safe:
-            return self._forward_causal(
+            output, traced_state, metrics = self._forward_causal(
                 hidden_states,
                 attention_mask=attention_mask,
                 world_state=world_state,
                 self_state=self_state,
                 block_size=block_size or hidden_states.size(1),
             )
+            emit_trace_event(
+                trace_context,
+                name="v6.self_state.causal",
+                kind="module",
+                stats=metrics,
+                tensors={
+                    "hidden_states": output,
+                    "world_state": world_state,
+                    "self_state_trace": traced_state,
+                },
+                tags={"module": "self_state", "mode": "causal"},
+            )
+            return output, traced_state, metrics
 
         normed_hidden = self.hidden_norm(hidden_states)
         boundary_logits = self.boundary(normed_hidden.float()) / self.boundary_temperature
@@ -316,6 +333,20 @@ class RecursiveSelfState(nn.Module):
         )
         metrics.update(thought_metrics)
         metrics["state_norm"] = current.detach().float().norm(dim=-1).mean()
+        emit_trace_event(
+            trace_context,
+            name="v6.self_state.full",
+            kind="module",
+            stats=metrics,
+            tensors={
+                "hidden_states": hidden_states,
+                "world_state": world_state,
+                "self_state": current,
+                "slot_context": slot_context,
+                "boundary_probs": boundary_probs,
+            },
+            tags={"module": "self_state", "mode": "full"},
+        )
         return hidden_states, current, metrics
 
     def _forward_causal(

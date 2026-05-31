@@ -1,6 +1,9 @@
 import torch
 from torch import nn
 
+from naime_hybrid.diagnostics.emitter import emit_trace_event
+from naime_hybrid.diagnostics.trace_context import TraceContext
+
 from .norm import RMSNorm
 from .state_ops import state_softmax_matmul
 
@@ -598,6 +601,7 @@ class TypedLatentDynamics(nn.Module):
         past_latent_field: bool = False,
         past_latent_adapt_steps: int = 0,
         apply_state_compatibility: bool = True,
+        trace_context: TraceContext | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -732,6 +736,20 @@ class TypedLatentDynamics(nn.Module):
             self_state=self_state,
             controller_state=controller_state,
             enabled=past_latent_field and apply_state_compatibility,
+        )
+        emit_trace_event(
+            trace_context,
+            name="v7.typed_dynamics.compatibility",
+            kind="module",
+            stats=compat_metrics,
+            tensors={
+                "hidden_states": hidden_states,
+                "latent_field": latent_field,
+                "world_state": world_state,
+                "self_state": self_state,
+                "controller_state": controller_state,
+            },
+            tags={"module": "typed_dynamics", "phase": "compatibility"},
         )
         current_latent = latent_field
         # Causal state protocol: current logits may read only the latent field
@@ -1000,4 +1018,18 @@ class TypedLatentDynamics(nn.Module):
             "v7_effective_controller_write_scale": hidden_states.new_tensor(float(self.controller_write_scale)),
         }
         metrics.update(compat_metrics)
+        emit_trace_event(
+            trace_context,
+            name="v7.typed_dynamics.forward",
+            kind="module",
+            stats=metrics,
+            tensors={
+                "hidden_states": hidden_states,
+                "latent_field": current_latent,
+                "world_state": world_final,
+                "self_state": self_final,
+                "controller_state": controller_final,
+            },
+            tags={"module": "typed_dynamics", "phase": "forward"},
+        )
         return hidden_states, world_final, self_final, current_latent, controller_final, metrics

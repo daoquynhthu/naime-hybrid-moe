@@ -100,6 +100,11 @@ class TrainConfig:
     stateful_chunk_len: int | None = None
     lambda_stateful_carry: float = 0.0
     stateful_carry_margin: float = 0.0
+    stateful_boundary_tokens: int = 64
+    stateful_boundary_decay: float = 0.97
+    lambda_stateful_boundary: float = 0.0
+    lambda_stateful_full: float = 0.0
+    stateful_target_margin: float = 0.0
     self_state_hidden_scale_warmup_steps: int = 0
     self_state_context_score_warmup_steps: int = 0
     self_state_context_score_start: float = 1.0

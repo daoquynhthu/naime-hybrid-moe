@@ -6,9 +6,19 @@ from torch.utils.data import DataLoader
 from naime_hybrid.config import NAIMEStateMoEConfig
 from naime_hybrid.models.state_packet import NAIMEStatePacket
 
-from .losses import IGNORE_INDEX, collect_aux_losses, lm_loss
+from .losses import (
+    IGNORE_INDEX,
+    boundary_token_weights,
+    collect_aux_losses,
+    lm_loss,
+    masked_token_average,
+    tail_token_weights,
+    token_lm_loss,
+)
 from .masks import prepare_attention_mask_for_device
 from .runtime import split_stateful_chunks
+
+BOUNDARY_WINDOWS = (16, 32, 64, 128)
 
 
 def _supports_state_packet(model: torch.nn.Module) -> bool:
@@ -79,15 +89,17 @@ def _stateful_chunk_pair(
     return chunks[0], chunks[1]
 
 
-def _estimate_state_carry_gain(
+def _prepare_stateful_probe_context(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
     labels: torch.Tensor,
     attention_mask: torch.Tensor | None,
+    *,
     infer_pad_mask: bool | None,
     use_amp: bool,
     chunk_len: int | None,
-) -> tuple[float, float, float] | None:
+    include_fresh: bool,
+) -> dict[str, object] | None:
     if not _supports_state_packet(model) or input_ids.size(1) < 4:
         return None
 
@@ -115,17 +127,266 @@ def _estimate_state_carry_gain(
             return_aux=False,
             past_state=packet,
         )
-        fresh_out = model(
+        context: dict[str, object] = {
+            "second": second,
+            "packet": packet,
+            "stateful_token_loss": token_lm_loss(stateful_out["logits"], second["labels"]),
+        }
+        if include_fresh:
+            fresh_out = model(
+                second["input_ids"],
+                attention_mask=second.get("attention_mask"),
+                infer_pad_mask=infer_pad_mask,
+                return_aux=False,
+            )
+            context["fresh_token_loss"] = token_lm_loss(fresh_out["logits"], second["labels"])
+    return context
+
+
+def _token_loss_views(
+    token_loss: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    boundary_decay: float,
+    tail_start: int,
+) -> dict[str, torch.Tensor]:
+    views = {"lm": masked_token_average(token_loss, labels)}
+    for boundary in BOUNDARY_WINDOWS:
+        views[f"boundary_{boundary}"] = masked_token_average(
+            token_loss,
+            labels,
+            weights=boundary_token_weights(labels, boundary_tokens=boundary, decay=boundary_decay),
+        )
+    views["tail"] = masked_token_average(
+        token_loss,
+        labels,
+        weights=tail_token_weights(labels, start=tail_start),
+    )
+    return views
+
+
+def _pair_view_metrics(
+    primary_token_loss: torch.Tensor,
+    secondary_token_loss: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    boundary_decay: float,
+    tail_start: int,
+    delta_name: str,
+    primary_name: str,
+    secondary_name: str,
+) -> dict[str, float]:
+    primary_views = _token_loss_views(
+        primary_token_loss,
+        labels,
+        boundary_decay=boundary_decay,
+        tail_start=tail_start,
+    )
+    secondary_views = _token_loss_views(
+        secondary_token_loss,
+        labels,
+        boundary_decay=boundary_decay,
+        tail_start=tail_start,
+    )
+    metrics: dict[str, float] = {}
+    for name, primary_value in primary_views.items():
+        secondary_value = secondary_views[name]
+        metrics[f"{delta_name}_{name}"] = float((secondary_value - primary_value).detach().cpu())
+        metrics[f"{primary_name}_{name}"] = float(primary_value.detach().cpu())
+        metrics[f"{secondary_name}_{name}"] = float(secondary_value.detach().cpu())
+    return metrics
+
+
+def _estimate_state_carry_gain_from_context(
+    context: dict[str, object],
+    *,
+    boundary_decay: float,
+    tail_start: int,
+) -> dict[str, float] | None:
+    second = context.get("second")
+    stateful_token_loss = context.get("stateful_token_loss")
+    fresh_token_loss = context.get("fresh_token_loss")
+    if not isinstance(second, dict) or not isinstance(stateful_token_loss, torch.Tensor) or not isinstance(
+        fresh_token_loss, torch.Tensor
+    ):
+        return None
+    return _pair_view_metrics(
+        stateful_token_loss,
+        fresh_token_loss,
+        second["labels"],
+        boundary_decay=boundary_decay,
+        tail_start=tail_start,
+        delta_name="gain",
+        primary_name="stateful",
+        secondary_name="fresh",
+    )
+
+
+def _estimate_v7_state_swap_penalty_from_context(
+    model: torch.nn.Module,
+    context: dict[str, object],
+    *,
+    infer_pad_mask: bool | None,
+    use_amp: bool,
+    boundary_decay: float,
+    tail_start: int,
+) -> dict[str, float] | None:
+    second = context.get("second")
+    packet = context.get("packet")
+    correct_token_loss = context.get("stateful_token_loss")
+    if not isinstance(second, dict) or not isinstance(packet, NAIMEStatePacket) or not isinstance(
+        correct_token_loss, torch.Tensor
+    ):
+        return None
+    if second["input_ids"].size(0) < 2:
+        return None
+    device_type = second["input_ids"].device.type
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
+        swapped_out = model(
             second["input_ids"],
             attention_mask=second.get("attention_mask"),
             infer_pad_mask=infer_pad_mask,
             return_aux=False,
+            past_state=_swap_packet_batch(packet),
         )
-        stateful_loss = lm_loss(stateful_out["logits"], second["labels"])
-        fresh_loss = lm_loss(fresh_out["logits"], second["labels"])
-    stateful = float(stateful_loss.detach().cpu())
-    fresh = float(fresh_loss.detach().cpu())
-    return fresh - stateful, stateful, fresh
+        swapped_token_loss = token_lm_loss(swapped_out["logits"], second["labels"])
+    return _pair_view_metrics(
+        correct_token_loss,
+        swapped_token_loss,
+        second["labels"],
+        boundary_decay=boundary_decay,
+        tail_start=tail_start,
+        delta_name="delta",
+        primary_name="correct",
+        secondary_name="wrong",
+    )
+
+
+def _estimate_v7_state_erase_sensitivity_from_context(
+    model: torch.nn.Module,
+    context: dict[str, object],
+    *,
+    infer_pad_mask: bool | None,
+    use_amp: bool,
+    boundary_decay: float,
+    tail_start: int,
+) -> dict[str, float] | None:
+    second = context.get("second")
+    packet = context.get("packet")
+    full_token_loss = context.get("stateful_token_loss")
+    if not isinstance(second, dict) or not isinstance(packet, NAIMEStatePacket) or not isinstance(
+        full_token_loss, torch.Tensor
+    ):
+        return None
+    device_type = second["input_ids"].device.type
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
+        world_erased_out = model(
+            second["input_ids"],
+            attention_mask=second.get("attention_mask"),
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            past_state=_packet_like(
+                packet,
+                world_state=None,
+                self_state=packet.self_state,
+                latent_field=packet.latent_field,
+                memory=packet.memory,
+                controller_state=packet.controller_state,
+            ),
+        )
+        self_erased_out = model(
+            second["input_ids"],
+            attention_mask=second.get("attention_mask"),
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            past_state=_packet_like(
+                packet,
+                world_state=packet.world_state,
+                self_state=None,
+                latent_field=packet.latent_field,
+                memory=packet.memory,
+                controller_state=packet.controller_state,
+            ),
+        )
+        latent_erased_out = model(
+            second["input_ids"],
+            attention_mask=second.get("attention_mask"),
+            infer_pad_mask=infer_pad_mask,
+            return_aux=False,
+            past_state=_packet_like(
+                packet,
+                world_state=packet.world_state,
+                self_state=packet.self_state,
+                latent_field=None,
+                memory=packet.memory,
+                controller_state=packet.controller_state,
+            ),
+        )
+        world_token_loss = token_lm_loss(world_erased_out["logits"], second["labels"])
+        self_token_loss = token_lm_loss(self_erased_out["logits"], second["labels"])
+        latent_token_loss = token_lm_loss(latent_erased_out["logits"], second["labels"])
+
+    full_views = _token_loss_views(
+        full_token_loss,
+        second["labels"],
+        boundary_decay=boundary_decay,
+        tail_start=tail_start,
+    )
+    world_views = _token_loss_views(
+        world_token_loss,
+        second["labels"],
+        boundary_decay=boundary_decay,
+        tail_start=tail_start,
+    )
+    self_views = _token_loss_views(
+        self_token_loss,
+        second["labels"],
+        boundary_decay=boundary_decay,
+        tail_start=tail_start,
+    )
+    latent_views = _token_loss_views(
+        latent_token_loss,
+        second["labels"],
+        boundary_decay=boundary_decay,
+        tail_start=tail_start,
+    )
+    metrics: dict[str, float] = {}
+    for name, full_value in full_views.items():
+        metrics[f"world_delta_{name}"] = float((world_views[name] - full_value).detach().cpu())
+        metrics[f"self_delta_{name}"] = float((self_views[name] - full_value).detach().cpu())
+        metrics[f"latent_delta_{name}"] = float((latent_views[name] - full_value).detach().cpu())
+        metrics[f"full_{name}"] = float(full_value.detach().cpu())
+    return metrics
+
+
+def _estimate_state_carry_gain(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    infer_pad_mask: bool | None,
+    use_amp: bool,
+    chunk_len: int | None,
+    boundary_decay: float,
+    tail_start: int,
+) -> dict[str, float] | None:
+    context = _prepare_stateful_probe_context(
+        model,
+        input_ids,
+        labels,
+        attention_mask,
+        infer_pad_mask=infer_pad_mask,
+        use_amp=use_amp,
+        chunk_len=chunk_len,
+        include_fresh=True,
+    )
+    if context is None:
+        return None
+    return _estimate_state_carry_gain_from_context(
+        context,
+        boundary_decay=boundary_decay,
+        tail_start=tail_start,
+    )
 
 
 def _estimate_latent_thought_gain(
@@ -225,46 +486,31 @@ def _estimate_v7_state_swap_penalty(
     infer_pad_mask: bool | None,
     use_amp: bool,
     chunk_len: int | None,
-) -> tuple[float, float, float] | None:
-    if not _supports_state_packet(model) or input_ids.size(0) < 2 or input_ids.size(1) < 4:
+    boundary_decay: float,
+    tail_start: int,
+) -> dict[str, float] | None:
+    if input_ids.size(0) < 2:
         return None
-
-    pair = _stateful_chunk_pair(input_ids, labels, attention_mask, chunk_len=chunk_len)
-    if pair is None:
+    context = _prepare_stateful_probe_context(
+        model,
+        input_ids,
+        labels,
+        attention_mask,
+        infer_pad_mask=infer_pad_mask,
+        use_amp=use_amp,
+        chunk_len=chunk_len,
+        include_fresh=False,
+    )
+    if context is None:
         return None
-    first, second = pair
-    device_type = input_ids.device.type
-    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
-        first_out = model(
-            first["input_ids"],
-            attention_mask=first.get("attention_mask"),
-            infer_pad_mask=infer_pad_mask,
-            return_aux=False,
-            return_logits=False,
-            return_state=True,
-        )
-        packet = first_out.get("state_packet")
-        if packet is None:
-            return None
-        correct_out = model(
-            second["input_ids"],
-            attention_mask=second.get("attention_mask"),
-            infer_pad_mask=infer_pad_mask,
-            return_aux=False,
-            past_state=packet,
-        )
-        swapped_out = model(
-            second["input_ids"],
-            attention_mask=second.get("attention_mask"),
-            infer_pad_mask=infer_pad_mask,
-            return_aux=False,
-            past_state=_swap_packet_batch(packet),
-        )
-        correct_loss = lm_loss(correct_out["logits"], second["labels"])
-        swapped_loss = lm_loss(swapped_out["logits"], second["labels"])
-    correct = float(correct_loss.detach().cpu())
-    swapped = float(swapped_loss.detach().cpu())
-    return swapped - correct, correct, swapped
+    return _estimate_v7_state_swap_penalty_from_context(
+        model,
+        context,
+        infer_pad_mask=infer_pad_mask,
+        use_amp=use_amp,
+        boundary_decay=boundary_decay,
+        tail_start=tail_start,
+    )
 
 
 def _estimate_v7_state_erase_sensitivity(
@@ -275,87 +521,32 @@ def _estimate_v7_state_erase_sensitivity(
     infer_pad_mask: bool | None,
     use_amp: bool,
     chunk_len: int | None,
-) -> tuple[float, float, float, float] | None:
+    boundary_decay: float,
+    tail_start: int,
+) -> dict[str, float] | None:
     native_model = _native_model(model)
-    if getattr(native_model, "typed_dynamics", None) is None or input_ids.size(1) < 4:
+    if getattr(native_model, "typed_dynamics", None) is None:
         return None
 
-    pair = _stateful_chunk_pair(input_ids, labels, attention_mask, chunk_len=chunk_len)
-    if pair is None:
+    context = _prepare_stateful_probe_context(
+        model,
+        input_ids,
+        labels,
+        attention_mask,
+        infer_pad_mask=infer_pad_mask,
+        use_amp=use_amp,
+        chunk_len=chunk_len,
+        include_fresh=False,
+    )
+    if context is None:
         return None
-    first, second = pair
-    device_type = input_ids.device.type
-    with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
-        first_out = model(
-            first["input_ids"],
-            attention_mask=first.get("attention_mask"),
-            infer_pad_mask=infer_pad_mask,
-            return_aux=False,
-            return_logits=False,
-            return_state=True,
-        )
-        packet = first_out.get("state_packet")
-        if packet is None:
-            return None
-        full_out = model(
-            second["input_ids"],
-            attention_mask=second.get("attention_mask"),
-            infer_pad_mask=infer_pad_mask,
-            return_aux=False,
-            past_state=packet,
-        )
-        world_erased_out = model(
-            second["input_ids"],
-            attention_mask=second.get("attention_mask"),
-            infer_pad_mask=infer_pad_mask,
-            return_aux=False,
-            past_state=_packet_like(
-                packet,
-                world_state=None,
-                self_state=packet.self_state,
-                latent_field=packet.latent_field,
-                memory=packet.memory,
-                controller_state=packet.controller_state,
-            ),
-        )
-        self_erased_out = model(
-            second["input_ids"],
-            attention_mask=second.get("attention_mask"),
-            infer_pad_mask=infer_pad_mask,
-            return_aux=False,
-            past_state=_packet_like(
-                packet,
-                world_state=packet.world_state,
-                self_state=None,
-                latent_field=packet.latent_field,
-                memory=packet.memory,
-                controller_state=packet.controller_state,
-            ),
-        )
-        latent_erased_out = model(
-            second["input_ids"],
-            attention_mask=second.get("attention_mask"),
-            infer_pad_mask=infer_pad_mask,
-            return_aux=False,
-            past_state=_packet_like(
-                packet,
-                world_state=packet.world_state,
-                self_state=packet.self_state,
-                latent_field=None,
-                memory=packet.memory,
-                controller_state=packet.controller_state,
-            ),
-        )
-        full_loss = lm_loss(full_out["logits"], second["labels"])
-        world_loss = lm_loss(world_erased_out["logits"], second["labels"])
-        self_loss = lm_loss(self_erased_out["logits"], second["labels"])
-        latent_loss = lm_loss(latent_erased_out["logits"], second["labels"])
-    full = float(full_loss.detach().cpu())
-    return (
-        float(world_loss.detach().cpu()) - full,
-        float(self_loss.detach().cpu()) - full,
-        float(latent_loss.detach().cpu()) - full,
-        full,
+    return _estimate_v7_state_erase_sensitivity_from_context(
+        model,
+        context,
+        infer_pad_mask=infer_pad_mask,
+        use_amp=use_amp,
+        boundary_decay=boundary_decay,
+        tail_start=tail_start,
     )
 
 
@@ -369,7 +560,9 @@ def _estimate_doc_continuity(
     *,
     chunk_len: int | None,
     target_chunks: int,
-) -> tuple[float, float, float, float, float] | None:
+    boundary_decay: float,
+    tail_start: int,
+) -> dict[str, float] | None:
     if not _supports_state_packet(model) or target_chunks < 2:
         return None
 
@@ -383,20 +576,17 @@ def _estimate_doc_continuity(
     if len(chunks) < 2:
         return None
 
-    gains: list[float] = []
-    stateful_losses: list[float] = []
-    fresh_losses: list[float] = []
+    gains_full: list[float] = []
+    gains_boundary_64: list[float] = []
+    gains_tail: list[float] = []
+    stateful_full_losses: list[float] = []
+    fresh_full_losses: list[float] = []
+    stateful_boundary_64_losses: list[float] = []
+    fresh_boundary_64_losses: list[float] = []
     packet = None
     device_type = input_ids.device.type
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=use_amp):
         for chunk in chunks:
-            fresh_out = model(
-                chunk["input_ids"],
-                attention_mask=chunk.get("attention_mask"),
-                infer_pad_mask=infer_pad_mask,
-                return_aux=False,
-            )
-            fresh_loss = lm_loss(fresh_out["logits"], chunk["labels"])
             if packet is None:
                 carry_out = model(
                     chunk["input_ids"],
@@ -409,6 +599,13 @@ def _estimate_doc_continuity(
                 packet = carry_out.get("state_packet")
                 continue
 
+            fresh_out = model(
+                chunk["input_ids"],
+                attention_mask=chunk.get("attention_mask"),
+                infer_pad_mask=infer_pad_mask,
+                return_aux=False,
+            )
+            fresh_token_loss = token_lm_loss(fresh_out["logits"], chunk["labels"])
             stateful_out = model(
                 chunk["input_ids"],
                 attention_mask=chunk.get("attention_mask"),
@@ -417,26 +614,56 @@ def _estimate_doc_continuity(
                 return_state=True,
                 past_state=packet,
             )
-            stateful_loss = lm_loss(stateful_out["logits"], chunk["labels"])
+            stateful_token_loss = token_lm_loss(stateful_out["logits"], chunk["labels"])
             packet = stateful_out.get("state_packet")
             if packet is None:
                 return None
-            fresh_value = float(fresh_loss.detach().cpu())
-            stateful_value = float(stateful_loss.detach().cpu())
-            gains.append(fresh_value - stateful_value)
-            fresh_losses.append(fresh_value)
-            stateful_losses.append(stateful_value)
+            fresh_views = _token_loss_views(
+                fresh_token_loss,
+                chunk["labels"],
+                boundary_decay=boundary_decay,
+                tail_start=tail_start,
+            )
+            stateful_views = _token_loss_views(
+                stateful_token_loss,
+                chunk["labels"],
+                boundary_decay=boundary_decay,
+                tail_start=tail_start,
+            )
+            gains_full.append(float((fresh_views["lm"] - stateful_views["lm"]).detach().cpu()))
+            gains_boundary_64.append(
+                float((fresh_views["boundary_64"] - stateful_views["boundary_64"]).detach().cpu())
+            )
+            gains_tail.append(float((fresh_views["tail"] - stateful_views["tail"]).detach().cpu()))
+            fresh_full_losses.append(float(fresh_views["lm"].detach().cpu()))
+            stateful_full_losses.append(float(stateful_views["lm"].detach().cpu()))
+            fresh_boundary_64_losses.append(float(fresh_views["boundary_64"].detach().cpu()))
+            stateful_boundary_64_losses.append(float(stateful_views["boundary_64"].detach().cpu()))
 
-    if not gains:
+    if not gains_full:
         return None
-    slope = 0.0 if len(gains) < 2 else (gains[-1] - gains[0]) / float(len(gains) - 1)
-    return (
-        sum(gains) / len(gains),
-        sum(gains),
-        slope,
-        sum(stateful_losses) / len(stateful_losses),
-        sum(fresh_losses) / len(fresh_losses),
+    slope_full = 0.0 if len(gains_full) < 2 else (gains_full[-1] - gains_full[0]) / float(len(gains_full) - 1)
+    slope_boundary_64 = (
+        0.0
+        if len(gains_boundary_64) < 2
+        else (gains_boundary_64[-1] - gains_boundary_64[0]) / float(len(gains_boundary_64) - 1)
     )
+    slope_tail = 0.0 if len(gains_tail) < 2 else (gains_tail[-1] - gains_tail[0]) / float(len(gains_tail) - 1)
+    return {
+        "gain_mean": sum(gains_full) / len(gains_full),
+        "gain_cumulative": sum(gains_full),
+        "gain_slope": slope_full,
+        "stateful_mean": sum(stateful_full_losses) / len(stateful_full_losses),
+        "fresh_mean": sum(fresh_full_losses) / len(fresh_full_losses),
+        "gain_boundary_64_mean": sum(gains_boundary_64) / len(gains_boundary_64),
+        "gain_boundary_64_cumulative": sum(gains_boundary_64),
+        "gain_boundary_64_slope": slope_boundary_64,
+        "stateful_boundary_64_mean": sum(stateful_boundary_64_losses) / len(stateful_boundary_64_losses),
+        "fresh_boundary_64_mean": sum(fresh_boundary_64_losses) / len(fresh_boundary_64_losses),
+        "gain_tail_mean": sum(gains_tail) / len(gains_tail),
+        "gain_tail_cumulative": sum(gains_tail),
+        "gain_tail_slope": slope_tail,
+    }
 
 
 def evaluate_model(
@@ -464,6 +691,8 @@ def evaluate_model(
     doc_continuity_docs: int = 32,
     doc_continuity_chunks: int = 4,
     stateful_chunk_len: int | None = None,
+    stateful_boundary_tokens: int = 64,
+    stateful_boundary_decay: float = 0.97,
 ) -> dict[str, float]:
     was_training = model.training
     model.eval()
@@ -655,6 +884,22 @@ def evaluate_model(
             "doc_fresh_loss_mean",
         ]
     }
+    for boundary in BOUNDARY_WINDOWS:
+        totals[f"state_carry_gain_boundary_{boundary}"] = 0.0
+    totals["state_carry_gain_tail"] = 0.0
+    totals["v7_state_swap_delta_boundary_64"] = 0.0
+    totals["v7_state_swap_delta_tail"] = 0.0
+    totals["v7_world_erase_delta_boundary_64"] = 0.0
+    totals["v7_self_erase_delta_boundary_64"] = 0.0
+    totals["v7_latent_erase_delta_boundary_64"] = 0.0
+    totals["doc_carry_gain_boundary_64_mean"] = 0.0
+    totals["doc_carry_gain_boundary_64_cumulative"] = 0.0
+    totals["doc_carry_gain_boundary_64_slope"] = 0.0
+    totals["doc_stateful_boundary_64_loss_mean"] = 0.0
+    totals["doc_fresh_boundary_64_loss_mean"] = 0.0
+    totals["doc_carry_gain_tail_mean"] = 0.0
+    totals["doc_carry_gain_tail_cumulative"] = 0.0
+    totals["doc_carry_gain_tail_slope"] = 0.0
     batches = 0
     state_carry_batches = 0
     latent_thought_gain_batches = 0
@@ -663,6 +908,7 @@ def evaluate_model(
     v7_state_erase_batches = 0
     doc_continuity_batches = 0
     tokens = 0
+    tail_start = max(1, int(stateful_boundary_tokens))
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
             if max_batches and batch_idx >= max_batches:
@@ -876,21 +1122,31 @@ def evaluate_model(
             totals["v7_effective_controller_write_scale"] += float(
                 aux["v7_effective_controller_write_scale"].detach().cpu()
             )
-            if state_carry:
-                carry = _estimate_state_carry_gain(
+            probe_context = None
+            if state_carry or v7_state_swap or v7_state_erase:
+                probe_context = _prepare_stateful_probe_context(
                     model,
                     input_ids,
                     labels,
                     attention_mask,
-                    infer_pad_mask,
-                    use_amp,
-                    stateful_chunk_len,
+                    infer_pad_mask=infer_pad_mask,
+                    use_amp=use_amp,
+                    chunk_len=stateful_chunk_len,
+                    include_fresh=state_carry,
+                )
+            if state_carry:
+                carry = _estimate_state_carry_gain_from_context(
+                    probe_context or {},
+                    boundary_decay=stateful_boundary_decay,
+                    tail_start=tail_start,
                 )
                 if carry is not None:
-                    gain, stateful_loss, fresh_loss = carry
-                    totals["state_carry_gain_lm"] += gain
-                    totals["state_carry_stateful_lm"] += stateful_loss
-                    totals["state_carry_fresh_lm"] += fresh_loss
+                    totals["state_carry_gain_lm"] += carry["gain_lm"]
+                    totals["state_carry_stateful_lm"] += carry["stateful_lm"]
+                    totals["state_carry_fresh_lm"] += carry["fresh_lm"]
+                    for boundary in BOUNDARY_WINDOWS:
+                        totals[f"state_carry_gain_boundary_{boundary}"] += carry[f"gain_boundary_{boundary}"]
+                    totals["state_carry_gain_tail"] += carry["gain_tail"]
                     state_carry_batches += 1
             if latent_thought_gain:
                 thought = _estimate_latent_thought_gain(
@@ -931,12 +1187,22 @@ def evaluate_model(
                     infer_pad_mask,
                     use_amp,
                     stateful_chunk_len,
+                    stateful_boundary_decay,
+                    tail_start,
+                ) if probe_context is None else _estimate_v7_state_swap_penalty_from_context(
+                    model,
+                    probe_context,
+                    infer_pad_mask=infer_pad_mask,
+                    use_amp=use_amp,
+                    boundary_decay=stateful_boundary_decay,
+                    tail_start=tail_start,
                 )
                 if swap is not None:
-                    delta, correct_loss, wrong_loss = swap
-                    totals["v7_state_swap_delta_lm"] += delta
-                    totals["v7_state_swap_correct_lm"] += correct_loss
-                    totals["v7_state_swap_wrong_lm"] += wrong_loss
+                    totals["v7_state_swap_delta_lm"] += swap["delta_lm"]
+                    totals["v7_state_swap_correct_lm"] += swap["correct_lm"]
+                    totals["v7_state_swap_wrong_lm"] += swap["wrong_lm"]
+                    totals["v7_state_swap_delta_boundary_64"] += swap["delta_boundary_64"]
+                    totals["v7_state_swap_delta_tail"] += swap["delta_tail"]
                     v7_state_swap_batches += 1
             if v7_state_erase:
                 erase = _estimate_v7_state_erase_sensitivity(
@@ -947,13 +1213,24 @@ def evaluate_model(
                     infer_pad_mask,
                     use_amp,
                     stateful_chunk_len,
+                    stateful_boundary_decay,
+                    tail_start,
+                ) if probe_context is None else _estimate_v7_state_erase_sensitivity_from_context(
+                    model,
+                    probe_context,
+                    infer_pad_mask=infer_pad_mask,
+                    use_amp=use_amp,
+                    boundary_decay=stateful_boundary_decay,
+                    tail_start=tail_start,
                 )
                 if erase is not None:
-                    world_delta, self_delta, latent_delta, full_loss = erase
-                    totals["v7_world_erase_delta_lm"] += world_delta
-                    totals["v7_self_erase_delta_lm"] += self_delta
-                    totals["v7_latent_erase_delta_lm"] += latent_delta
-                    totals["v7_state_erase_full_lm"] += full_loss
+                    totals["v7_world_erase_delta_lm"] += erase["world_delta_lm"]
+                    totals["v7_self_erase_delta_lm"] += erase["self_delta_lm"]
+                    totals["v7_latent_erase_delta_lm"] += erase["latent_delta_lm"]
+                    totals["v7_state_erase_full_lm"] += erase["full_lm"]
+                    totals["v7_world_erase_delta_boundary_64"] += erase["world_delta_boundary_64"]
+                    totals["v7_self_erase_delta_boundary_64"] += erase["self_delta_boundary_64"]
+                    totals["v7_latent_erase_delta_boundary_64"] += erase["latent_delta_boundary_64"]
                     v7_state_erase_batches += 1
             if doc_continuity and doc_continuity_batches < max(1, doc_continuity_docs):
                 continuity = _estimate_doc_continuity(
@@ -965,14 +1242,23 @@ def evaluate_model(
                     use_amp,
                     chunk_len=stateful_chunk_len,
                     target_chunks=doc_continuity_chunks,
+                    boundary_decay=stateful_boundary_decay,
+                    tail_start=tail_start,
                 )
                 if continuity is not None:
-                    mean_gain, cumulative_gain, slope, stateful_mean, fresh_mean = continuity
-                    totals["doc_carry_gain_mean"] += mean_gain
-                    totals["doc_carry_gain_cumulative"] += cumulative_gain
-                    totals["doc_carry_gain_slope"] += slope
-                    totals["doc_stateful_loss_mean"] += stateful_mean
-                    totals["doc_fresh_loss_mean"] += fresh_mean
+                    totals["doc_carry_gain_mean"] += continuity["gain_mean"]
+                    totals["doc_carry_gain_cumulative"] += continuity["gain_cumulative"]
+                    totals["doc_carry_gain_slope"] += continuity["gain_slope"]
+                    totals["doc_stateful_loss_mean"] += continuity["stateful_mean"]
+                    totals["doc_fresh_loss_mean"] += continuity["fresh_mean"]
+                    totals["doc_carry_gain_boundary_64_mean"] += continuity["gain_boundary_64_mean"]
+                    totals["doc_carry_gain_boundary_64_cumulative"] += continuity["gain_boundary_64_cumulative"]
+                    totals["doc_carry_gain_boundary_64_slope"] += continuity["gain_boundary_64_slope"]
+                    totals["doc_stateful_boundary_64_loss_mean"] += continuity["stateful_boundary_64_mean"]
+                    totals["doc_fresh_boundary_64_loss_mean"] += continuity["fresh_boundary_64_mean"]
+                    totals["doc_carry_gain_tail_mean"] += continuity["gain_tail_mean"]
+                    totals["doc_carry_gain_tail_cumulative"] += continuity["gain_tail_cumulative"]
+                    totals["doc_carry_gain_tail_slope"] += continuity["gain_tail_slope"]
                     doc_continuity_batches += 1
             tokens += int(labels.ne(IGNORE_INDEX).sum().item())
             batches += 1
@@ -1014,7 +1300,7 @@ def evaluate_model(
         + val_self_slot_diversity_contrib
     )
     val_aux_loss = val_total_loss - val_loss
-    return {
+    metrics = {
         "val_total_loss": val_total_loss,
         "val_aux_loss": val_aux_loss,
         "val_lm_loss": val_loss,
@@ -1257,3 +1543,48 @@ def evaluate_model(
         "val_batches": float(batches),
         "val_tokens": float(tokens),
     }
+    for boundary in BOUNDARY_WINDOWS:
+        metrics[f"val_state_carry_gain_boundary_{boundary}"] = (
+            totals[f"state_carry_gain_boundary_{boundary}"] / state_carry_batches if state_carry_batches else 0.0
+        )
+    metrics["val_state_carry_gain_tail"] = totals["state_carry_gain_tail"] / state_carry_batches if state_carry_batches else 0.0
+    metrics["val_doc_carry_gain_boundary_64_mean"] = (
+        totals["doc_carry_gain_boundary_64_mean"] / doc_continuity_batches if doc_continuity_batches else 0.0
+    )
+    metrics["val_doc_carry_gain_boundary_64_cumulative"] = (
+        totals["doc_carry_gain_boundary_64_cumulative"] / doc_continuity_batches if doc_continuity_batches else 0.0
+    )
+    metrics["val_doc_carry_gain_boundary_64_slope"] = (
+        totals["doc_carry_gain_boundary_64_slope"] / doc_continuity_batches if doc_continuity_batches else 0.0
+    )
+    metrics["val_doc_stateful_boundary_64_loss_mean"] = (
+        totals["doc_stateful_boundary_64_loss_mean"] / doc_continuity_batches if doc_continuity_batches else 0.0
+    )
+    metrics["val_doc_fresh_boundary_64_loss_mean"] = (
+        totals["doc_fresh_boundary_64_loss_mean"] / doc_continuity_batches if doc_continuity_batches else 0.0
+    )
+    metrics["val_doc_carry_gain_tail_mean"] = (
+        totals["doc_carry_gain_tail_mean"] / doc_continuity_batches if doc_continuity_batches else 0.0
+    )
+    metrics["val_doc_carry_gain_tail_cumulative"] = (
+        totals["doc_carry_gain_tail_cumulative"] / doc_continuity_batches if doc_continuity_batches else 0.0
+    )
+    metrics["val_doc_carry_gain_tail_slope"] = (
+        totals["doc_carry_gain_tail_slope"] / doc_continuity_batches if doc_continuity_batches else 0.0
+    )
+    metrics["val_v7_state_swap_delta_boundary_64"] = (
+        totals["v7_state_swap_delta_boundary_64"] / v7_state_swap_batches if v7_state_swap_batches else 0.0
+    )
+    metrics["val_v7_state_swap_delta_tail"] = (
+        totals["v7_state_swap_delta_tail"] / v7_state_swap_batches if v7_state_swap_batches else 0.0
+    )
+    metrics["val_v7_world_erase_delta_boundary_64"] = (
+        totals["v7_world_erase_delta_boundary_64"] / v7_state_erase_batches if v7_state_erase_batches else 0.0
+    )
+    metrics["val_v7_self_erase_delta_boundary_64"] = (
+        totals["v7_self_erase_delta_boundary_64"] / v7_state_erase_batches if v7_state_erase_batches else 0.0
+    )
+    metrics["val_v7_latent_erase_delta_boundary_64"] = (
+        totals["v7_latent_erase_delta_boundary_64"] / v7_state_erase_batches if v7_state_erase_batches else 0.0
+    )
+    return metrics

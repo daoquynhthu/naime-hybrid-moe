@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from naime_hybrid.kernels import cross_entropy_loss, fused_lm_cross_entropy_loss
 
@@ -19,6 +20,68 @@ def _observed(value: torch.Tensor) -> torch.Tensor:
 
 def lm_loss(logits: torch.Tensor, labels: torch.Tensor, backend: str = "auto") -> torch.Tensor:
     return cross_entropy_loss(logits, labels, ignore_index=IGNORE_INDEX, backend=backend)
+
+
+def token_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Return per-token causal LM cross entropy with IGNORE_INDEX masking."""
+
+    vocab = logits.size(-1)
+    return F.cross_entropy(
+        logits.reshape(-1, vocab),
+        labels.reshape(-1),
+        reduction="none",
+        ignore_index=IGNORE_INDEX,
+    ).reshape_as(labels)
+
+
+def masked_token_average(
+    token_loss: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Average per-token losses over observed labels, optionally with weights."""
+
+    valid = labels.ne(IGNORE_INDEX).to(dtype=token_loss.dtype)
+    if weights is None:
+        effective_weights = valid
+    else:
+        effective_weights = weights.to(dtype=token_loss.dtype) * valid
+    denom = effective_weights.sum().clamp_min(1.0)
+    return (token_loss * effective_weights).sum() / denom
+
+
+def boundary_token_weights(
+    labels: torch.Tensor,
+    *,
+    boundary_tokens: int,
+    decay: float = 1.0,
+) -> torch.Tensor:
+    """Return exponentially decayed weights over the first boundary tokens."""
+
+    seq_len = labels.size(1)
+    if seq_len <= 0 or boundary_tokens <= 0:
+        return torch.zeros_like(labels, dtype=torch.float32)
+    cutoff = min(int(boundary_tokens), seq_len)
+    positions = torch.arange(seq_len, device=labels.device, dtype=torch.float32).unsqueeze(0).expand_as(labels)
+    mask = (positions < float(cutoff)).to(dtype=torch.float32)
+    if decay != 1.0:
+        mask = mask * torch.pow(mask.new_tensor(float(decay)), positions)
+    return mask
+
+
+def tail_token_weights(labels: torch.Tensor, *, start: int) -> torch.Tensor:
+    """Return uniform weights over the suffix starting at `start`."""
+
+    seq_len = labels.size(1)
+    if seq_len <= 0:
+        return torch.zeros_like(labels, dtype=torch.float32)
+    if seq_len == 1:
+        start = 0
+    else:
+        start = min(max(1, int(start)), seq_len - 1)
+    positions = torch.arange(seq_len, device=labels.device).unsqueeze(0).expand_as(labels)
+    return (positions >= start).to(dtype=torch.float32)
 
 
 def fused_lm_loss(

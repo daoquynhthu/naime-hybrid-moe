@@ -16,6 +16,7 @@ from naime_hybrid import (
     build_model,
 )
 from naime_hybrid.data import HFDiskCausalDataset
+from naime_hybrid.diagnostics import TraceConfig, TraceContext, run_state_packet_diagnostics
 from naime_hybrid.modules.gate import GumbelBlockGate
 from naime_hybrid.modules.moe import TopKMoE
 from naime_hybrid.modules.self_state import RecursiveSelfState
@@ -31,10 +32,10 @@ from naime_hybrid.training.checkpoint import (
 from naime_hybrid.training.cli import build_train_config, parse_args
 from naime_hybrid.training.config import TrainConfig
 from naime_hybrid.training.control import reference_value_at_step, update_sparse_lambda
-from naime_hybrid.training.losses import lm_loss
+from naime_hybrid.training.losses import boundary_token_weights, lm_loss, masked_token_average, token_lm_loss
 from naime_hybrid.training.masks import prepare_attention_mask_for_device
 from naime_hybrid.training.runtime import split_stateful_chunks
-from naime_hybrid.training.train import _apply_self_state_warmup
+from naime_hybrid.training.train import _apply_self_state_warmup, _stateful_carry_objective
 from naime_hybrid.training.validation import evaluate_model
 
 
@@ -202,6 +203,28 @@ def test_lm_loss_trains_token_zero_and_ignores_only_negative_sentinel():
     assert loss < 1e-4
 
 
+def test_token_lm_loss_returns_per_token_values_and_masks_ignore_index():
+    logits = torch.tensor(
+        [
+            [[6.0, -6.0, -6.0], [-6.0, 6.0, -6.0], [-6.0, -6.0, 6.0]],
+        ]
+    )
+    labels = torch.tensor([[0, 1, -100]])
+
+    token_loss = token_lm_loss(logits, labels)
+    boundary_loss = masked_token_average(
+        token_loss,
+        labels,
+        weights=boundary_token_weights(labels, boundary_tokens=2, decay=1.0),
+    )
+
+    assert token_loss.shape == labels.shape
+    assert token_loss[0, 2].item() == pytest.approx(0.0)
+    assert token_loss[0, 0].item() < 1e-4
+    assert token_loss[0, 1].item() < 1e-4
+    assert boundary_loss.item() < 1e-4
+
+
 def test_hf_collate_keeps_token_zero_visible():
     batch = [{"input_ids": torch.tensor([0, 5, 6, 7, 8])}, {"input_ids": torch.tensor([9, 0, 10, 11, 12])}]
 
@@ -249,6 +272,16 @@ def test_cli_maps_stateful_carry_and_doc_continuity_flags(monkeypatch):
             "0.0005",
             "--stateful-carry-margin",
             "0.001",
+            "--stateful-boundary-tokens",
+            "48",
+            "--stateful-boundary-decay",
+            "0.95",
+            "--lambda-stateful-boundary",
+            "0.002",
+            "--lambda-stateful-full",
+            "0.0003",
+            "--stateful-target-margin",
+            "0.004",
             "--self-state-hidden-scale-warmup-steps",
             "2000",
             "--self-state-context-score-warmup-steps",
@@ -267,9 +300,122 @@ def test_cli_maps_stateful_carry_and_doc_continuity_flags(monkeypatch):
     assert config.stateful_chunk_len == 256
     assert config.lambda_stateful_carry == pytest.approx(5e-4)
     assert config.stateful_carry_margin == pytest.approx(1e-3)
+    assert config.stateful_boundary_tokens == 48
+    assert config.stateful_boundary_decay == pytest.approx(0.95)
+    assert config.lambda_stateful_boundary == pytest.approx(0.002)
+    assert config.lambda_stateful_full == pytest.approx(0.0003)
+    assert config.stateful_target_margin == pytest.approx(0.004)
     assert config.self_state_hidden_scale_warmup_steps == 2000
     assert config.self_state_context_score_warmup_steps == 1500
     assert config.self_state_context_score_start == pytest.approx(0.5)
+
+
+class _BoundaryCarryToyModel(torch.nn.Module):
+    def __init__(self, vocab_size: int = 8):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.stateful_detach_flags: list[bool] = []
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask=None,
+        infer_pad_mask=None,
+        return_aux=False,
+        return_logits=True,
+        return_state=False,
+        past_state=None,
+        detach_past_state=True,
+    ):
+        logits = torch.nn.functional.one_hot(input_ids % self.vocab_size, num_classes=self.vocab_size).float() * 6.0
+        if past_state is None and not return_state:
+            wrong = torch.nn.functional.one_hot((input_ids.add(1)) % self.vocab_size, num_classes=self.vocab_size).float()
+            logits = logits.clone()
+            logits[:, :2, :] = wrong[:, :2, :] * 6.0
+        if past_state is not None:
+            self.stateful_detach_flags.append(bool(detach_past_state))
+        out = {"logits": logits}
+        if return_state:
+            out["state_packet"] = object()
+        return out
+
+
+class _EvalProbeCountingModel(torch.nn.Module):
+    def __init__(self, vocab_size: int = 16, d_model: int = 8):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self._initial_world_state = True
+        self.typed_dynamics = object()
+        self.forward_calls = 0
+
+    def _packet(self, batch: int, device: torch.device) -> NAIMEStatePacket:
+        zeros = torch.zeros(batch, 2, self.d_model, device=device)
+        return NAIMEStatePacket(
+            world_state=zeros.clone(),
+            self_state=zeros.clone(),
+            latent_field=zeros.clone(),
+            memory=zeros.clone(),
+            controller_state=zeros.clone(),
+            architecture_id="naime_v7_typed_dynamics",
+        )
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask=None,
+        infer_pad_mask=None,
+        return_aux=True,
+        return_logits=True,
+        return_state=False,
+        past_state=None,
+        **kwargs,
+    ):
+        self.forward_calls += 1
+        logits = torch.nn.functional.one_hot(input_ids % self.vocab_size, num_classes=self.vocab_size).float() * 6.0
+        out = {"logits": logits, "aux": []}
+        if return_state:
+            out["state_packet"] = self._packet(input_ids.size(0), input_ids.device)
+        return out
+
+
+def test_stateful_carry_objective_prefers_boundary_advantage_and_keeps_writer_grad_path():
+    model = _BoundaryCarryToyModel()
+    config = TrainConfig(
+        stateful_batch_ratio=1.0,
+        stateful_chunk_len=3,
+        lambda_stateful_boundary=0.5,
+        lambda_stateful_full=0.25,
+        stateful_boundary_tokens=2,
+        stateful_boundary_decay=1.0,
+        stateful_target_margin=3.0,
+    )
+    input_ids = torch.tensor([[0, 1, 2, 3, 4, 5]])
+    labels = input_ids.clone()
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    carry = _stateful_carry_objective(
+        model,
+        input_ids=input_ids,
+        labels=labels,
+        attention_mask=attention_mask,
+        infer_pad_mask=False,
+        config=config,
+        use_amp=False,
+        device=torch.device("cpu"),
+    )
+
+    assert carry is not None
+    assert carry["boundary_gap"].item() > 0.0
+    assert carry["full_gap"].item() > 0.0
+    assert carry["boundary_lambda"].item() == pytest.approx(0.5)
+    assert carry["full_lambda"].item() == pytest.approx(0.25)
+    assert carry["target_margin"].item() == pytest.approx(3.0)
+    assert carry["batch_active"].item() == pytest.approx(1.0)
+    assert carry["carry_loss"].item() == pytest.approx(
+        0.5 * carry["boundary_carry_loss"].item() + 0.25 * carry["full_carry_loss"].item()
+    )
+    assert model.stateful_detach_flags == [False]
 
 
 def test_apply_self_state_warmup_updates_effective_scales():
@@ -347,8 +493,11 @@ def test_evaluate_model_reports_doc_continuity_metrics_for_v7():
     assert "val_doc_carry_gain_mean" in metrics
     assert "val_doc_carry_gain_cumulative" in metrics
     assert "val_doc_carry_gain_slope" in metrics
+    assert "val_doc_carry_gain_boundary_64_mean" in metrics
+    assert "val_doc_carry_gain_tail_mean" in metrics
     assert metrics["val_doc_continuity_batches"] == 1.0
     assert math.isfinite(metrics["val_doc_carry_gain_mean"])
+    assert math.isfinite(metrics["val_doc_carry_gain_boundary_64_mean"])
 
 
 def test_tiny_decoder_forward_and_backward():
@@ -1800,6 +1949,9 @@ def test_evaluate_model_reports_state_carry_gain_metric():
     assert math.isfinite(metrics["val_state_carry_gain_lm"])
     assert math.isfinite(metrics["val_state_carry_stateful_lm"])
     assert math.isfinite(metrics["val_state_carry_fresh_lm"])
+    assert math.isfinite(metrics["val_state_carry_gain_boundary_16"])
+    assert math.isfinite(metrics["val_state_carry_gain_boundary_64"])
+    assert math.isfinite(metrics["val_state_carry_gain_tail"])
 
 
 def test_evaluate_model_reports_latent_thought_gain_metric():
@@ -1908,7 +2060,145 @@ def test_evaluate_model_reports_v7_probe_metrics():
     assert metrics["val_v7_state_erase_batches"] == 1.0
     assert math.isfinite(metrics["val_v7_dynamics_gain_lm"])
     assert math.isfinite(metrics["val_v7_state_swap_delta_lm"])
+    assert math.isfinite(metrics["val_v7_state_swap_delta_boundary_64"])
     assert math.isfinite(metrics["val_v7_latent_erase_delta_lm"])
+    assert math.isfinite(metrics["val_v7_world_erase_delta_boundary_64"])
+
+
+def test_evaluate_model_reuses_stateful_probe_context_across_v7_eval_probes():
+    config = NAIMEStateMoEConfig(
+        vocab_size=16,
+        max_seq_len=8,
+        d_model=8,
+        n_layers=1,
+        n_dense_layers=1,
+        n_heads=2,
+        n_kv_heads=1,
+        d_ff=16,
+        world_state_slots=2,
+        self_state_slots=2,
+        v7_dynamics_steps=1,
+        v7_latent_slots=2,
+    )
+    model = _EvalProbeCountingModel(vocab_size=config.vocab_size, d_model=config.d_model)
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8], [2, 3, 4, 5, 6, 7, 8, 9]])
+    loader = [
+        {
+            "input_ids": input_ids,
+            "labels": input_ids.clone(),
+            "attention_mask": torch.ones_like(input_ids, dtype=torch.bool),
+        }
+    ]
+
+    metrics = evaluate_model(
+        model,
+        loader,
+        config,
+        torch.device("cpu"),
+        use_amp=False,
+        max_batches=1,
+        state_carry=True,
+        v7_state_swap=True,
+        v7_state_erase=True,
+        stateful_chunk_len=4,
+    )
+
+    assert model.forward_calls == 8
+    assert metrics["val_state_carry_batches"] == 1.0
+    assert metrics["val_v7_state_swap_batches"] == 1.0
+    assert metrics["val_v7_state_erase_batches"] == 1.0
+
+
+def test_v7_trace_context_emits_structured_events():
+    torch.manual_seed(321)
+    config = NAIMEStateMoEConfig(
+        vocab_size=32,
+        max_seq_len=16,
+        d_model=16,
+        n_layers=2,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=32,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=2,
+        top_k=1,
+        expert_hidden_dim=24,
+        world_state_slots=2,
+        self_state_slots=2,
+        v7_dynamics_steps=1,
+        v7_latent_slots=2,
+    )
+    model = build_model("naime_v7_typed_dynamics", config).eval()
+    trace_context = TraceContext(config=TraceConfig(enabled=True))
+    input_ids = torch.randint(1, config.vocab_size, (2, config.max_seq_len))
+
+    with torch.no_grad():
+        output = model(input_ids, return_state=True, trace_context=trace_context)
+
+    event_names = {event.name for event in trace_context.events}
+    assert output["state_packet"] is not None
+    assert "v7.decoder.ingress" in event_names
+    assert "v7.decoder.ingress_compatibility" in event_names
+    assert "v7.decoder.egress" in event_names
+    assert "v7.typed_dynamics.forward" in event_names
+
+
+def test_state_packet_diagnostics_emits_report_and_writes_artifacts(tmp_path):
+    torch.manual_seed(654)
+    config = NAIMEStateMoEConfig(
+        vocab_size=32,
+        max_seq_len=16,
+        d_model=16,
+        n_layers=2,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=32,
+        stride=4,
+        window=8,
+        z_dim=8,
+        n_experts=2,
+        top_k=1,
+        expert_hidden_dim=24,
+        world_state_slots=2,
+        self_state_slots=2,
+        v7_dynamics_steps=1,
+        v7_latent_slots=2,
+    )
+    model = build_model("naime_v7_typed_dynamics", config).eval()
+    trace_context = TraceContext(config=TraceConfig(enabled=True))
+    input_ids = torch.randint(1, config.vocab_size, (2, config.max_seq_len))
+    labels = input_ids.clone()
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    with torch.no_grad():
+        report = run_state_packet_diagnostics(
+            model,
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            chunk_len=config.max_seq_len // 2,
+            boundary_tokens=4,
+            trace_context=trace_context,
+            output_dir=str(tmp_path),
+        )
+
+    assert report["metrics"]["packet_summary"]["present"] is True
+    assert math.isfinite(report["metrics"]["full_gain"])
+    assert math.isfinite(report["metrics"]["boundary_gain"])
+    assert math.isfinite(report["metrics"]["tail_gain"])
+    assert "packet_interventions" in report["metrics"]
+    fields = report["metrics"]["packet_interventions"]["fields"]
+    assert fields["world_state"]["present"] is True
+    assert "erase" in fields["world_state"]
+    assert "swap" in fields["world_state"]
+    assert math.isfinite(fields["world_state"]["erase"]["delta_vs_full_packet"]["boundary"])
+    assert report["summary"]["event_count"] >= 3
+    assert (tmp_path / "trace_events.jsonl").exists()
+    assert (tmp_path / "summary.json").exists()
 
 
 def test_topk_moe_sparse_dispatch_matches_dense_dispatch():
