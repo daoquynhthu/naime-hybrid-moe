@@ -20,6 +20,7 @@ from naime_hybrid.diagnostics import (
     append_training_dynamics_event,
     build_training_dynamics_event,
     collect_gradient_component_stats,
+    collect_loss_gradient_probe,
     diagnostics_root,
     flatten_gradient_component_stats,
     run_state_packet_diagnostics,
@@ -406,6 +407,14 @@ def _write_diagnostics_window_snapshot(
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     return path
+
+
+def _selected_loss_gradient_probe_names(config) -> set[str]:
+    raw = str(getattr(config, "diagnostics_loss_grad_components", "") or "")
+    names = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    if "all" in names:
+        return {"lm", "state", "router", "self", "carry"}
+    return names
 
 
 def _apply_self_state_warmup(model: torch.nn.Module, config, step: int) -> tuple[float, float]:
@@ -1135,6 +1144,7 @@ def main() -> None:
             batch_loss_gpu = torch.tensor(0.0, device=device)
             batch_lm_loss_gpu = torch.tensor(0.0, device=device)
             gpu_metrics_accum = {}
+            diagnostic_loss_probe_payload = {}
             for _micro_step in range(config.grad_accum_steps):
                 batch = next(data_iter)
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -1152,6 +1162,7 @@ def main() -> None:
                         max_batch=config.diagnostics_max_batch,
                     )
 
+                diagnostic_losses: dict[str, torch.Tensor] = {}
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                     use_fused_lm = config.lm_loss_backend == "cuda_ext_fused_ce"
                     out = model(
@@ -1261,7 +1272,34 @@ def main() -> None:
                         + stateful_carry_contrib
                     )
                     total_loss = total_loss / config.grad_accum_steps
+                    if (
+                        diagnostics_due
+                        and bool(config.diagnostics_loss_grad_probe)
+                        and _micro_step == config.grad_accum_steps - 1
+                    ):
+                        selected_loss_probes = _selected_loss_gradient_probe_names(config)
+                        diagnostic_losses: dict[str, torch.Tensor] = {}
+                        if "lm" in selected_loss_probes:
+                            diagnostic_losses["lm"] = main_loss
+                        if "router" in selected_loss_probes:
+                            diagnostic_losses["router"] = load_contrib + sparse_contrib + kl_contrib
+                        if "state" in selected_loss_probes:
+                            diagnostic_losses["state"] = (
+                                state_pred_contrib + slot_diversity_contrib + slot_stability_contrib
+                            )
+                        if "self" in selected_loss_probes:
+                            diagnostic_losses["self"] = self_pred_contrib + self_slot_diversity_contrib
+                        if "carry" in selected_loss_probes:
+                            diagnostic_losses["carry"] = stateful_carry_contrib
 
+                if (
+                    diagnostics_due
+                    and bool(config.diagnostics_loss_grad_probe)
+                    and _micro_step == config.grad_accum_steps - 1
+                    and diagnostic_losses
+                    and not scaler.is_enabled()
+                ):
+                    diagnostic_loss_probe_payload = collect_loss_gradient_probe(model, diagnostic_losses)
                 scaler.scale(total_loss).backward()
                 batch_loss_gpu = batch_loss_gpu + total_loss.detach() * config.grad_accum_steps
                 batch_lm_loss_gpu = batch_lm_loss_gpu + main_loss.detach()
@@ -1406,6 +1444,7 @@ def main() -> None:
                             if bool(config.diagnostics_grad_components)
                             else {}
                         ),
+                        **diagnostic_loss_probe_payload,
                     }
                     _write_training_dynamics_event(
                         config=config,
@@ -1530,6 +1569,7 @@ def main() -> None:
                 "grad_norm": float(grad_norm),
                 **metrics,
                 **grad_component_payload,
+                **diagnostic_loss_probe_payload,
             }
 
             if stop_signals.requested:

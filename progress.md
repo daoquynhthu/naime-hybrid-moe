@@ -113,6 +113,24 @@ Gradient/component diagnostics update on 2026-05-31:
 - Local 2-step CPU smoke verified that `dynamics_events.jsonl` includes
   gradient component diagnostics; the smoke run was removed.
 
+Loss-component gradient attribution update on 2026-05-31:
+
+- Added diagnostics-only loss-component gradient probes. In explicit
+  diagnostics mode, selected loss groups can be replayed on the retained graph
+  of the final microbatch and attributed to broad parameter groups.
+- Supported probe selectors: `lm`, `router`, `state`, `self`, `carry`, and
+  `all`, controlled by `--diagnostics-loss-grad-components`.
+- The probe restores the original accumulated gradients before the real
+  optimizer path continues. It is skipped when AMP `GradScaler` is enabled, so
+  the normal mixed-precision training path is not perturbed.
+- Events now include `loss_grad_component_norm` and
+  `loss_grad_component_cosine`, making it possible to see whether LM/router/
+  state/self/carry objectives push the same component in aligned or conflicting
+  directions.
+- Local 2-step CPU smoke verified that loss-component gradient attribution is
+  present in `training_diagnostics/dynamics_events.jsonl`; the smoke run was
+  removed.
+
 Important command:
 
 ```powershell
@@ -137,6 +155,9 @@ Important command:
   causality should be read from `training_diagnostics/dynamics_events.jsonl`.
 - Gradient component diagnostics are for attribution and anomaly localization;
   they must not become optimization targets.
+- Loss-component gradient probes are diagnostic replays only. They must not
+  change accumulated gradients, LR policy, optimizer state, or checkpoint
+  contents.
 - Do not create one-off monitoring scripts when a unified probe already exists.
 - Keep remote commands windowless and use the established `remote.ps1` path.
 - Keep `pony_remote/`, `analysis/`, `bin/`, checkpoints, datasets, and local
@@ -151,6 +172,8 @@ Important command:
   `dynamics_events.jsonl` are written.
 - A diagnostic smoke must prove gradient component diagnostics are present when
   not disabled.
+- A diagnostic smoke must prove loss-component gradient attribution is present
+  when enabled and AMP scaler is disabled.
 - A real remote diagnostics run must produce `manifest.json`, `summary.json`,
   and `trace_events.jsonl`.
 - The remote report must include packet field interventions with finite

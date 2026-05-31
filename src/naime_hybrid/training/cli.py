@@ -222,6 +222,19 @@ def parse_args() -> argparse.Namespace:
         help="Skip per-module gradient norm grouping in diagnostics mode.",
     )
     parser.add_argument(
+        "--diagnostics-no-loss-grad-probe",
+        action="store_true",
+        help="Skip diagnostics-only loss-component gradient attribution probes.",
+    )
+    parser.add_argument(
+        "--diagnostics-loss-grad-components",
+        default="lm,state,router",
+        help=(
+            "Comma-separated diagnostics loss components to probe. Supported: "
+            "lm,state,router,self,carry,all. Diagnostics mode only."
+        ),
+    )
+    parser.add_argument(
         "--diagnostics-window-size",
         type=int,
         default=16,
@@ -745,6 +758,8 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
         diagnostics_max_batch=args.diagnostics_max_batch,
         diagnostics_record_tensor_stats=not args.diagnostics_no_tensor_stats,
         diagnostics_grad_components=not args.diagnostics_no_grad_components,
+        diagnostics_loss_grad_probe=not args.diagnostics_no_loss_grad_probe,
+        diagnostics_loss_grad_components=args.diagnostics_loss_grad_components,
         diagnostics_window_size=args.diagnostics_window_size,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,

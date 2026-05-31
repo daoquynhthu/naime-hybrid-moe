@@ -25,6 +25,8 @@ GRADIENT_KEYS = (
     "grad_component_total_norm",
     "grad_component_max_abs",
     "grad_component_param_count",
+    "loss_grad_component_norm",
+    "loss_grad_component_cosine",
 )
 
 ROUTER_KEYS = (
@@ -161,11 +163,65 @@ def collect_gradient_component_stats(model: torch.nn.Module) -> dict[str, dict[s
     }
 
 
+def _collect_flat_group_grads(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    groups: dict[str, list[torch.Tensor]] = {}
+    for name, parameter in model.named_parameters():
+        grad = parameter.grad
+        if grad is None:
+            continue
+        group = _gradient_group(name)
+        groups.setdefault(group, []).append(grad.detach().float().flatten().cpu())
+    return {group: torch.cat(chunks) for group, chunks in groups.items() if chunks}
+
+
 def flatten_gradient_component_stats(stats: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
     return {
         "grad_component_total_norm": {group: values["total_norm"] for group, values in stats.items()},
         "grad_component_max_abs": {group: values["max_abs"] for group, values in stats.items()},
         "grad_component_param_count": {group: values["param_count"] for group, values in stats.items()},
+    }
+
+
+def collect_loss_gradient_probe(
+    model: torch.nn.Module,
+    losses: dict[str, torch.Tensor],
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Attribute selected loss components to broad parameter groups.
+
+    This is intentionally diagnostics-only. It replays backward on retained
+    graphs for scalar component losses and restores the original accumulated
+    gradients before returning.
+    """
+
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    original_grads = [None if parameter.grad is None else parameter.grad.detach().clone() for parameter in parameters]
+    baseline = _collect_flat_group_grads(model)
+    norms: dict[str, dict[str, float]] = {}
+    cosines: dict[str, dict[str, float]] = {}
+    try:
+        for loss_name, loss in losses.items():
+            if not isinstance(loss, torch.Tensor) or not loss.requires_grad:
+                continue
+            model.zero_grad(set_to_none=True)
+            loss.backward(retain_graph=True)
+            current = _collect_flat_group_grads(model)
+            norms[loss_name] = {}
+            cosines[loss_name] = {}
+            for group, vector in current.items():
+                current_norm = float(vector.norm().item())
+                norms[loss_name][group] = current_norm
+                base = baseline.get(group)
+                if base is not None and current_norm > 0.0:
+                    base_norm = float(base.norm().item())
+                    if base_norm > 0.0:
+                        cosines[loss_name][group] = float(torch.dot(vector, base).item() / (current_norm * base_norm))
+    finally:
+        model.zero_grad(set_to_none=True)
+        for parameter, grad in zip(parameters, original_grads, strict=True):
+            parameter.grad = grad
+    return {
+        "loss_grad_component_norm": norms,
+        "loss_grad_component_cosine": cosines,
     }
 
 

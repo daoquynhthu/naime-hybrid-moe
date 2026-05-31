@@ -6,6 +6,7 @@ from .training_dynamics import (
     append_training_dynamics_event,
     build_training_dynamics_event,
     collect_gradient_component_stats,
+    collect_loss_gradient_probe,
     diagnostics_root,
     flatten_gradient_component_stats,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "build_trace_summary",
     "build_training_dynamics_event",
     "collect_gradient_component_stats",
+    "collect_loss_gradient_probe",
     "diagnostics_root",
     "flatten_gradient_component_stats",
     "run_state_packet_diagnostics",

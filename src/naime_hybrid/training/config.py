@@ -54,6 +54,8 @@ class TrainConfig:
     diagnostics_max_batch: int = 2
     diagnostics_record_tensor_stats: bool = True
     diagnostics_grad_components: bool = True
+    diagnostics_loss_grad_probe: bool = True
+    diagnostics_loss_grad_components: str = "lm,state,router"
     diagnostics_window_size: int = 16
     early_stop_patience: int = 0
     early_stop_min_delta: float = 0.0
